@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- CH340 / CH341 (most common on Creality boards) -->
+    <usb-device vendor-id="6790" product-id="29987" />   <!-- 0x1A86 / 0x7523 -->
+    <usb-device vendor-id="6790" product-id="21795" />   <!-- 0x1A86 / 0x5523 -->
+    <usb-device vendor-id="6790" product-id="22016" />   <!-- 0x1A86 / 0x5600 -->
+
+    <!-- FTDI -->
+    <usb-device vendor-id="1027" product-id="24577" />   <!-- 0x0403 / 0x6001 -->
+    <usb-device vendor-id="1027" product-id="24596" />   <!-- 0x0403 / 0x6014 -->
+    <usb-device vendor-id="1027" product-id="24592" />   <!-- 0x0403 / 0x6010 -->
+
+    <!-- CP210x (Silicon Labs) -->
+    <usb-device vendor-id="4292" product-id="60000" />   <!-- 0x10C4 / 0xEA60 -->
+
+    <!-- Prolific PL2303 -->
+    <usb-device vendor-id="1659" product-id="8963" />    <!-- 0x067B / 0x2303 -->
+
+    <!-- Arduino (CDC ACM) — Mega2560 / Uno / Nano boards used on some printer mainboards -->
+    <usb-device vendor-id="9025" product-id="66" />      <!-- 0x2341 / 0x0042 (Mega2560 R3) -->
+    <usb-device vendor-id="9025" product-id="67" />      <!-- 0x2341 / 0x0043 (Uno R3) -->
+    <usb-device vendor-id="9025" product-id="60000" />   <!-- 0x2341 / 0xEA60 -->
+    <usb-device vendor-id="6790" product-id="29984" />   <!-- 0x1A86 clones -->
+
+    <!-- Prusa (Einsy / MK3) -->
+    <usb-device vendor-id="9836" product-id="2" />       <!-- 0x2C6C / 0x0002 -->
+
+    <!-- BTT SKR (generic CDC ACM, STM32 VCP) -->
+    <usb-device vendor-id="1155" product-id="22336" />   <!-- 0x0483 / 0x5740 -->
+
+    <!-- Creality generic CDC (some newer CR-touch / v4.x boards) -->
+    <usb-device vendor-id="1155" product-id="22352" />   <!-- 0x0483 / 0x5750 -->
+</resources>

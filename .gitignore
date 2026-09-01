@@ -1,0 +1,6 @@
+out/
+classes/
+gen/
+debug.keystore
+design/printhost-dashboard.html
+.DS_Store

@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PrintHost</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #111214;
+    --panel: #1c1e22;
+    --panel-2: #202226;
+    --panel-border: #2a2d32;
+    --text: #f2f3f5;
+    --text-dim: #9a9da3;
+    --text-faint: #6b6e74;
+    --accent: #00c853;
+    --accent-dim: #0a3d24;
+    --accent-text: #06210f;
+    --warn: #f0b90b;
+    --warn-dim: #3d310a;
+    --danger: #ff6b6b;
+    --danger-dim: #4a1414;
+    --radius: 14px;
+    --radius-sm: 9px;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 12px; background: var(--bg); color: var(--text);
+         font-family: -apple-system, system-ui, sans-serif; font-size: 13px; }
+  .num { font-variant-numeric: tabular-nums; }
+
+  .top-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+  h1 { font-size: 16px; margin: 0; font-weight: 700; }
+  .status-group { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+
+  .phase { font-weight: 700; padding: 3px 12px 3px 10px; border-radius: 20px; background: #333; font-size: 11px;
+            display: flex; align-items: center; gap: 6px; }
+  .phase-dot { flex: none; }
+  .phase.PRINTING, .phase.IDLE { background: var(--accent-dim); color: var(--accent); }
+  .phase.ERROR { background: var(--danger-dim); color: var(--danger); }
+  .phase.PAUSED, .phase.UPLOADING, .phase.UPLOAD_VERIFIED, .phase.CONNECTING { background: var(--warn-dim); color: var(--warn); }
+  .phase.DISCONNECTED { background: #333; color: var(--text-dim); }
+
+  .battery { display: flex; align-items: center; gap: 5px; font-weight: 600; color: var(--text-dim); }
+  .battery.low { color: var(--danger); }
+  .battery-warning { background: var(--danger-dim); border: 1px solid #6b1f1f; border-radius: 8px;
+                      padding: 6px 12px; margin-bottom: 8px; font-size: 11.5px; display: none; }
+  .battery-warning.show { display: block; }
+  .msg { font-size: 11.5px; color: var(--danger); min-height: 15px; margin-bottom: 4px; }
+
+  button {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--panel-border);
+    border-radius: var(--radius-sm); padding: 8px 12px; font-size: 12px; font-weight: 700;
+    cursor: pointer;
+  }
+  button:disabled { color: var(--text-faint); cursor: not-allowed; }
+  button.primary { background: var(--accent); color: var(--accent-text); border: none; }
+  button.warn { background: var(--warn-dim); color: var(--warn); border: none; }
+  button.danger { background: var(--danger-dim); color: var(--danger); border: none; }
+  button.small { padding: 6px 10px; font-size: 11px; }
+
+  .card { background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius); padding: 16px; }
+  .main-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr); gap: 12px; align-items: stretch; }
+  @media (max-width: 620px) { .main-grid { grid-template-columns: 1fr; } }
+
+  .print-card { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+
+  .ring-wrap { display: flex; justify-content: center; }
+  .ring { width: 118px; height: 118px; }
+  .ring-bg { fill: none; stroke: var(--panel-2); stroke-width: 9; }
+  .ring-fg { fill: none; stroke: var(--accent); stroke-width: 9; stroke-linecap: round;
+             transform: rotate(-90deg); transform-origin: 50% 50%; transition: stroke-dashoffset 0.4s; }
+  .ring-fg.PAUSED, .ring-fg.UPLOADING, .ring-fg.UPLOAD_VERIFIED { stroke: var(--warn); }
+  .ring-fg.ERROR { stroke: var(--danger); }
+  .ring-pct { font-size: 25px; font-weight: 700; fill: var(--text); }
+
+  .pill { background: var(--panel-2); border-radius: var(--radius-sm); padding: 9px 12px; display: flex; align-items: center; gap: 9px; min-width: 0; }
+  .pill-icon { flex: none; color: var(--text-dim); }
+  .time-pill { justify-content: center; text-align: center; }
+  .time-elapsed { font-size: 15px; font-weight: 700; }
+  .time-remaining { font-size: 12px; color: var(--text-faint); }
+  .time-remaining .num { color: var(--text-dim); font-weight: 600; }
+
+  .temps-row { display: flex; gap: 8px; }
+  .temp-pill { flex: 1; justify-content: center; }
+  .temp-val { font-size: 15px; font-weight: 700; white-space: nowrap; }
+  .temp-target { color: var(--text-faint); font-weight: 500; font-size: 12px; }
+
+  .file-box { font-size: 12.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  .controls-row { display: flex; gap: 8px; }
+  .controls-row button { flex: 1; padding: 11px 0; font-size: 12.5px; }
+
+  .upload-box { border: 1.5px dashed var(--panel-border); border-radius: var(--radius-sm); padding: 9px 10px;
+                display: flex; align-items: center; gap: 9px; }
+  .upload-box .fname { flex: 1; min-width: 0; font-size: 11px; color: var(--text-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #fileInput { display: none; }
+
+  .sdfiles-box { background: var(--panel-2); border-radius: var(--radius-sm); padding: 9px 10px; display: flex; flex-direction: column; gap: 7px; }
+  .sdfiles-header { display: flex; align-items: center; justify-content: space-between; font-size: 10.5px; font-weight: 700;
+                     color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.4px; }
+  .sdfiles-header button { background: none; border: none; padding: 2px; color: var(--text-faint); display: flex; }
+  .sdfiles-header button:hover { color: var(--text-dim); }
+  .sdfiles-list { display: flex; flex-direction: column; gap: 4px; max-height: 132px; overflow-y: auto; }
+  .sdfile-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 9px;
+                border-radius: 7px; background: var(--panel); cursor: pointer; font-size: 11.5px; }
+  .sdfile-row:hover { background: #26292e; }
+  .sdfile-row.selected { background: var(--accent-dim); color: var(--accent); }
+  .sdfile-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
+  .sdfile-size { flex: none; color: var(--text-faint); font-size: 10.5px; }
+  .sdfile-row.selected .sdfile-size { color: var(--accent); opacity: 0.8; }
+  .sdfile-delete { flex: none; background: none; border: none; padding: 3px; color: var(--text-faint); display: flex; border-radius: 5px; }
+  .sdfile-delete:hover { color: var(--danger); background: var(--danger-dim); }
+  .sdfiles-empty { font-size: 11px; color: var(--text-faint); padding: 6px 2px; }
+  .sdfiles-list.locked .sdfile-row { pointer-events: none; opacity: 0.5; cursor: not-allowed; }
+
+  .camera-card { display: flex; flex-direction: column; justify-content: center; gap: 10px; }
+  /* Fixed aspect-ratio on the frame itself (not just its children) - this is what the phone's
+     rotated portrait capture actually looks like, and it must stay this size whether the camera
+     is on or off, never resizing when toggled or when the sibling column's height changes. */
+  .camera-frame { aspect-ratio: 3/4; width: 100%; max-width: 240px; margin: 0 auto; border-radius: var(--radius-sm); background: #000;
+                   position: relative; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+  #cameraImg { display: none; width: 100%; height: 100%; object-fit: contain; background: #0a0a0c; }
+  .camera-placeholder { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; color: #3a3d42; }
+  .live-badge { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.55); color: var(--text-dim);
+                font-size: 10.5px; font-weight: 600; padding: 3px 8px; border-radius: 20px; display: none; }
+  .live-badge.show { display: block; }
+  .camera-controls { display: flex; gap: 8px; }
+  .camera-controls button { flex: 1; padding: 10px 0; font-size: 12.5px; display: flex; align-items: center; justify-content: center; gap: 7px; }
+
+  .footer { text-align: center; font-size: 10.5px; color: var(--text-faint); margin-top: 8px; }
+</style>
+</head>
+<body>
+
+<div class="top-row">
+  <h1>PrintHost</h1>
+  <div class="status-group">
+    <span id="phase" class="phase">
+      <svg class="phase-dot" width="7" height="7" viewBox="0 0 8 8" aria-hidden="true"><circle cx="4" cy="4" r="4" fill="currentColor"/></svg>
+      <span id="phaseText">-</span>
+    </span>
+    <span class="battery" id="batteryWrap">
+      <svg width="17" height="15" viewBox="0 0 24 24">
+        <rect x="2" y="6" width="18" height="12" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/>
+        <path d="M21 10v4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+        <rect id="batteryFill" x="4.5" y="8.5" width="0" height="7" rx="1" fill="currentColor"/>
+      </svg>
+      <span id="batteryPct" class="num">-</span>%<span id="batteryChargingIcon"></span>
+    </span>
+    <button id="connectToggleBtn" class="small">Connect</button>
+  </div>
+</div>
+
+<div class="battery-warning" id="batteryWarning">
+  &#9888; Low phone battery: <span id="batteryWarningPct">-</span>% remaining.
+</div>
+<div class="msg" id="errorMsg"></div>
+
+<div class="main-grid">
+  <div class="card print-card">
+    <div class="ring-wrap">
+      <svg viewBox="0 0 118 118" class="ring">
+        <circle class="ring-bg" cx="59" cy="59" r="50" />
+        <circle class="ring-fg" id="progressRing" cx="59" cy="59" r="50" />
+        <text x="59" y="67" text-anchor="middle" class="ring-pct" id="ringPercent">0%</text>
+      </svg>
+    </div>
+
+    <div class="pill time-pill">
+      <svg class="pill-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>
+      <div>
+        <div class="time-elapsed"><span id="elapsed" class="num">-</span></div>
+        <div class="time-remaining"><span id="remaining" class="num">-</span></div>
+      </div>
+    </div>
+
+    <div class="temps-row">
+      <div class="pill temp-pill">
+        <svg class="pill-icon" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M7.5 3h9v4.2l-2.3 4.3v8.3a1.2 1.2 0 0 1-1.2 1.2h-2a1.2 1.2 0 0 1-1.2-1.2v-8.3L7.5 7.2z"/></svg>
+        <div class="temp-val num"><span id="hotendTemp">-</span>&deg;<span class="temp-target">/<span id="hotendTarget">-</span>&deg;</span></div>
+      </div>
+      <div class="pill temp-pill">
+        <svg class="pill-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="8" width="18" height="11" rx="1.5"/><path d="M3 13.5h18M9 8v11M15 8v11"/></svg>
+        <div class="temp-val num"><span id="bedTemp">-</span>&deg;<span class="temp-target">/<span id="bedTarget">-</span>&deg;</span></div>
+      </div>
+    </div>
+
+    <div class="pill file-box" id="currentFile">no file selected</div>
+
+    <div class="controls-row">
+      <button id="startBtn" class="primary">Start</button>
+      <button id="pauseBtn" class="warn">Pause</button>
+      <button id="resumeBtn" class="primary">Resume</button>
+      <button id="stopBtn" class="danger">Stop</button>
+    </div>
+
+    <div class="sdfiles-box">
+      <div class="sdfiles-header">
+        <span>On SD Card</span>
+        <button id="refreshSdBtn" title="Refresh list">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 4v6h-6"/></svg>
+        </button>
+      </div>
+      <div class="sdfiles-list" id="sdFilesList">
+        <div class="sdfiles-empty">Connect the printer to see stored files</div>
+      </div>
+    </div>
+
+    <div class="upload-box">
+      <button id="chooseFileBtn" class="primary small">Choose File</button>
+      <span class="fname" id="chosenFileName">No file selected</span>
+      <input type="file" id="fileInput" accept=".gcode,.gco,.g">
+    </div>
+    <div class="pill" id="uploadProgressWrap" style="display:none; padding: 6px 12px;">
+      <progress id="uploadProgress" value="0" max="100" style="width:100%; height:8px;"></progress>
+      <span id="uploadStatus" style="font-size:11px; white-space:nowrap;"></span>
+    </div>
+  </div>
+
+  <div class="card camera-card">
+    <div class="camera-frame">
+      <img id="cameraImg" alt="camera stream">
+      <div class="camera-placeholder" id="cameraPlaceholder">
+        <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8a2 2 0 0 1 2-2h1.5l1-1.5h7l1 1.5H18a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/><circle cx="12" cy="13" r="3.5"/></svg>
+      </div>
+      <span class="live-badge" id="liveBadge">LIVE</span>
+    </div>
+    <div class="camera-controls">
+      <button id="cameraBtn" class="primary">Camera On</button>
+      <button id="torchBtn">Flashlight</button>
+    </div>
+  </div>
+</div>
+
+<div class="footer" id="firmwareInfo"></div>
+
+<script>
+var LOW_BATTERY_THRESHOLD = 30;
+var RING_CIRCUMFERENCE = 2 * Math.PI * 50;
+var REMAINING_MIN_PERCENT = 3; // below this, the estimate is too noisy to show
+var cameraOn = false;
+var torchOn = false;
+var selectedFile = null;
+var wasLive = false;
+var currentSdFilename = null;
+
+var FRIENDLY_PHASE = {
+  DISCONNECTED: "Disconnected",
+  CONNECTING: "Connecting...",
+  IDLE: "Connected",
+  UPLOADING: "Uploading...",
+  UPLOAD_VERIFIED: "Ready to print",
+  PRINTING: "Printing",
+  PAUSED: "Paused",
+  ERROR: "Error"
+};
+
+function $(id) { return document.getElementById(id); }
+
+function fmtTime(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return (h > 0 ? h + "h " : "") + m + "m " + s + "s";
+}
+
+function post(path) {
+  return fetch(path, { method: "POST" }).then(function (r) { return r.json(); });
+}
+
+function fmtBytes(n) {
+  if (n == null || n < 0) return "";
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return Math.round(n / 1024) + " KB";
+  return (n / 1024 / 1024).toFixed(1) + " MB";
+}
+
+function loadSdFiles() {
+  fetch("/sdfiles").then(function (r) { return r.json(); }).then(function (data) {
+    renderSdFiles((data && data.files) || []);
+  }).catch(function () {});
+}
+
+function renderSdFiles(files) {
+  var list = $("sdFilesList");
+  list.innerHTML = "";
+  if (!files.length) {
+    var empty = document.createElement("div");
+    empty.className = "sdfiles-empty";
+    empty.textContent = "No files uploaded yet";
+    list.appendChild(empty);
+    return;
+  }
+  files.forEach(function (f) {
+    var row = document.createElement("div");
+    row.className = "sdfile-row" + (f.name === currentSdFilename ? " selected" : "");
+    row.dataset.filename = f.name;
+    var name = document.createElement("span");
+    name.className = "sdfile-name";
+    name.textContent = f.displayName || f.name;
+    name.title = f.displayName && f.displayName !== f.name ? f.displayName + " (" + f.name + ")" : f.name;
+    var size = document.createElement("span");
+    size.className = "sdfile-size num";
+    size.textContent = fmtBytes(f.size);
+    var del = document.createElement("button");
+    del.className = "sdfile-delete";
+    del.title = "Delete";
+    del.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>';
+    del.onclick = function (ev) {
+      ev.stopPropagation();
+      if (confirm('Delete "' + (f.displayName || f.name) + '" from the SD card?')) deleteSdFile(f.name);
+    };
+    row.appendChild(name);
+    row.appendChild(size);
+    row.appendChild(del);
+    row.onclick = function () { selectSdFile(f.name, f.displayName); };
+    list.appendChild(row);
+  });
+}
+
+function highlightSelectedSdFile() {
+  var rows = document.querySelectorAll(".sdfile-row");
+  for (var i = 0; i < rows.length; i++) {
+    rows[i].classList.toggle("selected", rows[i].dataset.filename === currentSdFilename);
+  }
+}
+
+function selectSdFile(name, displayName) {
+  var q = "/select?filename=" + encodeURIComponent(name)
+      + "&displayName=" + encodeURIComponent(displayName || "");
+  post(q).then(function (r) { renderStatus(r.state); });
+}
+
+function deleteSdFile(name) {
+  post("/delete?filename=" + encodeURIComponent(name)).then(function (r) {
+    renderStatus(r.state);
+    loadSdFiles();
+  });
+}
+
+$("refreshSdBtn").onclick = function () { loadSdFiles(); };
+
+function refreshStatus() {
+  fetch("/status").then(function (r) { return r.json(); }).then(renderStatus).catch(function () {});
+}
+
+function renderStatus(s) {
+  var phaseEl = $("phase");
+  $("phaseText").textContent = FRIENDLY_PHASE[s.phase] || s.phase;
+  phaseEl.className = "phase " + s.phase;
+  $("firmwareInfo").textContent = s.firmwareInfo || "";
+  $("errorMsg").textContent = s.lastError || "";
+
+  var live = s.phase !== "DISCONNECTED" && s.phase !== "CONNECTING";
+  // A printer-side error (upload failed, poll timed out, etc.) doesn't necessarily mean the
+  // serial connection itself is closed, but showing "Disconnect" as if everything's fine while
+  // something just failed is misleading - offer "Connect" (safe no-op if still open) instead.
+  var showAsConnected = live && s.phase !== "ERROR";
+  $("hotendTemp").textContent = live ? Math.round(s.hotendTemp) : "-";
+  $("hotendTarget").textContent = live ? Math.round(s.hotendTarget) : "-";
+  $("bedTemp").textContent = live ? Math.round(s.bedTemp) : "-";
+  $("bedTarget").textContent = live ? Math.round(s.bedTarget) : "-";
+
+  var ring = $("progressRing");
+  var offset = RING_CIRCUMFERENCE * (1 - s.printProgressPercent / 100);
+  ring.style.strokeDasharray = RING_CIRCUMFERENCE;
+  ring.style.strokeDashoffset = offset;
+  ring.setAttribute("class", "ring-fg " + s.phase);
+  $("ringPercent").textContent = s.printProgressPercent + "%";
+
+  $("elapsed").textContent = fmtTime(s.elapsedSeconds);
+  $("remaining").textContent = s.printProgressPercent >= REMAINING_MIN_PERCENT
+      ? fmtTime(s.estimatedRemainingSeconds || 0) + " remaining"
+      : (s.phase === "PRINTING" ? "Calculating..." : "-");
+
+  $("currentFile").textContent = s.currentFileDisplay || s.currentFile || "no file selected";
+
+  currentSdFilename = s.currentFile || null;
+  highlightSelectedSdFile();
+  $("sdFilesList").classList.toggle("locked",
+      s.phase === "PRINTING" || s.phase === "PAUSED" || s.phase === "UPLOADING");
+  if (live && !wasLive) loadSdFiles();
+  wasLive = live;
+
+  var pct = s.batteryPercent;
+  $("batteryPct").textContent = pct >= 0 ? pct : "-";
+  $("batteryWrap").className = "battery" + (pct >= 0 && pct <= LOW_BATTERY_THRESHOLD ? " low" : "");
+  $("batteryFill").setAttribute("width", pct >= 0 ? (13 * pct / 100) : 0);
+  $("batteryChargingIcon").textContent = s.batteryCharging ? " ⚡" : "";
+  var showWarning = pct >= 0 && pct <= LOW_BATTERY_THRESHOLD && !s.batteryCharging;
+  $("batteryWarning").className = "battery-warning" + (showWarning ? " show" : "");
+  $("batteryWarningPct").textContent = pct;
+
+  var toggleBtn = $("connectToggleBtn");
+  toggleBtn.textContent = showAsConnected ? "Disconnect" : "Connect";
+  toggleBtn.disabled = s.phase === "CONNECTING";
+
+  renderControls(s.phase);
+
+  // Progress bar reflects the real bottleneck - the phone-to-printer serial transfer
+  // (state.uploadedBytes/expectedBytes, polled from the server) - not the browser-to-phone
+  // HTTP leg, which finishes in a couple of seconds over Wi-Fi regardless of file size and
+  // would otherwise show 100% long before the actual SD write is anywhere near done. Driven
+  // entirely from server state, so it survives a page reload mid-upload too.
+  var uploading = s.phase === "UPLOADING";
+  $("uploadProgressWrap").style.display = uploading ? "flex" : "none";
+  if (uploading) {
+    var pct2 = s.expectedBytes > 0 ? Math.round(100 * s.uploadedBytes / s.expectedBytes) : 0;
+    $("uploadProgress").value = pct2;
+    $("uploadStatus").textContent = pct2 + "%";
+  }
+}
+
+/** Only the buttons relevant to the current phase are shown at all - not just disabled. */
+function renderControls(phase) {
+  $("startBtn").style.display = phase === "UPLOAD_VERIFIED" ? "" : "none";
+  $("pauseBtn").style.display = phase === "PRINTING" ? "" : "none";
+  $("resumeBtn").style.display = phase === "PAUSED" ? "" : "none";
+  $("stopBtn").style.display = (phase === "PRINTING" || phase === "PAUSED") ? "" : "none";
+}
+
+$("connectToggleBtn").onclick = function () {
+  var path = this.textContent === "Disconnect" ? "/disconnect" : "/connect";
+  post(path).then(function (r) { renderStatus(r.state); });
+};
+$("startBtn").onclick = function () { post("/start").then(function(r){ renderStatus(r.state); }); };
+$("pauseBtn").onclick = function () {
+  if (confirm("Pause the print?")) {
+    post("/pause").then(function(r){ renderStatus(r.state); });
+  }
+};
+$("resumeBtn").onclick = function () { post("/resume").then(function(r){ renderStatus(r.state); }); };
+$("stopBtn").onclick = function () {
+  if (confirm("Stop the print? This cannot be resumed.")) {
+    post("/stop").then(function(r){ renderStatus(r.state); });
+  }
+};
+
+function chooseFile(file) {
+  selectedFile = file;
+  $("chosenFileName").textContent = file ? file.name : "No file selected";
+  refreshStatus();
+  if (file) uploadSelectedFile(file);
+}
+$("chooseFileBtn").onclick = function () { $("fileInput").click(); };
+$("fileInput").onchange = function () { chooseFile(this.files[0] || null); };
+
+function uploadSelectedFile(file) {
+  var xhr = new XMLHttpRequest();
+  xhr.open("POST", "/upload?filename=" + encodeURIComponent(file.name));
+  // No xhr.upload.onprogress here - that would only measure the fast browser-to-phone HTTP
+  // leg. The visible progress bar is driven by renderStatus() polling the server instead,
+  // which reflects the real bottleneck (phone-to-printer serial transfer).
+  xhr.onload = function () {
+    var resp = {};
+    try { resp = JSON.parse(xhr.responseText); } catch (e) {}
+    $("uploadStatus").textContent = resp.success ? "verified" : ("failed: " + (resp.message || xhr.status));
+    if (resp.state) renderStatus(resp.state);
+    if (resp.success) loadSdFiles();
+  };
+  xhr.onerror = function () { $("uploadStatus").textContent = "network error"; };
+  xhr.send(file);
+}
+
+$("cameraBtn").onclick = function () {
+  var startingUp = !cameraOn;
+  var path = startingUp ? "/camera/start" : "/camera/stop";
+  post(path).then(function (r) {
+    cameraOn = startingUp ? r.success : false;
+    $("cameraBtn").textContent = cameraOn ? "Camera Off" : "Camera On";
+    var img = $("cameraImg");
+    var placeholder = $("cameraPlaceholder");
+    $("liveBadge").className = "live-badge" + (cameraOn ? " show" : "");
+    if (cameraOn) {
+      img.style.display = "block";
+      placeholder.style.display = "none";
+      img.src = "/camera/stream?_=" + Date.now();
+    } else {
+      img.style.display = "none";
+      placeholder.style.display = "flex";
+      img.src = "";
+    }
+  });
+};
+
+$("torchBtn").onclick = function () {
+  var path = torchOn ? "/torch/off" : "/torch/on";
+  post(path).then(function (r) {
+    torchOn = path === "/torch/on" ? r.success : false;
+    $("torchBtn").textContent = torchOn ? "Flashlight Off" : "Flashlight";
+  });
+};
+
+refreshStatus();
+setInterval(refreshStatus, 2000);
+</script>
+</body>
+</html>
