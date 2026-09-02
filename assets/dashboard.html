@@ -558,6 +558,10 @@ function renderControls(phase) {
 
 $("connectToggle").onchange = function () {
   var wantConnected = this.checked;
+  if (!wantConnected && !confirm("Disconnect the printer?")) {
+    this.checked = true;
+    return;
+  }
   post(wantConnected ? "/connect" : "/disconnect").then(function (r) { renderStatus(r.state); });
 };
 $("screenToggle").onchange = function () {
@@ -571,6 +575,10 @@ $("screenToggle").onchange = function () {
 $("plugToggle").onchange = function () {
   var turnOn = this.checked;
   var toggle = this;
+  if (!turnOn && !confirm("Turn off the plug? This cuts the printer's power.")) {
+    toggle.checked = true;
+    return;
+  }
   post(turnOn ? "/plug/on" : "/plug/off").then(function (r) {
     if (!r.success) {
       toggle.checked = !turnOn;

@@ -35,6 +35,7 @@ public class CameraController {
     private final CameraManager cameraManager;
     private String backCameraId;
     private int sensorOrientation = 90;
+    private boolean afAutoSupported = false;
 
     private HandlerThread bgThread;
     private Handler bgHandler;
@@ -153,6 +154,16 @@ public class CameraController {
             if (facing != null && facing == CameraCharacteristics.LENS_FACING_BACK) {
                 Integer orientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION);
                 if (orientation != null) sensorOrientation = orientation;
+                int[] afModes = chars.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES);
+                afAutoSupported = false;
+                if (afModes != null) {
+                    for (int mode : afModes) {
+                        if (mode == CameraCharacteristics.CONTROL_AF_MODE_AUTO) {
+                            afAutoSupported = true;
+                            break;
+                        }
+                    }
+                }
                 return id;
             }
         }
@@ -206,7 +217,19 @@ public class CameraController {
                 if (cameraDevice == null) return; // torn down while we were configuring
                 captureSession = session;
                 try {
-                    session.setRepeatingRequest(repeatingRequestBuilder.build(), null, bgHandler);
+                    if (afAutoSupported) {
+                        // Focus once, then lock - see FocusLockCallback. Without this the
+                        // default AF mode (TEMPLATE_RECORD's CONTINUOUS_VIDEO) kept re-hunting on
+                        // every bit of nozzle/print motion, confirmed annoying on real hardware.
+                        repeatingRequestBuilder.set(CaptureRequest.CONTROL_AF_MODE,
+                                CaptureRequest.CONTROL_AF_MODE_AUTO);
+                        repeatingRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER,
+                                CaptureRequest.CONTROL_AF_TRIGGER_START);
+                        session.setRepeatingRequest(repeatingRequestBuilder.build(),
+                                new FocusLockCallback(), bgHandler);
+                    } else {
+                        session.setRepeatingRequest(repeatingRequestBuilder.build(), null, bgHandler);
+                    }
                 } catch (CameraAccessException e) {
                     Log.e(TAG, "setRepeatingRequest failed", e);
                     teardown();
@@ -219,6 +242,42 @@ public class CameraController {
             Log.e(TAG, "capture session configure failed");
             synchronized (CameraController.this) {
                 teardown();
+            }
+        }
+    }
+
+    /**
+     * Watches the one-shot autofocus trigger started in onConfigured() across frames until it
+     * settles (FOCUSED_LOCKED or NOT_FOCUSED_LOCKED - either is a terminal "done scanning"
+     * state), then clears the trigger. CONTROL_AF_MODE_AUTO doesn't refocus again on its own
+     * once the trigger is idle, unlike the CONTINUOUS_* modes - this is what actually holds the
+     * lock, not just clearing the trigger flag.
+     */
+    class FocusLockCallback extends CameraCaptureSession.CaptureCallback {
+        private boolean locked = false;
+
+        @Override
+        public void onCaptureCompleted(CameraCaptureSession session, CaptureRequest request,
+                                        android.hardware.camera2.TotalCaptureResult result) {
+            if (locked) return;
+            Integer afState = result.get(android.hardware.camera2.CaptureResult.CONTROL_AF_STATE);
+            if (afState == null) {
+                locked = true; // device doesn't report AF state - nothing more we can do here
+                return;
+            }
+            if (afState == android.hardware.camera2.CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
+                    || afState == android.hardware.camera2.CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED) {
+                locked = true;
+                synchronized (CameraController.this) {
+                    if (captureSession == null || repeatingRequestBuilder == null) return;
+                    try {
+                        repeatingRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER,
+                                CaptureRequest.CONTROL_AF_TRIGGER_IDLE);
+                        captureSession.setRepeatingRequest(repeatingRequestBuilder.build(), null, bgHandler);
+                    } catch (CameraAccessException e) {
+                        Log.e(TAG, "focus lock finalize failed", e);
+                    }
+                }
             }
         }
     }

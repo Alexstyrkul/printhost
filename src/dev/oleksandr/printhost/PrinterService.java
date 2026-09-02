@@ -760,7 +760,6 @@ public class PrinterService extends Service {
     }
 
     private static final Pattern SD_PRINTING_BYTE = Pattern.compile("SD printing byte (\\d+)/(\\d+)");
-    private static final Pattern ELAPSED_TIME = Pattern.compile("(\\d+):(\\d+)");
 
     class PollerThread extends Thread {
         private volatile boolean stopRequested = false;
@@ -851,9 +850,23 @@ public class PrinterService extends Service {
         }
     }
 
-    /** Returns true if the printer reports the SD print is done. */
+    /**
+     * Returns true if the printer reports the SD print is done. This firmware's real
+     * "Done printing file" line (confirmed against the actual source, gcode/sd/M1001.cpp) is
+     * NOT a response to any M27 we send - it's a spontaneous line the firmware injects into its
+     * own command queue and emits exactly once, at whatever moment the print truly finishes,
+     * completely independent of our poll timing. It can arrive during the ~1.5s gap between
+     * polls and be missed entirely - confirmed on real hardware: progress froze at 99% forever
+     * after a print finished, because M27 had already moved on to reporting "Not SD printing"
+     * (card.flag.sdprinting flips false inside M1001's own handler) by the time we polled again,
+     * which matched neither the literal message nor the byte-progress pattern. So completion is
+     * now detected three independent ways, any one of which is sufficient - not relying on
+     * catching that one-shot message.
+     */
     private static boolean parseProgress(String m27Response, PrinterState state) {
-        if (m27Response.toLowerCase(java.util.Locale.US).contains("done printing")) {
+        String lower = m27Response.toLowerCase(java.util.Locale.US);
+        if (lower.contains("done printing")) {
+            state.printProgressPercent = 100;
             return true;
         }
         Matcher m = SD_PRINTING_BYTE.matcher(m27Response);
@@ -862,19 +875,38 @@ public class PrinterService extends Service {
             long total = Long.parseLong(m.group(2));
             if (total > 0) {
                 state.printProgressPercent = (int) (done * 100 / total);
+                if (done >= total) return true;
             }
+            return false;
         }
-        return false;
+        // No byte-progress line at all - the firmware already stopped reporting one
+        // ("Not SD printing"), which only happens after M1001 has already run.
+        return lower.contains("not sd printing");
     }
 
+    /**
+     * This firmware's real M31 response (confirmed against the actual source,
+     * gcode/stats/M31.cpp + libs/duration_t.h) is NOT "H:MM" - duration_t::toString() formats it
+     * as space-separated unit letters, largest-first, omitting leading zero units - e.g. "45s",
+     * "2m 15s", "1h 5m 22s". The old ELAPSED_TIME regex looked for a colon, which this format
+     * never contains, so elapsed time silently stayed 0 for the entire session - confirmed live
+     * (progress climbed 25%->26% while elapsedSeconds stayed 0 the whole time).
+     */
+    private static final Pattern TIME_UNIT = Pattern.compile("(\\d+)([dhms])");
+
     private static long parseElapsedSeconds(String m31Response) {
-        Matcher m = ELAPSED_TIME.matcher(m31Response);
-        if (m.find()) {
-            long minutes = Long.parseLong(m.group(1));
-            long seconds = Long.parseLong(m.group(2));
-            return minutes * 60 + seconds;
+        long total = 0;
+        Matcher m = TIME_UNIT.matcher(m31Response);
+        while (m.find()) {
+            long value = Long.parseLong(m.group(1));
+            switch (m.group(2)) {
+                case "d": total += value * 86400; break;
+                case "h": total += value * 3600; break;
+                case "m": total += value * 60; break;
+                case "s": total += value; break;
+            }
         }
-        return 0;
+        return total;
     }
 
     // ---- screen wake / lock -------------------------------------------------------------------
