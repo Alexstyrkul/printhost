@@ -160,8 +160,7 @@
       </svg>
       <span id="batteryPct" class="num">-</span>%<span id="batteryChargingIcon"></span>
     </span>
-    <button id="wakeScreenBtn" class="small" title="Wake the phone's screen">Wake</button>
-    <button id="lockScreenBtn" class="small" title="Lock the phone's screen">Lock</button>
+    <button id="screenToggleBtn" class="small" title="Wake or lock the phone's screen">Wake</button>
     <button id="connectToggleBtn" class="small">Connect</button>
   </div>
 </div>
@@ -499,6 +498,8 @@ function renderStatus(s) {
   toggleBtn.textContent = showAsConnected ? "Disconnect" : "Connect";
   toggleBtn.disabled = s.phase === "CONNECTING";
 
+  $("screenToggleBtn").textContent = s.screenOn ? "Lock" : "Wake";
+
   renderControls(s.phase);
 
   // Progress bar reflects the real bottleneck - the phone-to-printer serial transfer
@@ -527,8 +528,10 @@ $("connectToggleBtn").onclick = function () {
   var path = this.textContent === "Disconnect" ? "/disconnect" : "/connect";
   post(path).then(function (r) { renderStatus(r.state); });
 };
-$("wakeScreenBtn").onclick = function () { post("/screen/wake"); };
-$("lockScreenBtn").onclick = function () { post("/screen/lock"); };
+$("screenToggleBtn").onclick = function () {
+  var path = this.textContent === "Lock" ? "/screen/lock" : "/screen/wake";
+  post(path).then(function (r) { renderStatus(r.state); });
+};
 $("startBtn").onclick = function () { post("/start").then(function(r){ renderStatus(r.state); }); };
 $("pauseBtn").onclick = function () {
   if (confirm("Pause the print?")) {

@@ -38,6 +38,7 @@ public class PrinterState {
 
     public volatile int batteryPercent = -1; // -1 = unknown
     public volatile boolean batteryCharging = false;
+    public volatile boolean screenOn = false;
 
     public synchronized JSONObject toJson() {
         JSONObject o = new JSONObject();
@@ -61,6 +62,7 @@ public class PrinterState {
             o.put("torchOn", torchOn);
             o.put("batteryPercent", batteryPercent);
             o.put("batteryCharging", batteryCharging);
+            o.put("screenOn", screenOn);
 
             long remaining = 0;
             if (printProgressPercent > 0 && printProgressPercent < 100) {

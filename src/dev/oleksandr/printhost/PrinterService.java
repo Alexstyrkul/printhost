@@ -147,6 +147,7 @@ public class PrinterService extends Service {
      *  commandLock, since this is what the dashboard polls for live progress. */
     public JSONObject getStateJson() {
         updateBatteryStatus();
+        updateScreenStatus();
         return state.toJson();
     }
 
@@ -155,6 +156,13 @@ public class PrinterService extends Service {
         if (bm == null) return;
         state.batteryPercent = bm.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY);
         state.batteryCharging = bm.isCharging();
+    }
+
+    /** So the dashboard's Wake/Lock button can show the right label without the user having to
+     *  track which one they last pressed. */
+    private void updateScreenStatus() {
+        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        state.screenOn = pm != null && pm.isInteractive();
     }
 
     /** Diagnostic passthrough for M20 - useful while bringing up a new printer/firmware. */
