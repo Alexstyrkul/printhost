@@ -825,6 +825,39 @@ public class PrinterService extends Service {
         return 0;
     }
 
+    // ---- screen wake / lock -------------------------------------------------------------------
+    // Manual replacement for trying to auto-detect "the printer just got plugged in" and wake the
+    // screen for it - confirmed on real hardware that reliably distinguishing that from a manual
+    // power-button lock (in usbtap's accessibility service) turned out to be more trouble than it
+    // was worth. Instead: the user physically turns the printer on, then presses this dashboard
+    // button themselves to wake the phone before pressing Connect - explicit, not guessed.
+
+    /** A brief, one-shot wake - nothing is held afterward, so it can never fight a manual
+     *  power-button lock (see usbtap's UsbAllowService for why that matters). */
+    @SuppressWarnings("deprecation") // SCREEN_BRIGHT_WAKE_LOCK has no non-deprecated replacement
+    public void wakeScreen() {
+        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        if (pm == null) return;
+        PowerManager.WakeLock oneShot = pm.newWakeLock(
+                PowerManager.SCREEN_BRIGHT_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP,
+                "PrintHost:manualWake");
+        oneShot.acquire(1000);
+        oneShot.release();
+    }
+
+    /**
+     * Locking the screen isn't something a regular app is allowed to do on its own - only an
+     * AccessibilityService can call performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN). usbtap
+     * already has exactly that capability (it uses the same call for its own dialog-handling
+     * flow), so this just asks it to do it via a targeted broadcast rather than duplicating an
+     * accessibility service inside PrintHost itself.
+     */
+    public void lockScreen() {
+        Intent intent = new Intent("dev.oleksandr.usbtap.ACTION_LOCK_SCREEN");
+        intent.setPackage("dev.oleksandr.usbtap");
+        sendBroadcast(intent);
+    }
+
     // ---- camera / torch -----------------------------------------------------------------------
 
     public boolean cameraStart() {

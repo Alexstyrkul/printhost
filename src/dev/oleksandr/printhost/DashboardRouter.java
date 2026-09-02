@@ -46,6 +46,12 @@ public class DashboardRouter implements RequestRouter {
         } else if (p.equals("/disconnect") && req.method.equals("POST")) {
             service.disconnectPrinter();
             writeJson(out, 200, resultJson(true, service.getStateJson()));
+        } else if (p.equals("/screen/wake") && req.method.equals("POST")) {
+            service.wakeScreen();
+            writeJson(out, 200, resultJson(true, service.getStateJson()));
+        } else if (p.equals("/screen/lock") && req.method.equals("POST")) {
+            service.lockScreen();
+            writeJson(out, 200, resultJson(true, service.getStateJson()));
         } else if (p.equals("/debug/sdlist") && req.method.equals("GET")) {
             writeText(out, 200, "text/plain", service.debugListSdFiles());
         } else if (p.equals("/sdfiles") && req.method.equals("GET")) {

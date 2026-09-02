@@ -129,6 +129,18 @@
   .camera-controls button { flex: 1; padding: 10px 0; font-size: 12.5px; display: flex; align-items: center; justify-content: center; gap: 7px; }
 
   .footer { text-align: center; font-size: 10.5px; color: var(--text-faint); margin-top: 8px; }
+
+  .toast { position: fixed; left: 50%; top: 16px; transform: translateX(-50%) translateY(-20px);
+           background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius);
+           padding: 12px 16px; display: flex; align-items: center; gap: 10px; box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+           opacity: 0; pointer-events: none; transition: opacity 0.25s, transform 0.25s; z-index: 100; max-width: 90vw; }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); pointer-events: auto; }
+  .toast-icon { flex: none; width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center; justify-content: center; }
+  .toast.success .toast-icon { background: var(--accent-dim); color: var(--accent); }
+  .toast.error .toast-icon { background: var(--danger-dim); color: var(--danger); }
+  .toast-text { font-size: 12.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .toast-close { flex: none; background: none; border: none; color: var(--text-faint); padding: 2px; margin-left: 4px; }
+  .toast-close:hover { color: var(--text); }
 </style>
 </head>
 <body>
@@ -148,6 +160,8 @@
       </svg>
       <span id="batteryPct" class="num">-</span>%<span id="batteryChargingIcon"></span>
     </span>
+    <button id="wakeScreenBtn" class="small" title="Wake the phone's screen">Wake</button>
+    <button id="lockScreenBtn" class="small" title="Lock the phone's screen">Lock</button>
     <button id="connectToggleBtn" class="small">Connect</button>
   </div>
 </div>
@@ -235,6 +249,14 @@
 
 <div class="footer" id="firmwareInfo"></div>
 
+<div class="toast" id="toast">
+  <span class="toast-icon" id="toastIcon"></span>
+  <span class="toast-text" id="toastText"></span>
+  <button class="toast-close" id="toastClose" title="Dismiss">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+  </button>
+</div>
+
 <script>
 var LOW_BATTERY_THRESHOLD = 30;
 var RING_CIRCUMFERENCE = 2 * Math.PI * 50;
@@ -244,6 +266,7 @@ var torchOn = false;
 var selectedFile = null;
 var wasLive = false;
 var currentSdFilename = null;
+var lastPhase = null;
 
 var FRIENDLY_PHASE = {
   DISCONNECTED: "Disconnected",
@@ -273,6 +296,86 @@ function fmtBytes(n) {
   if (n < 1024) return n + " B";
   if (n < 1024 * 1024) return Math.round(n / 1024) + " KB";
   return (n / 1024 / 1024).toFixed(1) + " MB";
+}
+
+var toastTimer = null;
+
+function showToast(kind, text) {
+  var toast = $("toast");
+  $("toastIcon").innerHTML = kind === "success"
+      ? '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>'
+      : '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4M12 17h.01"/><circle cx="12" cy="12" r="9"/></svg>';
+  $("toastText").textContent = text;
+  toast.className = "toast show " + kind;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(function () { toast.classList.remove("show"); }, 10000);
+  playChime(kind);
+}
+$("toastClose").onclick = function () { $("toast").classList.remove("show"); clearTimeout(toastTimer); };
+
+// No sound file to ship (single-file HTML asset, no bundled audio) and no OS-level notification
+// permission to rely on (see PRINTHOST_STATUS.md - macOS notification permissions turned into a
+// dead end) - Web Audio needs neither. Success and error get deliberately different melodies
+// (not just beep count) so they're not confusable at a glance/listen: success is a smooth rising
+// two-note sine chime, error is three flat, harsher square-wave beeps at a lower pitch.
+//
+// Browsers start an AudioContext "suspended" until the page has seen at least one real user
+// gesture (click/tap/key) - confirmed on real hardware: opening the dashboard via a fresh link
+// (typing/pasting a URL doesn't count as a gesture) showed the toast banner fine but produced no
+// sound at all, silently. A single shared context, resumed on the page's first interaction
+// (whatever it is - Connect, Choose File, anything), covers the real scenario: the dashboard is
+// normally clicked around in before a print ever finishes, so by the time a chime is actually
+// needed it's already unlocked. resume() is also called defensively on every play, in case the
+// browser suspended it again (e.g. after the tab was backgrounded for a while).
+var sharedAudioCtx = null;
+function getAudioCtx() {
+  if (!sharedAudioCtx) {
+    sharedAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  return sharedAudioCtx;
+}
+["click", "touchstart", "keydown"].forEach(function (evt) {
+  document.addEventListener(evt, function () {
+    getAudioCtx().resume();
+  }, { once: true, passive: true });
+});
+
+function playChime(kind) {
+  try {
+    var ctx = getAudioCtx();
+    ctx.resume();
+    var notes = kind === "success" ? [660, 990] : [330, 330, 330];
+    var noteDuration = kind === "success" ? 0.16 : 0.12;
+    var gap = kind === "success" ? 0.15 : 0.22;
+    var waveform = kind === "success" ? "sine" : "square";
+    for (var i = 0; i < notes.length; i++) {
+      (function (freq, delay) {
+        var osc = ctx.createOscillator();
+        var gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.type = waveform;
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0.0001, ctx.currentTime + delay);
+        gain.gain.exponentialRampToValueAtTime(0.25, ctx.currentTime + delay + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + delay + noteDuration);
+        osc.start(ctx.currentTime + delay);
+        osc.stop(ctx.currentTime + delay + noteDuration + 0.02);
+      })(notes[i], i * gap);
+    }
+  } catch (e) {}
+}
+
+/** Fires purely off phase transitions this tab has actually observed - no dependency on
+ *  OS-level notification permissions or a background listener process. Only meaningful while
+ *  the dashboard tab is open, which matches how it's actually used (left open on a monitor). */
+function checkForNotifiableTransition(s) {
+  if (lastPhase === "PRINTING" && s.phase === "IDLE" && s.printProgressPercent >= 100) {
+    showToast("success", "Print finished: " + (s.currentFileDisplay || s.currentFile || ""));
+  } else if (s.phase === "ERROR" && lastPhase !== "ERROR" && lastPhase !== null) {
+    showToast("error", s.lastError || "Printer error");
+  }
+  lastPhase = s.phase;
 }
 
 function loadSdFiles() {
@@ -345,6 +448,7 @@ function refreshStatus() {
 }
 
 function renderStatus(s) {
+  checkForNotifiableTransition(s);
   var phaseEl = $("phase");
   $("phaseText").textContent = FRIENDLY_PHASE[s.phase] || s.phase;
   phaseEl.className = "phase " + s.phase;
@@ -423,6 +527,8 @@ $("connectToggleBtn").onclick = function () {
   var path = this.textContent === "Disconnect" ? "/disconnect" : "/connect";
   post(path).then(function (r) { renderStatus(r.state); });
 };
+$("wakeScreenBtn").onclick = function () { post("/screen/wake"); };
+$("lockScreenBtn").onclick = function () { post("/screen/lock"); };
 $("startBtn").onclick = function () { post("/start").then(function(r){ renderStatus(r.state); }); };
 $("pauseBtn").onclick = function () {
   if (confirm("Pause the print?")) {
@@ -493,6 +599,18 @@ $("torchBtn").onclick = function () {
 
 refreshStatus();
 setInterval(refreshStatus, 2000);
+
+// ?demo=success or ?demo=error opens straight into a toast, so it can be shown/heard on the
+// actual device by opening a link - no console needed.
+var demoParam = new URLSearchParams(location.search).get("demo");
+if (demoParam === "success" || demoParam === "error") {
+  // Fire on the page's first tap/click rather than immediately on load - a demo toast shown
+  // right on load would hit the same "no sound before any gesture" browser restriction that
+  // playChime()'s own unlock listener is there to avoid for the real notification.
+  document.addEventListener("click", function () {
+    showToast(demoParam, demoParam === "success" ? "Print finished: demo.gcode" : "Demo error message");
+  }, { once: true });
+}
 </script>
 </body>
 </html>
