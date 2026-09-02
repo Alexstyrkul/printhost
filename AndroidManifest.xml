@@ -20,6 +20,7 @@
         android:label="PrintHost"
         android:icon="@android:drawable/sym_def_app_icon"
         android:allowBackup="false"
+        android:usesCleartextTraffic="true"
         android:supportsRtl="true">
 
         <activity

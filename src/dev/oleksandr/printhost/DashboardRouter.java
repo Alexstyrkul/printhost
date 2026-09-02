@@ -52,6 +52,22 @@ public class DashboardRouter implements RequestRouter {
         } else if (p.equals("/screen/lock") && req.method.equals("POST")) {
             service.lockScreen();
             writeJson(out, 200, resultJson(true, service.getStateJson()));
+        } else if (p.equals("/plug/on") && req.method.equals("POST")) {
+            PrinterService.UploadOutcome outcome = service.tapoPlugOn();
+            JSONObject json = resultJson(outcome.success, service.getStateJson());
+            try {
+                json.put("message", outcome.message);
+            } catch (Exception ignored) {
+            }
+            writeJson(out, outcome.success ? 200 : 502, json);
+        } else if (p.equals("/plug/off") && req.method.equals("POST")) {
+            PrinterService.UploadOutcome outcome = service.tapoPlugOff();
+            JSONObject json = resultJson(outcome.success, service.getStateJson());
+            try {
+                json.put("message", outcome.message);
+            } catch (Exception ignored) {
+            }
+            writeJson(out, outcome.success ? 200 : 502, json);
         } else if (p.equals("/debug/sdlist") && req.method.equals("GET")) {
             writeText(out, 200, "text/plain", service.debugListSdFiles());
         } else if (p.equals("/sdfiles") && req.method.equals("GET")) {

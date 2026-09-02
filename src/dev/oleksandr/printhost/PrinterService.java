@@ -61,8 +61,10 @@ public class PrinterService extends Service {
     private UsbManager usbManager;
     private PollerThread pollerThread;
     private TempPollerThread tempPollerThread;
+    private PlugPollerThread plugPollerThread;
     private File uploadedFile;
     private SdFilenameMap sdFilenameMap;
+    private TapoPlugController tapoPlugController;
 
     @Override
     public void onCreate() {
@@ -72,12 +74,16 @@ public class PrinterService extends Service {
         cameraController = new CameraController(this);
         macNotifier = new MacNotifier(this);
         sdFilenameMap = new SdFilenameMap(new File(getFilesDir(), "sd_filename_map.json"));
+        tapoPlugController = new TapoPlugController(this);
 
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PrintHost:service");
         wakeLock.acquire();
 
         createNotificationChannel();
+
+        plugPollerThread = new PlugPollerThread();
+        plugPollerThread.start();
     }
 
     @Override
@@ -99,6 +105,7 @@ public class PrinterService extends Service {
     public void onDestroy() {
         stopPoller();
         stopTempPoller();
+        if (plugPollerThread != null) plugPollerThread.requestStop();
         if (httpServer != null) httpServer.shutdown();
         cameraController.stop();
         printerConnection.disconnect();
@@ -715,6 +722,43 @@ public class PrinterService extends Service {
         }
     }
 
+    private static final int PLUG_POLL_INTERVAL_MS = 15000;
+
+    /** Independent of the printer connection - the plug's own state doesn't depend on whether
+     *  the printer is currently talked to over USB. Runs for the service's whole lifetime so the
+     *  dashboard's plug switch shows the real current state on first load (not just after this
+     *  app itself has toggled it), including changes made elsewhere (Tapo app, the plug's own
+     *  button). Each poll is a full KLAP handshake round trip, so this stays deliberately slower
+     *  than the temperature poller - the plug rarely changes state on its own. */
+    class PlugPollerThread extends Thread {
+        private volatile boolean stopRequested = false;
+
+        PlugPollerThread() {
+            super("PrintHostPlugPoller");
+        }
+
+        void requestStop() {
+            stopRequested = true;
+            interrupt();
+        }
+
+        @Override
+        public void run() {
+            while (!stopRequested) {
+                try {
+                    Thread.sleep(PLUG_POLL_INTERVAL_MS);
+                    if (stopRequested) break;
+                    if (!tapoPlugController.isConfigured()) continue;
+                    state.plugOn = tapoPlugController.isOn();
+                } catch (InterruptedException e) {
+                    break;
+                } catch (Exception e) {
+                    Log.w(TAG, "plug status poll failed (non-fatal)", e);
+                }
+            }
+        }
+    }
+
     private static final Pattern SD_PRINTING_BYTE = Pattern.compile("SD printing byte (\\d+)/(\\d+)");
     private static final Pattern ELAPSED_TIME = Pattern.compile("(\\d+):(\\d+)");
 
@@ -864,6 +908,37 @@ public class PrinterService extends Service {
         Intent intent = new Intent("dev.oleksandr.usbtap.ACTION_LOCK_SCREEN");
         intent.setPackage("dev.oleksandr.usbtap");
         sendBroadcast(intent);
+    }
+
+    // ---- Tapo smart plug (printer power) -------------------------------------------------------
+    // Not behind commandLock: talks over Wi-Fi to the plug, not the printer's USB-serial link, so
+    // it has nothing to serialize against - and a slow/stuck plug handshake must not block the
+    // dashboard's printer polling.
+
+    public UploadOutcome tapoPlugOn() {
+        try {
+            tapoPlugController.turnOn();
+            state.plugOn = true;
+            return new UploadOutcome(true, "Plug on");
+        } catch (IOException e) {
+            Log.e(TAG, "tapoPlugOn failed", e);
+            return new UploadOutcome(false, String.valueOf(e.getMessage()));
+        }
+    }
+
+    public UploadOutcome tapoPlugOff() {
+        try {
+            tapoPlugController.turnOff();
+            state.plugOn = false;
+            // The printer's power runs through this plug - cutting it kills the USB link too, so
+            // reflect that immediately instead of leaving a stale "connected"/IDLE dashboard until
+            // the poller eventually times out and notices on its own.
+            disconnectPrinter();
+            return new UploadOutcome(true, "Plug off");
+        } catch (IOException e) {
+            Log.e(TAG, "tapoPlugOff failed", e);
+            return new UploadOutcome(false, String.valueOf(e.getMessage()));
+        }
     }
 
     // ---- camera / torch -----------------------------------------------------------------------

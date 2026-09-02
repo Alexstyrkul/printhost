@@ -141,6 +141,19 @@
   .toast-text { font-size: 12.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .toast-close { flex: none; background: none; border: none; color: var(--text-faint); padding: 2px; margin-left: 4px; }
   .toast-close:hover { color: var(--text); }
+
+  .switch-item { display: flex; align-items: center; gap: 5px; }
+  .switch-label { font-size: 10.5px; font-weight: 700; color: var(--text-dim); }
+  .switch { position: relative; display: inline-block; width: 32px; height: 19px; flex: none; }
+  .switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+  .switch-slider { position: absolute; inset: 0; background: var(--panel-2); border: 1px solid var(--panel-border);
+                    border-radius: 20px; cursor: pointer; transition: background-color 0.15s, border-color 0.15s; }
+  .switch-slider::before { content: ""; position: absolute; width: 13px; height: 13px; left: 2px; top: 2px;
+                            background: #fff; border-radius: 50%; transition: transform 0.15s;
+                            box-shadow: 0 1px 3px rgba(0,0,0,0.35); }
+  .switch input:checked + .switch-slider { background: var(--accent); border-color: var(--accent); }
+  .switch input:checked + .switch-slider::before { transform: translateX(13px); }
+  .switch input:disabled + .switch-slider { opacity: 0.5; cursor: not-allowed; }
 </style>
 </head>
 <body>
@@ -160,8 +173,18 @@
       </svg>
       <span id="batteryPct" class="num">-</span>%<span id="batteryChargingIcon"></span>
     </span>
-    <button id="screenToggleBtn" class="small" title="Wake or lock the phone's screen">Wake</button>
-    <button id="connectToggleBtn" class="small">Connect</button>
+    <label class="switch-item" title="Turn the Tapo smart plug on or off">
+      <span class="switch-label">Plug</span>
+      <span class="switch"><input type="checkbox" id="plugToggle"><span class="switch-slider"></span></span>
+    </label>
+    <label class="switch-item" title="Wake or lock the phone's screen">
+      <span class="switch-label">Screen</span>
+      <span class="switch"><input type="checkbox" id="screenToggle"><span class="switch-slider"></span></span>
+    </label>
+    <label class="switch-item" title="Connect or disconnect the printer">
+      <span class="switch-label">Printer</span>
+      <span class="switch"><input type="checkbox" id="connectToggle"><span class="switch-slider"></span></span>
+    </label>
   </div>
 </div>
 
@@ -264,6 +287,7 @@ var cameraOn = false;
 var torchOn = false;
 var selectedFile = null;
 var wasLive = false;
+var screenToggleSyncSuppressedUntil = 0;
 var currentSdFilename = null;
 var lastPhase = null;
 
@@ -494,11 +518,19 @@ function renderStatus(s) {
   $("batteryWarning").className = "battery-warning" + (showWarning ? " show" : "");
   $("batteryWarningPct").textContent = pct;
 
-  var toggleBtn = $("connectToggleBtn");
-  toggleBtn.textContent = showAsConnected ? "Disconnect" : "Connect";
-  toggleBtn.disabled = s.phase === "CONNECTING";
+  $("connectToggle").checked = showAsConnected;
+  $("connectToggle").disabled = s.phase === "CONNECTING";
 
-  $("screenToggleBtn").textContent = s.screenOn ? "Lock" : "Wake";
+  if (Date.now() >= screenToggleSyncSuppressedUntil) {
+    $("screenToggle").checked = !!s.screenOn;
+  }
+
+  // Only the background plug poller and our own on/off clicks ever change plugOn - never
+  // force the switch to a state while the user might be mid-drag, but there's no drag state
+  // to preserve here (checkboxes just flip), so a plain sync on every poll is fine.
+  if (s.plugOn !== null && s.plugOn !== undefined) {
+    $("plugToggle").checked = s.plugOn;
+  }
 
   renderControls(s.phase);
 
@@ -524,13 +556,29 @@ function renderControls(phase) {
   $("stopBtn").style.display = (phase === "PRINTING" || phase === "PAUSED") ? "" : "none";
 }
 
-$("connectToggleBtn").onclick = function () {
-  var path = this.textContent === "Disconnect" ? "/disconnect" : "/connect";
-  post(path).then(function (r) { renderStatus(r.state); });
+$("connectToggle").onchange = function () {
+  var wantConnected = this.checked;
+  post(wantConnected ? "/connect" : "/disconnect").then(function (r) { renderStatus(r.state); });
 };
-$("screenToggleBtn").onclick = function () {
-  var path = this.textContent === "Lock" ? "/screen/lock" : "/screen/wake";
-  post(path).then(function (r) { renderStatus(r.state); });
+$("screenToggle").onchange = function () {
+  // Locking/waking the screen isn't instant on the phone's side (accessibility-service action,
+  // animation) - PowerManager.isInteractive() lags a beat behind it. Confirmed on real hardware:
+  // without this suppression window, the next status poll or two still reports the OLD state,
+  // flipping the switch back then forward again a moment after the user's own click.
+  screenToggleSyncSuppressedUntil = Date.now() + 2500;
+  post(this.checked ? "/screen/wake" : "/screen/lock");
+};
+$("plugToggle").onchange = function () {
+  var turnOn = this.checked;
+  var toggle = this;
+  post(turnOn ? "/plug/on" : "/plug/off").then(function (r) {
+    if (!r.success) {
+      toggle.checked = !turnOn;
+      showToast("error", r.message || (turnOn ? "Plug on failed" : "Plug off failed"));
+    } else {
+      showToast("success", turnOn ? "Plug turned on" : "Plug turned off");
+    }
+  });
 };
 $("startBtn").onclick = function () { post("/start").then(function(r){ renderStatus(r.state); }); };
 $("pauseBtn").onclick = function () {
