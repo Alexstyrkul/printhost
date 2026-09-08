@@ -68,6 +68,35 @@ public class DashboardRouter implements RequestRouter {
             } catch (Exception ignored) {
             }
             writeJson(out, outcome.success ? 200 : 502, json);
+        } else if (p.equals("/filament/unload") && req.method.equals("POST")) {
+            PrinterService.UploadOutcome outcome = service.unloadFilament();
+            JSONObject json = resultJson(outcome.success, service.getStateJson());
+            try {
+                json.put("message", outcome.message);
+            } catch (Exception ignored) {
+            }
+            writeJson(out, outcome.success ? 200 : 422, json);
+        } else if (p.equals("/level") && req.method.equals("POST")) {
+            PrinterService.UploadOutcome outcome = service.levelBed();
+            JSONObject json = resultJson(outcome.success, service.getStateJson());
+            try {
+                json.put("message", outcome.message);
+            } catch (Exception ignored) {
+            }
+            writeJson(out, outcome.success ? 200 : 422, json);
+        } else if (p.equals("/level/grid") && req.method.equals("GET")) {
+            JSONObject body = new JSONObject();
+            try {
+                body.put("grid", service.getLevelingGrid());
+                body.put("success", true);
+            } catch (Exception e) {
+                try {
+                    body.put("success", false);
+                    body.put("message", String.valueOf(e.getMessage()));
+                } catch (Exception ignored) {
+                }
+            }
+            writeJson(out, 200, body);
         } else if (p.equals("/debug/sdlist") && req.method.equals("GET")) {
             writeText(out, 200, "text/plain", service.debugListSdFiles());
         } else if (p.equals("/sdfiles") && req.method.equals("GET")) {

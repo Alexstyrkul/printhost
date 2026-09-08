@@ -659,6 +659,100 @@ public class PrinterService extends Service {
         }
     }
 
+    // ---- maintenance: filament unload / bed leveling -------------------------------------------
+    // Both are real physical actions (heating + extruder motion, or a full probe pass) - blocked
+    // outright while a print is active, same as the SD-file operations above, and never touched
+    // by anything but an explicit user click (see dashboard.html's confirm() dialogs).
+
+    private static final long LEVEL_TIMEOUT_MS = 150_000; // G29 stays silent on the wire while
+    // probing all 16 points - no keepalive lines to reset the sliding timeout the way M109 gets,
+    // so this has to cover the whole worst-case pass (home + 16-point probe) in one window.
+
+    public UploadOutcome unloadFilament() {
+        synchronized (commandLock) {
+            if (!printerConnection.isOpen()) {
+                return new UploadOutcome(false, "Not connected");
+            }
+            if (state.phase == PrinterState.Phase.PRINTING || state.phase == PrinterState.Phase.PAUSED
+                    || state.phase == PrinterState.Phase.UPLOADING) {
+                return new UploadOutcome(false, "Cannot unload filament while " + state.phase);
+            }
+            state.unloadingFilament = true;
+            try {
+                printerConnection.unloadFilament(new PrinterConnection.LineListener() {
+                    @Override
+                    public void onLine(String line) {
+                        synchronized (PrinterService.this) {
+                            parseTemperatures(line, state);
+                        }
+                    }
+                });
+                return new UploadOutcome(true, "Filament unloaded - pull it out now");
+            } catch (IOException | TimeoutException e) {
+                Log.e(TAG, "unloadFilament failed", e);
+                state.lastError = String.valueOf(e.getMessage());
+                return new UploadOutcome(false, state.lastError);
+            } finally {
+                state.unloadingFilament = false;
+            }
+        }
+    }
+
+    public UploadOutcome levelBed() {
+        synchronized (commandLock) {
+            if (!printerConnection.isOpen()) {
+                return new UploadOutcome(false, "Not connected");
+            }
+            if (state.phase == PrinterState.Phase.PRINTING || state.phase == PrinterState.Phase.PAUSED
+                    || state.phase == PrinterState.Phase.UPLOADING) {
+                return new UploadOutcome(false, "Cannot level while " + state.phase);
+            }
+            state.levelingBed = true;
+            try {
+                printerConnection.levelBed(LEVEL_TIMEOUT_MS);
+                return new UploadOutcome(true, "Bed leveling saved");
+            } catch (IOException | TimeoutException e) {
+                Log.e(TAG, "levelBed failed", e);
+                state.lastError = String.valueOf(e.getMessage());
+                return new UploadOutcome(false, state.lastError);
+            } finally {
+                state.levelingBed = false;
+            }
+        }
+    }
+
+    /**
+     * Per-point Z values from "M420 V" (see PrinterConnection.queryLevelingGrid()'s javadoc),
+     * parsed into rows of numbers for the dashboard's calibration-values table. Confirmed exact
+     * real format from print_2d_array() (Marlin/src/feature/bedlevel/bedlevel.cpp): a header row
+     * of bare column indices ("0","1","2","3" - no sign, no decimal point), then one row per Y
+     * with a row index followed by signed 3-decimal values ("+0.025", "-0.010", ...). Matching
+     * only tokens with BOTH a sign and a decimal point is what naturally skips the header and
+     * the leading row-index number without needing to special-case them.
+     */
+    private static final Pattern GRID_VALUE = Pattern.compile("[+-]\\d+\\.\\d+");
+
+    public JSONArray getLevelingGrid() throws IOException, TimeoutException {
+        synchronized (commandLock) {
+            String raw = printerConnection.queryLevelingGrid();
+            JSONArray rows = new JSONArray();
+            for (String line : raw.split("\n")) {
+                Matcher m = GRID_VALUE.matcher(line);
+                JSONArray row = new JSONArray();
+                while (m.find()) {
+                    try {
+                        row.put(Double.parseDouble(m.group()));
+                    } catch (org.json.JSONException ignored) {
+                        // put(double) only throws for NaN/Infinite - can't happen for a
+                        // regex-matched finite decimal token
+                    }
+                }
+                if (row.length() > 0) rows.put(row);
+            }
+            return rows;
+        }
+    }
+
     // ---- background polling while printing --------------------------------------------------
 
     private synchronized void startPoller() {

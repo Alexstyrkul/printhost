@@ -255,6 +255,67 @@ public class PrinterConnection {
         return sendAndWaitForOk("M24", DEFAULT_TIMEOUT_MS);
     }
 
+    /**
+     * Manual filament unload macro. This firmware doesn't have M701/M702 compiled in
+     * (FILAMENT_LOAD_UNLOAD_GCODES is commented out in Configuration_adv.h, confirmed against
+     * the real firmware source) - this replicates what the printer's own touchscreen does
+     * instead (Auto_in_out_feedstock(false) in the DWIN screen firmware), using that same
+     * function's real constants from dwin.h, not generic guesses: heat to 240C, push 15mm at
+     * 4mm/s (primes/melts the tip before pulling so it doesn't snap), retract 90mm at 2mm/s,
+     * then cool to 140C afterward - the same "warm standby" temp the stock macro leaves it at
+     * (below EXTRUDE_MINTEMP=180C, so it can't ooze, but warm enough to reheat quickly for a
+     * reload). listener sees temperature lines during the M109 heat-up so the caller can show
+     * live progress instead of a frozen dashboard for the ~1-2 minutes heating can take.
+     */
+    private static final int UNLOAD_HEAT_TEMP_C = 240;
+    private static final int UNLOAD_COOL_TEMP_C = 140;
+    private static final double UNLOAD_PUSH_MM = 15;
+    private static final double UNLOAD_PUSH_FEEDRATE_MM_S = 4;
+    private static final double UNLOAD_RETRACT_MM = 90;
+    private static final double UNLOAD_RETRACT_FEEDRATE_MM_S = 2;
+
+    public synchronized void unloadFilament(LineListener listener) throws IOException, TimeoutException {
+        sendAndWaitForOk("M104 S" + UNLOAD_HEAT_TEMP_C, DEFAULT_TIMEOUT_MS);
+        sendAndWaitForOk("M109 S" + UNLOAD_HEAT_TEMP_C, DEFAULT_TIMEOUT_MS, listener);
+        sendAndWaitForOk("G91", DEFAULT_TIMEOUT_MS);
+        sendAndWaitForOk(extrudeMove(UNLOAD_PUSH_MM, UNLOAD_PUSH_FEEDRATE_MM_S), DEFAULT_TIMEOUT_MS);
+        sendAndWaitForOk(extrudeMove(-UNLOAD_RETRACT_MM, UNLOAD_RETRACT_FEEDRATE_MM_S), DEFAULT_TIMEOUT_MS);
+        sendAndWaitForOk("G90", DEFAULT_TIMEOUT_MS);
+        sendAndWaitForOk("M104 S" + UNLOAD_COOL_TEMP_C, DEFAULT_TIMEOUT_MS);
+    }
+
+    private static String extrudeMove(double eDistanceMm, double feedrateMmPerSec) {
+        return String.format(java.util.Locale.US, "G1 E%.1f F%.0f", eDistanceMm, feedrateMmPerSec * 60);
+    }
+
+    /**
+     * Auto bed leveling, matching exactly what this printer's own touchscreen does when you
+     * press Confirm after a leveling pass (HMI_Leveling()'s confirm branch in the DWIN screen
+     * firmware: gcode.process_subcommands_now_P("M420 S1"); refresh_bed_level(); settings.save()
+     * - and settings.save() is the same real function M500 calls). G29 probes the BLTouch grid
+     * (4x4 = 16 points, GRID_MAX_POINTS_X=4, confirmed in Configuration.h for the active
+     * AUTO_BED_LEVELING_BILINEAR block) and builds the mesh; no heating needed first - it's a
+     * mechanical probe, not a melt-touch one. M420 S1 enables the mesh, M500 persists it to
+     * EEPROM so it survives this printer's frequent power-cycles through the Tapo plug.
+     *
+     * A full 16-point probe pass is silent on the wire until it's done (no keepalive lines like
+     * M109 gets), so the sliding per-line timeout that keeps a long M109 alive can't help here -
+     * levelTimeoutMs is passed straight through as the deadline for the G29 call specifically.
+     */
+    public synchronized void levelBed(long levelTimeoutMs) throws IOException, TimeoutException {
+        sendAndWaitForOk("G29", levelTimeoutMs);
+        sendAndWaitForOk("M420 S1", DEFAULT_TIMEOUT_MS);
+        sendAndWaitForOk("M500", DEFAULT_TIMEOUT_MS);
+    }
+
+    /** Raw per-point mesh values, straight from the printer's own currently-loaded (and possibly
+     *  EEPROM-restored, not just freshly-probed) calibration - "M420 V" is what
+     *  print_bilinear_leveling_grid() (Marlin/src/feature/bedlevel/abl/abl.cpp) sends in response,
+     *  confirmed against the real source. PrinterService parses the returned text into a grid. */
+    public synchronized String queryLevelingGrid() throws IOException, TimeoutException {
+        return sendAndWaitForOk("M420 V", DEFAULT_TIMEOUT_MS);
+    }
+
     public interface UploadProgressListener {
         void onProgress(long sentBytes, long totalBytes);
     }

@@ -40,6 +40,8 @@ public class PrinterState {
     public volatile boolean batteryCharging = false;
     public volatile boolean screenOn = false;
     public volatile Boolean plugOn = null; // null = unknown, not polled yet
+    public volatile boolean unloadingFilament = false;
+    public volatile boolean levelingBed = false;
 
     public synchronized JSONObject toJson() {
         JSONObject o = new JSONObject();
@@ -65,6 +67,8 @@ public class PrinterState {
             o.put("batteryCharging", batteryCharging);
             o.put("screenOn", screenOn);
             o.put("plugOn", plugOn == null ? JSONObject.NULL : plugOn);
+            o.put("unloadingFilament", unloadingFilament);
+            o.put("levelingBed", levelingBed);
 
             long remaining = 0;
             if (printProgressPercent > 0 && printProgressPercent < 100) {

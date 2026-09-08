@@ -130,6 +130,58 @@
 
   .footer { text-align: center; font-size: 10.5px; color: var(--text-faint); margin-top: 8px; }
 
+  .title-group { display: flex; align-items: center; gap: 10px; }
+  .menu-btn { width: 30px; height: 30px; padding: 0; flex: none; display: flex; align-items: center; justify-content: center;
+              background: var(--panel-2); border: 1px solid var(--panel-border); border-radius: var(--radius-sm);
+              color: var(--text-dim); cursor: pointer; }
+
+  /* Settings lives in a left drawer, hidden until asked for - not a block pushed into the main
+     scroll. Closed by default (translateX off-screen); the menu button and scrim are the only
+     way in/out. */
+  .sidebar-scrim { position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 90;
+                    opacity: 0; pointer-events: none; transition: opacity 0.25s ease; }
+  .sidebar-scrim.open { opacity: 1; pointer-events: auto; }
+  .sidebar { position: fixed; top: 0; left: 0; bottom: 0; width: 280px; max-width: 85vw;
+             background: var(--panel); border-right: 1px solid var(--panel-border);
+             box-shadow: 8px 0 24px rgba(0,0,0,0.4); z-index: 91;
+             display: flex; flex-direction: column;
+             transform: translateX(-100%); transition: transform 0.25s ease; }
+  .sidebar.open { transform: translateX(0); }
+  .sidebar-header { display: flex; align-items: center; justify-content: space-between;
+                      padding: 16px; border-bottom: 1px solid var(--panel-border); }
+  .sidebar-title { font-size: 14px; font-weight: 700; color: var(--text); }
+  .sidebar-close { width: 26px; height: 26px; display: flex; align-items: center; justify-content: center;
+                    background: none; border: none; color: var(--text-faint); cursor: pointer; padding: 0; }
+  .sidebar-body { padding: 14px; display: flex; flex-direction: column; gap: 8px; overflow-y: auto; }
+
+  .action-row { width: 100%; display: flex; align-items: center; gap: 10px; font-family: inherit;
+                background: var(--panel-2); border: 1px solid var(--panel-border); border-radius: var(--radius-sm);
+                padding: 12px 13px; cursor: pointer; }
+  .action-icon { flex: none; color: var(--text-dim); display: flex; }
+  .action-label { flex: 1; font-size: 12.5px; font-weight: 700; color: var(--text); text-align: left; }
+  .section-label { font-size: 10.5px; font-weight: 700; color: var(--text-faint); text-transform: uppercase;
+                     letter-spacing: 0.5px; margin: 6px 2px 0; }
+
+  .icon-toggle { flex: none; width: 30px; height: 30px; display: flex; align-items: center; justify-content: center;
+                 background: var(--panel); border: 1px solid var(--panel-border); border-radius: 7px;
+                 color: var(--text-dim); cursor: pointer; }
+  .icon-toggle.open { color: var(--accent); border-color: var(--accent-dim); background: var(--accent-dim); }
+
+  .grid-panel { max-height: 0; opacity: 0; overflow: hidden; margin-top: 0;
+                transition: max-height 0.25s ease, opacity 0.2s ease, margin-top 0.25s ease; }
+  .grid-panel.open { max-height: 220px; opacity: 1; margin-top: -2px; }
+  .grid-table { width: 100%; border-collapse: collapse; font-size: 11px; font-variant-numeric: tabular-nums;
+                background: var(--panel-2); border: 1px solid var(--panel-border); border-radius: var(--radius-sm); overflow: hidden; }
+  .grid-table td { text-align: center; padding: 7px 4px; color: var(--text-dim); }
+  .grid-table td.neg { color: var(--danger); }
+  .grid-table td.pos { color: var(--accent); }
+  .grid-table tr:not(:last-child) td { border-bottom: 1px solid var(--panel-border); }
+  .grid-table td:not(:last-child) { border-right: 1px solid var(--panel-border); }
+  .grid-empty { font-size: 11px; color: var(--text-faint); text-align: center; padding: 10px; }
+  .grid-caption { display: flex; justify-content: center; padding-top: 6px; }
+  .grid-caption-badge { background: #d8d9db; color: #26282c; font-size: 10px; font-weight: 800;
+                          letter-spacing: 0.5px; padding: 3px 10px; border-radius: 4px; }
+
   .toast { position: fixed; left: 50%; top: 16px; transform: translateX(-50%) translateY(-20px);
            background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius);
            padding: 12px 16px; display: flex; align-items: center; gap: 10px; box-shadow: 0 8px 24px rgba(0,0,0,0.4);
@@ -159,7 +211,12 @@
 <body>
 
 <div class="top-row">
-  <h1>PrintHost</h1>
+  <div class="title-group">
+    <button id="menuBtn" class="menu-btn" title="Settings">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+    </button>
+    <h1>PrintHost</h1>
+  </div>
   <div class="status-group">
     <span id="phase" class="phase">
       <svg class="phase-dot" width="7" height="7" viewBox="0 0 8 8" aria-hidden="true"><circle cx="4" cy="4" r="4" fill="currentColor"/></svg>
@@ -270,6 +327,35 @@
 </div>
 
 <div class="footer" id="firmwareInfo"></div>
+
+<div class="sidebar-scrim" id="sidebarScrim"></div>
+<div class="sidebar" id="sidebar">
+  <div class="sidebar-header">
+    <span class="sidebar-title">Settings</span>
+    <button id="sidebarClose" class="sidebar-close" title="Close">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+  </div>
+  <div class="sidebar-body">
+    <button id="unloadFilamentBtn" class="action-row">
+      <span class="action-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M2 12h4M18 12h4M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8"/></svg></span>
+      <span class="action-label">Unload Filament</span>
+    </button>
+
+    <div class="section-label">Calibration</div>
+    <button id="levelBedBtn" class="action-row">
+      <span class="action-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M8 4v6"/></svg></span>
+      <span class="action-label">Auto Level Table</span>
+      <span id="gridToggle" class="icon-toggle" title="Calibration Values">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+      </span>
+    </button>
+    <div class="grid-panel" id="gridPanel">
+      <table class="grid-table" id="gridTable"><tr><td class="grid-empty">-</td></tr></table>
+      <div class="grid-caption"><span class="grid-caption-badge">CREALITY</span></div>
+    </div>
+  </div>
+</div>
 
 <div class="toast" id="toast">
   <span class="toast-icon" id="toastIcon"></span>
@@ -521,6 +607,9 @@ function renderStatus(s) {
   $("connectToggle").checked = showAsConnected;
   $("connectToggle").disabled = s.phase === "CONNECTING";
 
+  $("unloadFilamentBtn").disabled = !!s.unloadingFilament;
+  $("levelBedBtn").disabled = !!s.levelingBed;
+
   if (Date.now() >= screenToggleSyncSuppressedUntil) {
     $("screenToggle").checked = !!s.screenOn;
   }
@@ -588,6 +677,97 @@ $("plugToggle").onchange = function () {
     }
   });
 };
+function openSidebar() {
+  $("sidebar").classList.add("open");
+  $("sidebarScrim").classList.add("open");
+}
+function closeSidebar() {
+  $("sidebar").classList.remove("open");
+  $("sidebarScrim").classList.remove("open");
+}
+$("menuBtn").onclick = openSidebar;
+$("sidebarClose").onclick = closeSidebar;
+$("sidebarScrim").onclick = closeSidebar;
+
+$("unloadFilamentBtn").onclick = function () {
+  if (!confirm("Heat the nozzle to 240°C and unload the filament? Make sure nothing is printing.")) return;
+  var btn = this;
+  btn.disabled = true;
+  post("/filament/unload").then(function (r) {
+    showToast(r.success ? "success" : "error",
+        r.success ? (r.message || "Filament unloaded - pull it out now") : (r.message || "Unload failed"));
+    btn.disabled = false;
+  });
+};
+
+$("levelBedBtn").onclick = function () {
+  if (!confirm("Run auto bed leveling? This probes the bed with the BLTouch and saves the result.")) return;
+  var btn = this;
+  btn.disabled = true;
+  post("/level").then(function (r) {
+    showToast(r.success ? "success" : "error",
+        r.success ? (r.message || "Bed leveling saved") : (r.message || "Leveling failed"));
+    btn.disabled = false;
+    if (r.success && $("gridPanel").classList.contains("open")) loadLevelingGrid();
+  });
+};
+
+/** Values straight from the printer's own currently-loaded mesh ("M420 V") - not just right
+ *  after running Auto Level Table, but any time the panel is opened, since a mesh saved in an
+ *  earlier session (or even from the printer's own screen) is still what's actually active. */
+var DEMO_GRID = [
+  [0.025, 0.050, -0.010, 0.030],
+  [-0.015, 0.000, 0.020, 0.045],
+  [0.010, -0.005, 0.015, 0.025],
+  [0.005, 0.020, 0.010, -0.010]
+];
+
+/** M420 V's first printed row is Y index 0 (the printer's Y-home position) - confirmed on the
+ *  real bed (Creality logo plate) that Y-home is the FAR edge from someone standing in front of
+ *  the printer, not the near edge. Reversed here so the table's BOTTOM row is the near edge and
+ *  the TOP row is the far edge - reading the table top-to-bottom then matches looking at the bed
+ *  from above while standing at the front, far-to-near. */
+function renderLevelingGrid(grid) {
+  var table = $("gridTable");
+  var html = "";
+  grid.slice().reverse().forEach(function (row) {
+    html += "<tr>" + row.map(function (v) {
+      var cls = v > 0 ? "pos" : (v < 0 ? "neg" : "");
+      return '<td class="' + cls + '">' + (v >= 0 ? "+" : "") + v.toFixed(3) + "</td>";
+    }).join("") + "</tr>";
+  });
+  table.innerHTML = html;
+}
+
+function loadLevelingGrid() {
+  var table = $("gridTable");
+  // ?demo=grid shows sample values without touching the printer - see the ?demo=success/error
+  // toast demo below for the same idea applied to the calibration grid.
+  if (new URLSearchParams(location.search).get("demo") === "grid") {
+    renderLevelingGrid(DEMO_GRID);
+    return;
+  }
+  table.innerHTML = '<tr><td class="grid-empty">Loading...</td></tr>';
+  fetch("/level/grid").then(function (r) { return r.json(); }).then(function (r) {
+    if (!r.success || !r.grid || !r.grid.length) {
+      table.innerHTML = '<tr><td class="grid-empty">' + (r.message || "No calibration data") + "</td></tr>";
+      return;
+    }
+    renderLevelingGrid(r.grid);
+  }).catch(function () {
+    table.innerHTML = '<tr><td class="grid-empty">Failed to load</td></tr>';
+  });
+}
+
+$("gridToggle").onclick = function (e) {
+  e.stopPropagation(); // sits inside the "Auto Level Table" row - don't also trigger that action
+  var panel = $("gridPanel");
+  var willOpen = !panel.classList.contains("open");
+  panel.classList.toggle("open", willOpen);
+  this.classList.toggle("open", willOpen);
+  if (willOpen) loadLevelingGrid();
+};
+
 $("startBtn").onclick = function () { post("/start").then(function(r){ renderStatus(r.state); }); };
 $("pauseBtn").onclick = function () {
   if (confirm("Pause the print?")) {
@@ -669,6 +849,12 @@ if (demoParam === "success" || demoParam === "error") {
   document.addEventListener("click", function () {
     showToast(demoParam, demoParam === "success" ? "Print finished: demo.gcode" : "Demo error message");
   }, { once: true });
+} else if (demoParam === "grid") {
+  // No audio involved here, so this can open straight away - no click-gate needed.
+  openSidebar();
+  $("gridPanel").classList.add("open");
+  $("gridToggle").classList.add("open");
+  loadLevelingGrid();
 }
 </script>
 </body>
