@@ -35,6 +35,13 @@ phone's local IP in any browser on the same network.
    time you connect the printer)
 4. Open `http://<phone-ip>:8899/` in a browser on the same network
 
+For a fully unattended setup (phone left running by the printer, no one
+around to tap "Allow" every time it reconnects), also install
+[usbtap](https://github.com/Alexstyrkul/usbtap) - a small companion
+accessibility service that auto-confirms that USB permission dialog and
+powers the dashboard's screen-lock button. Optional otherwise: without it
+you just tap the dialog yourself the first time each session.
+
 Optional: run `mac-notify-listener.py` on a Mac on the same network for native
 notifications - PrintHost auto-discovers it, no configuration needed.
 
