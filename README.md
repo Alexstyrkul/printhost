@@ -10,6 +10,8 @@ to the printer's CH340 serial chip) and serves a small dashboard over your local
 Wi-Fi network. No app installs, no cloud account, no port forwarding — open the
 phone's local IP in any browser on the same network.
 
+![PrintHost dashboard](docs/dashboard.png)
+
 ## Features
 
 - Upload and start/pause/resume/stop prints, with live temperature and progress
@@ -65,6 +67,13 @@ specific printer and phone, not a polished general-purpose product - expect
 rough edges. It's a single Android app with no build variants, no CI, and no
 test suite; changes are verified by hand against the real hardware.
 
+## Third-party code
+
+Bundles [usb-serial-for-android](https://github.com/mik3y/usb-serial-for-android)
+(`src/com/hoho/android/usbserial/`) as source rather than a Gradle dependency,
+since this project builds with plain `aapt2`/`javac`/`d8`, not Gradle. MIT
+licensed, same as this project.
+
 ## License
 
-No license file yet - all rights reserved by default. Ask before reusing.
+MIT - see [LICENSE](LICENSE).
