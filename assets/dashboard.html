@@ -279,6 +279,11 @@
       </div>
     </div>
 
+    <div class="pill" id="layerBox" style="display:none; justify-content:center; gap:7px;">
+      <svg class="pill-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
+      <span class="num" style="font-size:12.5px; font-weight:700;">Layer <span id="currentLayer">-</span>/<span id="totalLayers">-</span></span>
+    </div>
+
     <div class="pill file-box" id="currentFile">no file selected</div>
 
     <div class="controls-row">
@@ -587,6 +592,13 @@ function renderStatus(s) {
       : (s.phase === "PRINTING" ? "Calculating..." : "-");
 
   $("currentFile").textContent = s.currentFileDisplay || s.currentFile || "no file selected";
+
+  var hasLayerInfo = s.currentLayer != null && s.totalLayers != null;
+  $("layerBox").style.display = hasLayerInfo ? "flex" : "none";
+  if (hasLayerInfo) {
+    $("currentLayer").textContent = s.currentLayer;
+    $("totalLayers").textContent = s.totalLayers;
+  }
 
   currentSdFilename = s.currentFile || null;
   highlightSelectedSdFile();

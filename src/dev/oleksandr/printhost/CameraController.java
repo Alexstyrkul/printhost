@@ -44,6 +44,7 @@ public class CameraController {
     private CameraCaptureSession captureSession;
     private ImageReader imageReader;
     private CaptureRequest.Builder repeatingRequestBuilder;
+    private FocusLockCallback focusLockCallback;
 
     private volatile byte[] latestFrame;
     private volatile boolean torchRequested = false;
@@ -93,6 +94,7 @@ public class CameraController {
     }
 
     private void teardown() {
+        focusLockCallback = null;
         if (captureSession != null) {
             captureSession.close();
             captureSession = null;
@@ -125,7 +127,13 @@ public class CameraController {
         try {
             if (cameraDevice != null && captureSession != null && repeatingRequestBuilder != null) {
                 applyTorchToRequest(repeatingRequestBuilder, on);
-                captureSession.setRepeatingRequest(repeatingRequestBuilder.build(), null, bgHandler);
+                // Must keep passing focusLockCallback here, not null - a null callback replaces
+                // the session's repeating-request callback entirely, silently killing
+                // FocusLockCallback's watch for FOCUSED_LOCKED if the torch is toggled before
+                // focus has settled. Confirmed on real hardware: toggling the flashlight right
+                // after Camera On left CONTROL_AF_TRIGGER_START stuck in the builder forever,
+                // making the camera re-trigger an autofocus scan on every single frame.
+                captureSession.setRepeatingRequest(repeatingRequestBuilder.build(), focusLockCallback, bgHandler);
                 return true;
             }
             String id = backCameraId != null ? backCameraId : findBackCameraId();
@@ -221,13 +229,17 @@ public class CameraController {
                         // Focus once, then lock - see FocusLockCallback. Without this the
                         // default AF mode (TEMPLATE_RECORD's CONTINUOUS_VIDEO) kept re-hunting on
                         // every bit of nozzle/print motion, confirmed annoying on real hardware.
+                        // The callback instance is kept in a field (not local) so setTorch() can
+                        // keep passing it too - see setTorch()'s own comment for why that matters.
                         repeatingRequestBuilder.set(CaptureRequest.CONTROL_AF_MODE,
                                 CaptureRequest.CONTROL_AF_MODE_AUTO);
                         repeatingRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER,
                                 CaptureRequest.CONTROL_AF_TRIGGER_START);
+                        focusLockCallback = new FocusLockCallback();
                         session.setRepeatingRequest(repeatingRequestBuilder.build(),
-                                new FocusLockCallback(), bgHandler);
+                                focusLockCallback, bgHandler);
                     } else {
+                        focusLockCallback = null;
                         session.setRepeatingRequest(repeatingRequestBuilder.build(), null, bgHandler);
                     }
                 } catch (CameraAccessException e) {
@@ -273,7 +285,12 @@ public class CameraController {
                     try {
                         repeatingRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER,
                                 CaptureRequest.CONTROL_AF_TRIGGER_IDLE);
-                        captureSession.setRepeatingRequest(repeatingRequestBuilder.build(), null, bgHandler);
+                        // Keep passing `this`, not null - same reasoning as setTorch(): a null
+                        // callback here would just be this callback discarding itself, which is
+                        // harmless once locked=true, but inconsistent with setTorch() re-passing
+                        // this same (by-then-harmless) instance. One rule everywhere is simpler
+                        // than reasoning about which call sites are safe to pass null.
+                        captureSession.setRepeatingRequest(repeatingRequestBuilder.build(), this, bgHandler);
                     } catch (CameraAccessException e) {
                         Log.e(TAG, "focus lock finalize failed", e);
                     }

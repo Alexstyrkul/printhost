@@ -261,6 +261,8 @@ public class PrinterService extends Service {
                 state.lastError = "";
                 uploadedFile = null;
                 state.fanSpeed = null;
+                state.currentLayer = null;
+                state.totalLayers = null;
                 updateNotification("Selected: " + filename);
                 return new UploadOutcome(true, "Selected " + filename);
             } catch (IOException | TimeoutException e) {
@@ -344,10 +346,21 @@ public class PrinterService extends Service {
                 printerConnection.connect(target);
                 state.firmwareInfo = firstLine(printerConnection.queryFirmwareInfo());
                 state.zOffset = parseZOffset(printerConnection.queryZOffset());
-                state.phase = PrinterState.Phase.IDLE;
                 state.lastError = "";
                 updateNotification("Connected");
                 startTempPoller();
+                // The printer's own SD print keeps running regardless of whether this app was
+                // connected to it - confirmed on real hardware after the app process itself
+                // restarted mid-print: reconnecting used to always show IDLE/0% with the actual
+                // print continuing untracked in the background until it finished. Detect and
+                // resume live monitoring instead.
+                if (resumeActiveSdPrintIfAny()) {
+                    state.phase = PrinterState.Phase.PRINTING;
+                    updateNotification("Printing " + state.currentFileDisplay);
+                    startPoller();
+                } else {
+                    state.phase = PrinterState.Phase.IDLE;
+                }
                 return true;
             } catch (IOException | TimeoutException e) {
                 Log.e(TAG, "connectPrinter failed", e);
@@ -357,6 +370,62 @@ public class PrinterService extends Service {
                 return false;
             }
         }
+    }
+
+    /**
+     * Checks whether the printer reports an SD print already running, and if so restores
+     * state.currentFile/currentFileDisplay/printProgressPercent/elapsedSeconds from it - called
+     * from within connectPrinter()'s own commandLock, not a separate entry point. Only inspects
+     * state; the caller decides what to do with the phase (matches selectSdFile()/startPrint()'s
+     * existing division of responsibility elsewhere in this class).
+     */
+    private boolean resumeActiveSdPrintIfAny() {
+        try {
+            String progress = printerConnection.pollProgress();
+            Matcher m = SD_PRINTING_BYTE.matcher(progress);
+            if (!m.find()) return false;
+            long done = Long.parseLong(m.group(1));
+            long total = Long.parseLong(m.group(2));
+            if (total <= 0) return false;
+            state.printProgressPercent = (int) (done * 100 / total);
+
+            try {
+                String name = parseCurrentFilename(printerConnection.queryCurrentFilename());
+                if (name != null) {
+                    state.currentFile = name;
+                    state.currentFileDisplay = sdFilenameMap.displayNameFor(name);
+                }
+            } catch (IOException | TimeoutException e) {
+                Log.w(TAG, "Couldn't recover the filename after reconnect (non-fatal)", e);
+            }
+            try {
+                state.elapsedSeconds = parseElapsedSeconds(printerConnection.pollPrintTime());
+            } catch (IOException | TimeoutException e) {
+                Log.w(TAG, "Couldn't recover elapsed time after reconnect (non-fatal)", e);
+            }
+            // Fan speed and layer number are both looked up by byte-offset against this file
+            // (see PollerThread.pollOnce()) - the on-disk copy survives an app restart even
+            // though the `uploadedFile` field itself doesn't, so just point back at it. Only
+            // meaningful if this app instance is the one that uploaded the file currently
+            // printing - same assumption the upload flow itself already relies on.
+            File localCopy = new File(getFilesDir(), "current_upload.gcode");
+            if (uploadedFile == null && localCopy.exists()) {
+                uploadedFile = localCopy;
+            }
+            return true;
+        } catch (IOException | TimeoutException e) {
+            Log.w(TAG, "Couldn't check for an active SD print on connect (non-fatal)", e);
+            return false;
+        }
+    }
+
+    private static String parseCurrentFilename(String m27cResponse) {
+        int idx = m27cResponse.indexOf("Current file:");
+        if (idx < 0) return null;
+        String rest = m27cResponse.substring(idx + "Current file:".length()).trim();
+        int newline = rest.indexOf('\n');
+        String name = (newline >= 0 ? rest.substring(0, newline) : rest).trim();
+        return name.isEmpty() ? null : name;
     }
 
     public void disconnectPrinter() {
@@ -382,6 +451,8 @@ public class PrinterService extends Service {
             state.printProgressPercent = 0;
             state.elapsedSeconds = 0;
             state.fanSpeed = null;
+            state.currentLayer = null;
+            state.totalLayers = null;
             uploadedFile = null;
             updateNotification("Idle");
         }
@@ -916,6 +987,10 @@ public class PrinterService extends Service {
                 state.elapsedSeconds = parseElapsedSeconds(printTime);
                 if (uploadedFile != null) {
                     state.fanSpeed = GcodeFanParser.fanSpeedAtByteOffset(uploadedFile, state.uploadedBytes);
+                    GcodeLayerParser.LayerInfo layerInfo =
+                            GcodeLayerParser.layerInfoAtByteOffset(uploadedFile, state.uploadedBytes);
+                    state.currentLayer = layerInfo == null ? null : layerInfo.currentLayer;
+                    state.totalLayers = layerInfo == null ? null : layerInfo.totalLayers;
                 }
                 if (done) {
                     state.phase = PrinterState.Phase.IDLE;
@@ -967,6 +1042,14 @@ public class PrinterService extends Service {
         if (m.find()) {
             long done = Long.parseLong(m.group(1));
             long total = Long.parseLong(m.group(2));
+            // Also the live SD read position, not just an upload-progress number - fan speed
+            // and layer number are both looked up against this same field by byte offset (see
+            // PollerThread.pollOnce()). Confirmed this was never updated after the initial
+            // upload finished until now, meaning both would have been reading whatever was at
+            // the very end of the file the entire time a print was running, not the real
+            // position - the upload progress bar itself only ever shows during UPLOADING, so
+            // repurposing the field during PRINTING doesn't conflict with it.
+            state.uploadedBytes = done;
             if (total > 0) {
                 state.printProgressPercent = (int) (done * 100 / total);
                 if (done >= total) return true;

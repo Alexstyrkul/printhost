@@ -178,6 +178,14 @@ public class PrinterConnection {
         return sendAndWaitForOk("M27", DEFAULT_TIMEOUT_MS);
     }
 
+    /** "M27 C" - confirmed in the real firmware source (gcode/sd/M27.cpp) - reports "Current
+     *  file: NAME" for whatever's selected/printing right now. Used to recover the filename
+     *  after reconnecting to a printer that's already mid SD-print (this app's own process
+     *  restarting doesn't stop or reselect the printer's job). */
+    public synchronized String queryCurrentFilename() throws IOException, TimeoutException {
+        return sendAndWaitForOk("M27 C", DEFAULT_TIMEOUT_MS);
+    }
+
     public synchronized String pollPrintTime() throws IOException, TimeoutException {
         return sendAndWaitForOk("M31", DEFAULT_TIMEOUT_MS);
     }
