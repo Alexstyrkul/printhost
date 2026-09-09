@@ -5,6 +5,8 @@ import android.util.Log;
 import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -38,6 +40,8 @@ public class DashboardRouter implements RequestRouter {
         String p = req.path;
         if (p.equals("/") && req.method.equals("GET")) {
             writeDashboard(out);
+        } else if (p.startsWith("/vendor/") && req.method.equals("GET")) {
+            writeVendorAsset(out, p);
         } else if (p.equals("/status") && req.method.equals("GET")) {
             writeJson(out, 200, service.getStateJson());
         } else if (p.equals("/connect") && req.method.equals("POST")) {
@@ -153,6 +157,8 @@ public class DashboardRouter implements RequestRouter {
         } else if (p.equals("/torch/off") && req.method.equals("POST")) {
             boolean ok = service.torch(false);
             writeJson(out, ok ? 200 : 502, resultJson(ok, service.getStateJson()));
+        } else if (p.equals("/gcode/current") && req.method.equals("GET")) {
+            writeUploadedGcode(out);
         } else {
             writeText(out, 404, "text/plain", "Not found: " + p);
         }
@@ -198,6 +204,34 @@ public class DashboardRouter implements RequestRouter {
         }
     }
 
+    /** Raw bytes of whatever's currently loaded (PrinterService.uploadedFile), for the
+     *  dashboard's 3D preview to parse client-side - it has no other way to reach a file that
+     *  only ever lived in the app's private storage. Streamed rather than buffered like
+     *  readAsset(): a real gcode file can be tens of MB, dashboard.html itself is a few KB. */
+    private void writeUploadedGcode(OutputStream out) throws IOException {
+        File file = service.getUploadedFile();
+        if (file == null || !file.exists()) {
+            writeText(out, 404, "text/plain", "No gcode file uploaded this session");
+            return;
+        }
+        String head = "HTTP/1.1 200 OK\r\n"
+                + "Content-Type: text/plain; charset=utf-8\r\n"
+                + "Content-Length: " + file.length() + "\r\n"
+                + "Connection: close\r\n\r\n";
+        out.write(head.getBytes(StandardCharsets.US_ASCII));
+        InputStream in = new FileInputStream(file);
+        try {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) != -1) {
+                out.write(buf, 0, n);
+            }
+        } finally {
+            in.close();
+        }
+        out.flush();
+    }
+
     private static void sleepQuiet(long ms) {
         try {
             Thread.sleep(ms);
@@ -211,6 +245,33 @@ public class DashboardRouter implements RequestRouter {
             cachedDashboardHtml = readAsset("dashboard.html");
         }
         writeBytes(out, 200, "text/html; charset=utf-8", cachedDashboardHtml);
+    }
+
+    /** Static files bundled under assets/vendor/ - the 3D preview's JS libraries and the print
+     *  bed model, none of which existed as servable routes before (writeDashboard() only ever
+     *  served the one fixed asset). AssetManager.open() reads out of the APK's own asset
+     *  namespace, not the real filesystem, so "..' can't escape to anything outside it - rejected
+     *  anyway as a cheap sanity check. */
+    private void writeVendorAsset(OutputStream out, String path) throws IOException {
+        if (path.contains("..")) {
+            writeText(out, 404, "text/plain", "Not found: " + path);
+            return;
+        }
+        byte[] body;
+        try {
+            body = readAsset(path.substring(1)); // strip leading '/'
+        } catch (IOException e) {
+            writeText(out, 404, "text/plain", "Not found: " + path);
+            return;
+        }
+        writeBytes(out, 200, vendorContentType(path), body);
+    }
+
+    private static String vendorContentType(String path) {
+        if (path.endsWith(".js")) return "application/javascript; charset=utf-8";
+        if (path.endsWith(".svg")) return "image/svg+xml";
+        if (path.endsWith(".stl")) return "application/octet-stream";
+        return "application/octet-stream";
     }
 
     private byte[] readAsset(String name) throws IOException {

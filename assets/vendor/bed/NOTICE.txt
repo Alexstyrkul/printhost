@@ -1,0 +1,9 @@
+creality_ender3v3se_buildplate_model.stl
+creality_ender3v3se_buildplate_texture.svg (unused currently — no UVs on the STL)
+
+Source: OrcaSlicer (https://github.com/SoftFever/OrcaSlicer), path
+resources/profiles/Creality/, machine profile "Creality Ender-3 V3 SE".
+License: AGPL-3.0 (whole-repo license; no separate asset license found).
+
+Fetched 2026-09-09 for the printhost-preview-test sandbox. Not yet cleared
+for use beyond this local dev/test prototype — revisit before shipping.

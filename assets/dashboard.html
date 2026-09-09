@@ -206,7 +206,39 @@
   .switch input:checked + .switch-slider { background: var(--accent); border-color: var(--accent); }
   .switch input:checked + .switch-slider::before { transform: translateX(13px); }
   .switch input:disabled + .switch-slider { opacity: 0.5; cursor: not-allowed; }
+
+  /* --- Print Preview card --- */
+  .preview-card { padding: 0; overflow: hidden; }
+  .preview-header { width: 100%; display: flex; align-items: center; gap: 10px; padding: 14px 16px; }
+  .preview-header .action-icon { color: var(--text-dim); }
+  .preview-header .action-label { font-size: 12.5px; font-weight: 700; color: var(--text); flex: 1; }
+  .preview-header .num { font-size: 11.5px; color: var(--text-faint); font-weight: 600; }
+  .preview-body { max-height: 420px; opacity: 1; overflow: hidden; }
+  .preview-stage { position: relative; width: 100%; aspect-ratio: 4 / 3; background: #3a3d42;
+                    border-top: 1px solid var(--panel-border); overflow: hidden; }
+  .preview-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  #previewGhostCanvas { z-index: 1; opacity: 0.65; }
+  #previewSolidCanvas { z-index: 2; }
+  .preview-loading { position: absolute; inset: 0; z-index: 3; display: flex; align-items: center;
+                      justify-content: center; color: var(--text-faint); font-size: 12px;
+                      text-align: center; padding: 0 20px; transition: opacity 0.2s ease; pointer-events: none; }
+  .preview-loading.hidden { opacity: 0; }
+  .preview-loading.error { color: var(--danger); font-weight: 600; }
+  .preview-legend { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+                     padding: 10px 16px 14px; font-size: 11px; color: var(--text-dim); }
+  .preview-legend-swatches { display: flex; gap: 14px; }
+  .preview-legend-swatches span { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
 </style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/vendor/three.module.js",
+    "lil-gui": "/vendor/lil-gui.js",
+    "gcode-preview": "/vendor/gcode-preview.js"
+  }
+}
+</script>
 </head>
 <body>
 
@@ -279,11 +311,6 @@
       </div>
     </div>
 
-    <div class="pill" id="layerBox" style="display:none; justify-content:center; gap:7px;">
-      <svg class="pill-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
-      <span class="num" style="font-size:12.5px; font-weight:700;">Layer <span id="currentLayer">-</span>/<span id="totalLayers">-</span></span>
-    </div>
-
     <div class="pill file-box" id="currentFile">no file selected</div>
 
     <div class="controls-row">
@@ -316,7 +343,33 @@
     </div>
   </div>
 
-  <div class="card camera-card">
+  <div class="card preview-card">
+    <div class="preview-header">
+      <span class="action-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 2 7l10 5 10-5-10-5Z"/><path d="M2 17l10 5 10-5M2 12l10 5 10-5"/></svg></span>
+      <span class="action-label">Print Preview</span>
+      <span class="num" id="previewLayerReadout">Layer -/-</span>
+    </div>
+    <div class="preview-body" id="previewBody">
+      <div class="preview-stage" id="previewStage">
+        <canvas id="previewGhostCanvas"></canvas>
+        <canvas id="previewSolidCanvas"></canvas>
+        <div class="preview-loading" id="previewLoading">No file loaded</div>
+      </div>
+      <div class="preview-legend">
+        <div class="preview-legend-swatches">
+          <span><span class="swatch" style="background:#3ecf7e"></span>Printed</span>
+          <span><span class="swatch" style="background:#9aa0ac"></span>Remaining</span>
+        </div>
+        <span class="num" id="previewPercentReadout">-</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" style="grid-column: 1; border-style: dashed; display: flex; align-items: center; justify-content: center; color: var(--text-faint); font-size: 11px;">
+    Reserved
+  </div>
+
+  <div class="card camera-card" style="grid-column: 2;">
     <div class="camera-frame">
       <img id="cameraImg" alt="camera stream">
       <div class="camera-placeholder" id="cameraPlaceholder">
@@ -557,6 +610,78 @@ function deleteSdFile(name) {
 
 $("refreshSdBtn").onclick = function () { loadSdFiles(); };
 
+/** Lazily loads the 3D preview as soon as a file is *selected* (currentFile set - upload
+ *  verified, chosen from the SD list, or already printing), not once layer info shows up:
+ *  currentLayer/totalLayers only start populating once byte-offset progress exists, i.e. once
+ *  printing is already under way, which is well after Start becomes pressable and the user
+ *  expects to see something. totalLayers before that comes from the client's own parse
+ *  (api.totalLayers) instead of the server, which doesn't know it yet either at that point.
+ *
+ *  currentFile is set the same way whether the file was freshly uploaded this session (a local
+ *  copy exists, GET /gcode/current serves it) or picked from the SD card list (no local copy -
+ *  see PrinterService.selectSdFile's comment - so that GET 404s and the load below fails with a
+ *  visible error rather than silently showing nothing).
+ *
+ *  No file selected resets to idle so the next real selection re-triggers a fresh load instead
+ *  of showing the previous file's geometry. */
+var previewApi = null;
+var previewFile = null;
+var previewLoading = false;
+
+function ensurePreview(s) {
+  var hasFile = !!(s.currentFile || s.currentFileDisplay);
+  if (!hasFile) {
+    if (previewApi || previewFile) {
+      previewApi = null;
+      previewFile = null;
+      $("previewLayerReadout").textContent = "Layer -/-";
+      $("previewPercentReadout").textContent = "-";
+      $("previewLoading").textContent = "No file loaded";
+      $("previewLoading").classList.remove("hidden", "error");
+    }
+    return;
+  }
+
+  var fileKey = s.currentFile || s.currentFileDisplay || "";
+  var layer = s.currentLayer != null ? s.currentLayer : 0;
+  if (previewApi && previewFile === fileKey) {
+    previewApi.setCurrentLayer(layer);
+    var total = s.totalLayers != null ? s.totalLayers : previewApi.totalLayers;
+    $("previewLayerReadout").textContent = "Layer " + layer + "/" + total;
+    $("previewPercentReadout").textContent = (s.printProgressPercent || 0) + "%";
+    return;
+  }
+  if (previewLoading) return; // already loading fileKey (or about to be superseded by it)
+
+  previewLoading = true;
+  previewFile = fileKey;
+  $("previewLoading").textContent = "Loading preview…";
+  $("previewLoading").classList.remove("hidden", "error");
+  import("/vendor/preview-panel.js").then(function (mod) {
+    return mod.initPrintPreview({
+      ghostCanvas: $("previewGhostCanvas"),
+      solidCanvas: $("previewSolidCanvas"),
+      gcodeUrl: "/gcode/current",
+      initialLayer: layer,
+    });
+  }).then(function (api) {
+    previewApi = api;
+    previewLoading = false;
+    $("previewLoading").classList.add("hidden");
+    var total = s.totalLayers != null ? s.totalLayers : api.totalLayers;
+    $("previewLayerReadout").textContent = "Layer " + layer + "/" + total;
+    $("previewPercentReadout").textContent = (s.printProgressPercent || 0) + "%";
+  }).catch(function (err) {
+    console.error("Print preview failed to load:", err);
+    previewLoading = false;
+    previewApi = null;
+    previewFile = null;
+    $("previewLoading").textContent = "Preview failed: " + (err && err.message ? err.message : String(err));
+    $("previewLoading").classList.remove("hidden");
+    $("previewLoading").classList.add("error");
+  });
+}
+
 function refreshStatus() {
   fetch("/status").then(function (r) { return r.json(); }).then(renderStatus).catch(function () {});
 }
@@ -593,12 +718,7 @@ function renderStatus(s) {
 
   $("currentFile").textContent = s.currentFileDisplay || s.currentFile || "no file selected";
 
-  var hasLayerInfo = s.currentLayer != null && s.totalLayers != null;
-  $("layerBox").style.display = hasLayerInfo ? "flex" : "none";
-  if (hasLayerInfo) {
-    $("currentLayer").textContent = s.currentLayer;
-    $("totalLayers").textContent = s.totalLayers;
-  }
+  ensurePreview(s);
 
   currentSdFilename = s.currentFile || null;
   highlightSelectedSdFile();

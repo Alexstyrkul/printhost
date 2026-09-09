@@ -158,6 +158,13 @@ public class PrinterService extends Service {
         return state.toJson();
     }
 
+    /** Local copy of whatever's currently loaded (see uploadedFile above) - null if nothing has
+     *  been uploaded or resumed this session. The dashboard's 3D preview reads this raw over
+     *  GET /gcode/current to parse the same file GcodeLayerParser is already tracking layers in. */
+    public File getUploadedFile() {
+        return uploadedFile;
+    }
+
     private void updateBatteryStatus() {
         android.os.BatteryManager bm = (android.os.BatteryManager) getSystemService(BATTERY_SERVICE);
         if (bm == null) return;
