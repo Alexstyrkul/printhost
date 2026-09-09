@@ -326,6 +326,24 @@ public class PrinterConnection {
 
     public interface UploadProgressListener {
         void onProgress(long sentBytes, long totalBytes);
+
+        /** Polled once per content line, not just at start - a cancel needs to land within one
+         *  line's round-trip (milliseconds), not wait for the whole remaining file. */
+        boolean isCancelled();
+    }
+
+    /** Thrown mid-transfer when the listener reports cancellation. uploadFile()'s own finally
+     *  block still runs first (M29, closing whatever got written), so printerFilename here is
+     *  exactly what's left sitting incomplete on the SD card - the caller's job is to decide
+     *  whether to delete it. */
+    public static class UploadCancelledException extends IOException {
+        public final String printerFilename;
+        public final long bytesSent;
+        UploadCancelledException(String printerFilename, long bytesSent) {
+            super("Upload cancelled after " + bytesSent + " bytes");
+            this.printerFilename = printerFilename;
+            this.bytesSent = bytesSent;
+        }
     }
 
     /**
@@ -365,6 +383,9 @@ public class PrinterConnection {
         String line;
         try {
             while ((line = reader.readLine()) != null) {
+                if (listener != null && listener.isCancelled()) {
+                    throw new UploadCancelledException(printerFilename, totalSent);
+                }
                 // This firmware discards everything from ';' onward character-by-character as
                 // it RECEIVES a line - confirmed on real hardware - so a checksum placed after a
                 // comment is silently lost and the line gets rejected. Stripping the comment

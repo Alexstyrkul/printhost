@@ -131,6 +131,9 @@ public class DashboardRouter implements RequestRouter {
             writeJson(out, outcome.success ? 200 : 422, json);
         } else if (p.equals("/upload") && req.method.equals("POST")) {
             handleUpload(req, out);
+        } else if (p.equals("/upload/cancel") && req.method.equals("POST")) {
+            service.cancelUpload();
+            writeJson(out, 200, resultJson(true, service.getStateJson()));
         } else if (p.equals("/start") && req.method.equals("POST")) {
             boolean ok = service.startPrint();
             writeJson(out, ok ? 200 : 409, resultJson(ok, service.getStateJson()));

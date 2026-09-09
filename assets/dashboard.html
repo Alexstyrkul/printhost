@@ -337,9 +337,10 @@
       <span class="fname" id="chosenFileName">No file selected</span>
       <input type="file" id="fileInput" accept=".gcode,.gco,.g">
     </div>
-    <div class="pill" id="uploadProgressWrap" style="display:none; padding: 6px 12px;">
+    <div class="pill" id="uploadProgressWrap" style="display:none; padding: 6px 12px; gap: 8px;">
       <progress id="uploadProgress" value="0" max="100" style="width:100%; height:8px;"></progress>
       <span id="uploadStatus" style="font-size:11px; white-space:nowrap;"></span>
+      <button id="cancelUploadBtn" class="small danger" style="flex: none;">Cancel</button>
     </div>
   </div>
 
@@ -610,33 +611,41 @@ function deleteSdFile(name) {
 
 $("refreshSdBtn").onclick = function () { loadSdFiles(); };
 
-/** Lazily loads the 3D preview as soon as a file is *selected* (currentFile set - upload
- *  verified, chosen from the SD list, or already printing), not once layer info shows up:
- *  currentLayer/totalLayers only start populating once byte-offset progress exists, i.e. once
- *  printing is already under way, which is well after Start becomes pressable and the user
- *  expects to see something. totalLayers before that comes from the client's own parse
- *  (api.totalLayers) instead of the server, which doesn't know it yet either at that point.
+/** Lazily loads the 3D preview once a file is both *selected* and actually ready to read
+ *  (UPLOAD_VERIFIED/PRINTING/PAUSED), not once layer info shows up: currentLayer/totalLayers
+ *  only start populating once byte-offset progress exists, i.e. once printing is already under
+ *  way, which is well after Start becomes pressable and the user expects to see something.
+ *  totalLayers before that comes from the client's own parse (api.totalLayers) instead of the
+ *  server, which doesn't know it yet either at that point.
  *
- *  currentFile is set the same way whether the file was freshly uploaded this session (a local
- *  copy exists, GET /gcode/current serves it) or picked from the SD card list (no local copy -
- *  see PrinterService.selectSdFile's comment - so that GET 404s and the load below fails with a
- *  visible error rather than silently showing nothing).
+ *  "Ready" deliberately excludes UPLOADING: currentFile is set the moment an upload *starts*,
+ *  not when it finishes (PrinterService.upload() sets it before the transfer even begins, to
+ *  show the filename while it's in progress) - GET /gcode/current only has something to serve
+ *  once PrinterService.uploadedFile itself gets set, which is after the transfer completes and
+ *  verifies. Triggering during UPLOADING was hitting a real, expected 404 every time, not a bug
+ *  in the fetch itself.
  *
- *  No file selected resets to idle so the next real selection re-triggers a fresh load instead
- *  of showing the previous file's geometry. */
+ *  A file picked from the SD card list (rather than freshly uploaded) reaches UPLOAD_VERIFIED
+ *  the same way, but only has something to serve if PrinterService found a matching gcode-cache
+ *  entry from an earlier upload (see selectSdFile's own comment) - otherwise this still 404s,
+ *  now visibly rather than silently.
+ *
+ *  No file selected, or not yet ready, resets to idle so the next real selection re-triggers a
+ *  fresh load instead of showing the previous file's geometry. */
 var previewApi = null;
 var previewFile = null;
 var previewLoading = false;
+var PREVIEW_READY_PHASES = { UPLOAD_VERIFIED: true, PRINTING: true, PAUSED: true };
 
 function ensurePreview(s) {
-  var hasFile = !!(s.currentFile || s.currentFileDisplay);
-  if (!hasFile) {
+  var ready = !!(s.currentFile || s.currentFileDisplay) && !!PREVIEW_READY_PHASES[s.phase];
+  if (!ready) {
     if (previewApi || previewFile) {
       previewApi = null;
       previewFile = null;
       $("previewLayerReadout").textContent = "Layer -/-";
       $("previewPercentReadout").textContent = "-";
-      $("previewLoading").textContent = "No file loaded";
+      $("previewLoading").textContent = s.phase === "UPLOADING" ? "Uploading…" : "No file loaded";
       $("previewLoading").classList.remove("hidden", "error");
     }
     return;
@@ -921,6 +930,14 @@ function chooseFile(file) {
 }
 $("chooseFileBtn").onclick = function () { $("fileInput").click(); };
 $("fileInput").onchange = function () { chooseFile(this.files[0] || null); };
+$("cancelUploadBtn").onclick = function () {
+  if (!confirm("Cancel the upload? The partial file will be deleted from the SD card.")) return;
+  // Doesn't wait on the in-flight /upload request - a *separate* connection/thread handles
+  // this one and just flips a flag the upload loop is already polling (see
+  // PrinterService.cancelUpload's own comment on why that's safe without commandLock). The
+  // /upload request itself will come back shortly after with its own "cancelled" outcome.
+  post("/upload/cancel");
+};
 
 function uploadSelectedFile(file) {
   var xhr = new XMLHttpRequest();
@@ -931,8 +948,10 @@ function uploadSelectedFile(file) {
   xhr.onload = function () {
     var resp = {};
     try { resp = JSON.parse(xhr.responseText); } catch (e) {}
-    $("uploadStatus").textContent = resp.success ? "verified" : ("failed: " + (resp.message || xhr.status));
+    $("uploadStatus").textContent = resp.message === "Upload cancelled" ? "cancelled"
+        : resp.success ? "verified" : ("failed: " + (resp.message || xhr.status));
     if (resp.state) renderStatus(resp.state);
+    // Also on a cancel - refreshes away the partial file cancelUpload() just deleted from SD.
     if (resp.success) loadSdFiles();
   };
   xhr.onerror = function () { $("uploadStatus").textContent = "network error"; };

@@ -29,6 +29,8 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -238,8 +240,15 @@ public class PrinterService extends Service {
      * Selects a file already on the SD card for printing, without re-uploading it - the
      * counterpart to upload() for jobs staged ahead of time. Mirrors upload()'s post-condition
      * (UPLOAD_VERIFIED with currentFile/uploadedBytes set) so startPrint() works unchanged.
-     * uploadedFile is cleared: it backs fan-speed-by-byte-offset lookup against the locally kept
-     * copy of a *freshly uploaded* file, and there is no local copy for a file staged earlier.
+     * uploadedFile backs both fan-speed-by-byte-offset lookup and the 3D preview's GET
+     * /gcode/current, and there is no way to read a file's content back off the printer itself
+     * to repopulate it (see cacheGcodeFile's own comment) - so this falls back to the gcode
+     * cache instead, keyed by the same SD short name this app itself would have uploaded it
+     * under. A cache hit needs its size to still match what the printer just reported for this
+     * filename (M23's own answer, already in `size` below): a stale or mismatched cache entry
+     * would silently preview the wrong file, which is worse than no preview at all. Genuinely
+     * missing (never uploaded through this app, or evicted) falls through to null exactly as
+     * before - the dashboard shows that as "preview unavailable" rather than failing silently.
      *
      * displayName is whatever listSdFiles() resolved for this entry (its own firmware-reported
      * LFN, our own remembered upload name, or the bare short name) - the caller already has it
@@ -266,7 +275,8 @@ public class PrinterService extends Service {
                 state.uploadedBytes = size;
                 state.expectedBytes = size;
                 state.lastError = "";
-                uploadedFile = null;
+                File cached = new File(gcodeCacheDir(), sanitizeCacheFilename(filename));
+                uploadedFile = (cached.exists() && cached.length() == size) ? cached : null;
                 state.fanSpeed = null;
                 state.currentLayer = null;
                 state.totalLayers = null;
@@ -302,11 +312,13 @@ public class PrinterService extends Service {
             try {
                 String response = printerConnection.deleteFile(filename);
                 sdFilenameMap.remove(filename);
+                deleteGcodeCacheEntry(filename);
                 if (filename.equals(state.currentFile)) {
                     state.currentFile = "";
                     state.currentFileDisplay = "";
                     state.uploadedBytes = 0;
                     state.expectedBytes = 0;
+                    uploadedFile = null;
                     if (state.phase == PrinterState.Phase.UPLOAD_VERIFIED) {
                         state.phase = PrinterState.Phase.IDLE;
                     }
@@ -558,6 +570,7 @@ public class PrinterService extends Service {
         state.currentFileDisplay = filename;
         state.uploadedBytes = 0;
         state.expectedBytes = contentLength;
+        uploadCancelRequested = false;
         updateNotification("Uploading " + filename);
 
         File localCopy = new File(getFilesDir(), "current_upload.gcode");
@@ -579,6 +592,7 @@ public class PrinterService extends Service {
                 state.phase = PrinterState.Phase.UPLOAD_VERIFIED;
                 uploadedFile = localCopy;
                 sdFilenameMap.put(result.printerFilename, filename);
+                cacheGcodeFile(localCopy, result.printerFilename);
                 updateNotification("Upload verified: " + result.printerFilename);
                 return new UploadOutcome(true, "Uploaded as " + result.printerFilename
                         + " (from " + filename + "), verified " + result.bytesSent + " bytes");
@@ -588,6 +602,27 @@ public class PrinterService extends Service {
                 updateNotification("Upload FAILED verification");
                 return new UploadOutcome(false, state.lastError);
             }
+        } catch (PrinterConnection.UploadCancelledException e) {
+            // uploadFile()'s own finally already ran M29, so e.printerFilename is real but
+            // incomplete on the SD card - the whole reason a cancel needs to delete it too,
+            // unlike a normal cancel that could just leave nothing behind.
+            Log.i(TAG, "Upload cancelled after " + e.bytesSent + " bytes, removing partial file "
+                    + e.printerFilename);
+            try {
+                printerConnection.deleteFile(e.printerFilename);
+            } catch (IOException | TimeoutException deleteFailure) {
+                Log.w(TAG, "Couldn't remove the partial file after cancelling upload"
+                        + " (non-fatal, but " + e.printerFilename + " is now junk on the SD card)",
+                        deleteFailure);
+            }
+            state.phase = PrinterState.Phase.IDLE;
+            state.currentFile = "";
+            state.currentFileDisplay = "";
+            state.uploadedBytes = 0;
+            state.expectedBytes = 0;
+            state.lastError = "";
+            updateNotification("Upload cancelled");
+            return new UploadOutcome(true, "Upload cancelled");
         } catch (IOException | TimeoutException e) {
             Log.e(TAG, "upload failed", e);
             state.phase = PrinterState.Phase.ERROR;
@@ -597,10 +632,25 @@ public class PrinterService extends Service {
       }
     }
 
+    /** Set from a *different* request thread than the one blocked inside upload() (which holds
+     *  commandLock for the whole transfer) - a plain volatile flag, not something guarded by
+     *  commandLock itself, is the point: acquiring that lock to cancel would just block until
+     *  the upload finished on its own. */
+    private volatile boolean uploadCancelRequested = false;
+
+    public void cancelUpload() {
+        uploadCancelRequested = true;
+    }
+
     class ProgressListener implements PrinterConnection.UploadProgressListener {
         @Override
         public void onProgress(long sentBytes, long totalBytes) {
             state.uploadedBytes = sentBytes;
+        }
+
+        @Override
+        public boolean isCancelled() {
+            return uploadCancelRequested;
         }
     }
 
@@ -644,6 +694,77 @@ public class PrinterService extends Service {
             while ((n = in.read(buf)) != -1) {
                 out.write(buf, 0, n);
             }
+        }
+    }
+
+    // ---- gcode cache (for the 3D preview to reach a file after this app restarts, or after
+    // picking one back up from the SD card list rather than uploading it fresh) -----------------
+
+    /** 300MB is generous for a phone and comfortably covers a few dozen real prints - this
+     *  exists to bound growth over months of use, not because any single file is expected to be
+     *  large. */
+    private static final long GCODE_CACHE_MAX_BYTES = 300L * 1024 * 1024;
+
+    private File gcodeCacheDir() {
+        File dir = new File(getFilesDir(), "gcode_cache");
+        dir.mkdirs();
+        return dir;
+    }
+
+    /** Printer filenames are already constrained to classic 8.3 short names (see
+     *  toSafeSdFilename's own comment on why), so this never actually strips anything in
+     *  practice - just refuses to let a filename from the wire be used as a raw path. */
+    private static String sanitizeCacheFilename(String printerFilename) {
+        return printerFilename.replaceAll("[^A-Za-z0-9._-]", "_");
+    }
+
+    /** Keeps a copy of every file this app itself successfully uploads, named after its SD
+     *  short name, so selecting it back out of the SD card list later - even after the app
+     *  restarts and loses the in-memory uploadedFile reference - can still serve it to the 3D
+     *  preview (see selectSdFile below). There's no way to read it back from the printer itself
+     *  instead: Marlin's SD gcode set (M20/M21/M22/M23/M24/M25/M27/M28/M29/M30/M32/M33 - all of
+     *  it) covers listing, selecting, writing and print control, but nothing reads a file's
+     *  content back out over serial. */
+    private void cacheGcodeFile(File source, String printerFilename) {
+        try (InputStream in = new FileInputStream(source)) {
+            saveToLocalFile(in, new File(gcodeCacheDir(), sanitizeCacheFilename(printerFilename)));
+            evictOldGcodeCacheEntries();
+        } catch (IOException e) {
+            Log.w(TAG, "Failed to cache gcode for later preview: " + e.getMessage());
+        }
+    }
+
+    /** Mirrors deleteSdFile(): the normal workflow here is upload, print, delete off the SD card
+     *  through this same dashboard, and there's no reason to go on holding a cached copy for
+     *  the 3D preview once the file it was for no longer exists on the printer at all. Silently
+     *  a no-op if nothing was ever cached for this name (picked from the SD list without a
+     *  cache hit, or uploaded before this cache existed). */
+    private void deleteGcodeCacheEntry(String printerFilename) {
+        new File(gcodeCacheDir(), sanitizeCacheFilename(printerFilename)).delete();
+    }
+
+    /** Oldest-by-last-modified first - these accumulate roughly one per real upload, so this is
+     *  a simple LRU over actual usage, not over how recently a file was merely previewed. */
+    private void evictOldGcodeCacheEntries() {
+        File[] files = gcodeCacheDir().listFiles();
+        if (files == null) return;
+        long total = 0;
+        for (File f : files) total += f.length();
+        if (total <= GCODE_CACHE_MAX_BYTES) return;
+        // A plain Comparator, not File::lastModified/a lambda: this project's javac is invoked
+        // against android.jar as the bootclasspath (see build.sh), which doesn't carry
+        // LambdaMetafactory - method references and lambdas fail to compile here even at
+        // -source 8, so the whole codebase sticks to old-style anonymous classes.
+        Arrays.sort(files, new Comparator<File>() {
+            @Override
+            public int compare(File a, File b) {
+                return Long.compare(a.lastModified(), b.lastModified());
+            }
+        });
+        for (File f : files) {
+            if (total <= GCODE_CACHE_MAX_BYTES) break;
+            total -= f.length();
+            f.delete();
         }
     }
 
