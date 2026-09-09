@@ -29,27 +29,71 @@ public class GcodeLayerParser {
         }
     }
 
+    // uploadedFile is always the same on-disk path (current_upload.gcode, overwritten per upload
+    // - see PrinterService), so identity alone can't detect a new file; length changing is what
+    // invalidates tracking here. totalLayers only needs computing once per file (one full scan).
+    private static File trackedFile;
+    private static long trackedFileLength = -1;
+    private static int trackedTotalLayers;
+
+    // Incremental scan of "current layer" - resumed across polls instead of re-reading from byte
+    // 0 every time. Caching totalLayers alone (an earlier version of this fix) wasn't enough:
+    // re-scanning 0..byteOffset every ~2s poll for the whole length of a print is itself the same
+    // O(file)-per-poll cost once the print is far enough along - confirmed live, the
+    // PrintHostPoller/GC-daemon CPU storm came right back as the print progressed even with
+    // totalLayers cached. reader.skip() jumps straight past what's already been counted instead of
+    // re-parsing it.
+    private static long scannedPosition;
+    private static int scannedCurrent;
+
     /** Returns null if the file can't be read or has no layer markers at all (e.g. a file from a
-     *  slicer/profile that doesn't emit them). One pass over the whole file - see the class
-     *  javadoc for why a single marker count serves both "how many so far" and "how many total". */
-    public static LayerInfo layerInfoAtByteOffset(File gcodeFile, long byteOffset) {
+     *  slicer/profile that doesn't emit them). */
+    public static synchronized LayerInfo layerInfoAtByteOffset(File gcodeFile, long byteOffset) {
         if (gcodeFile == null || !gcodeFile.exists()) return null;
-        int current = 0;
-        int total = 0;
-        long consumed = 0;
+        long length = gcodeFile.length();
+        if (!gcodeFile.equals(trackedFile) || length != trackedFileLength) {
+            trackedFile = gcodeFile;
+            trackedFileLength = length;
+            trackedTotalLayers = countLayers(gcodeFile);
+            scannedPosition = 0;
+            scannedCurrent = 0;
+        }
+        if (trackedTotalLayers == 0) return null;
+
+        // Byte offset went backward (e.g. a reprint of the same file) - can't resume from the
+        // middle, start over.
+        if (byteOffset < scannedPosition) {
+            scannedPosition = 0;
+            scannedCurrent = 0;
+        }
+
         try (BufferedReader reader = new BufferedReader(new FileReader(gcodeFile))) {
+            reader.skip(scannedPosition);
+            long consumed = scannedPosition;
             String line;
-            while ((line = reader.readLine()) != null) {
+            while (consumed < byteOffset && (line = reader.readLine()) != null) {
                 consumed += line.length() + 1;
                 if (line.trim().startsWith(LAYER_CHANGE_TAG)) {
-                    total++;
-                    if (consumed <= byteOffset) current = total;
+                    scannedCurrent++;
                 }
             }
+            scannedPosition = consumed;
         } catch (IOException e) {
             return null;
         }
-        if (total == 0) return null;
-        return new LayerInfo(current, total);
+        return new LayerInfo(scannedCurrent, trackedTotalLayers);
+    }
+
+    private static int countLayers(File gcodeFile) {
+        int total = 0;
+        try (BufferedReader reader = new BufferedReader(new FileReader(gcodeFile))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.trim().startsWith(LAYER_CHANGE_TAG)) total++;
+            }
+        } catch (IOException e) {
+            return 0;
+        }
+        return total;
     }
 }

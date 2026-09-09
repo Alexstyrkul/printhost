@@ -1153,9 +1153,42 @@ public class PrinterService extends Service {
     // ---- camera / torch -----------------------------------------------------------------------
 
     public boolean cameraStart() {
+        // OnePlus's own camera policy rejects CameraManager.openCamera() outright while the
+        // screen is off (confirmed live: CameraAccessException CAMERA_DISABLED "disabled by
+        // policy" only with the screen off, works fine the instant it's on) - there's no public
+        // API to opt out of that OEM check, so this briefly wakes the screen for the open and
+        // locks it straight back once the camera's actually running, instead of leaving it lit
+        // for the whole camera session.
+        //
+        // wakeScreen()'s wake lock acquire() returns immediately - it does NOT wait for the
+        // display to actually finish powering on (panel wake, brightness ramp, keyguard
+        // transition). Calling openCamera() right after was a race that mostly lost: confirmed
+        // live via logcat, "OpFodDimControl: disable: display power status: off" logged only
+        // moments before repeated CAMERA_DISABLED failures on this exact code path. Give the
+        // screen real wall-clock time to settle before trying to open.
+        wakeScreen();
+        try {
+            Thread.sleep(700);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
         boolean ok = cameraController.start();
         synchronized (this) {
             state.cameraOn = ok;
+        }
+        if (ok) {
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        Thread.sleep(1500);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    lockScreen();
+                }
+            }, "PrintHostCameraRelock").start();
         }
         return ok;
     }
