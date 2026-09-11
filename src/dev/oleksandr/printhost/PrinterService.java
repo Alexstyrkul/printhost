@@ -66,6 +66,7 @@ public class PrinterService extends Service {
     private PlugPollerThread plugPollerThread;
     private File uploadedFile;
     private SdFilenameMap sdFilenameMap;
+    private GcodeCacheSizeMap gcodeCacheSizeMap;
     private TapoPlugController tapoPlugController;
 
     @Override
@@ -76,6 +77,7 @@ public class PrinterService extends Service {
         cameraController = new CameraController(this);
         macNotifier = new MacNotifier(this);
         sdFilenameMap = new SdFilenameMap(new File(getFilesDir(), "sd_filename_map.json"));
+        gcodeCacheSizeMap = new GcodeCacheSizeMap(new File(getFilesDir(), "gcode_cache_sizes.json"));
         tapoPlugController = new TapoPlugController(this);
 
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
@@ -258,11 +260,13 @@ public class PrinterService extends Service {
      * /gcode/current, and there is no way to read a file's content back off the printer itself
      * to repopulate it (see cacheGcodeFile's own comment) - so this falls back to the gcode
      * cache instead, keyed by the same SD short name this app itself would have uploaded it
-     * under. A cache hit needs its size to still match what the printer just reported for this
-     * filename (M23's own answer, already in `size` below): a stale or mismatched cache entry
-     * would silently preview the wrong file, which is worse than no preview at all. Genuinely
-     * missing (never uploaded through this app, or evicted) falls through to null exactly as
-     * before - the dashboard shows that as "preview unavailable" rather than failing silently.
+     * under. A cache hit needs its recorded SD size (GcodeCacheSizeMap, not the cached file's
+     * own on-disk length - those measure different things, see that class's own comment) to
+     * still match what the printer just reported for this filename (M23's own answer, already
+     * in `size` below): a stale or mismatched cache entry would silently preview the wrong file,
+     * which is worse than no preview at all. Genuinely missing (never uploaded through this app,
+     * or evicted) falls through to null exactly as before - the dashboard shows that as "preview
+     * unavailable" rather than failing silently.
      *
      * displayName is whatever listSdFiles() resolved for this entry (its own firmware-reported
      * LFN, our own remembered upload name, or the bare short name) - the caller already has it
@@ -290,7 +294,7 @@ public class PrinterService extends Service {
                 state.expectedBytes = size;
                 state.lastError = "";
                 File cached = new File(gcodeCacheDir(), sanitizeCacheFilename(filename));
-                uploadedFile = (cached.exists() && cached.length() == size) ? cached : null;
+                uploadedFile = (cached.exists() && gcodeCacheSizeMap.sdSizeFor(filename) == size) ? cached : null;
                 state.fanSpeed = null;
                 state.currentLayer = null;
                 state.totalLayers = null;
@@ -606,7 +610,7 @@ public class PrinterService extends Service {
                 state.phase = PrinterState.Phase.UPLOAD_VERIFIED;
                 uploadedFile = localCopy;
                 sdFilenameMap.put(result.printerFilename, filename);
-                cacheGcodeFile(localCopy, result.printerFilename);
+                cacheGcodeFile(localCopy, result.printerFilename, result.bytesSent);
                 updateNotification("Upload verified: " + result.printerFilename);
                 return new UploadOutcome(true, "Uploaded as " + result.printerFilename
                         + " (from " + filename + "), verified " + result.bytesSent + " bytes");
@@ -739,9 +743,14 @@ public class PrinterService extends Service {
      *  instead: Marlin's SD gcode set (M20/M21/M22/M23/M24/M25/M27/M28/M29/M30/M32/M33 - all of
      *  it) covers listing, selecting, writing and print control, but nothing reads a file's
      *  content back out over serial. */
-    private void cacheGcodeFile(File source, String printerFilename) {
+    private void cacheGcodeFile(File source, String printerFilename, long sdSize) {
         try (InputStream in = new FileInputStream(source)) {
             saveToLocalFile(in, new File(gcodeCacheDir(), sanitizeCacheFilename(printerFilename)));
+            // sdSize (result.bytesSent - the post-normalization size M23 will report for this
+            // name later) alongside it: selectSdFile()'s cache-hit check needs to compare like
+            // with like (see GcodeCacheSizeMap's own comment - this file's own on-disk length is
+            // the pre-normalization original, a different number by design).
+            gcodeCacheSizeMap.put(printerFilename, sdSize);
             evictOldGcodeCacheEntries();
         } catch (IOException e) {
             Log.w(TAG, "Failed to cache gcode for later preview: " + e.getMessage());
@@ -755,6 +764,7 @@ public class PrinterService extends Service {
      *  cache hit, or uploaded before this cache existed). */
     private void deleteGcodeCacheEntry(String printerFilename) {
         new File(gcodeCacheDir(), sanitizeCacheFilename(printerFilename)).delete();
+        gcodeCacheSizeMap.remove(printerFilename);
     }
 
     /** Oldest-by-last-modified first - these accumulate roughly one per real upload, so this is
