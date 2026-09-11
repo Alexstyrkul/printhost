@@ -42,7 +42,11 @@
   .phase.DISCONNECTED { background: #333; color: var(--text-dim); }
 
   .battery { display: flex; align-items: center; gap: 5px; font-weight: 600; color: var(--text-dim); }
-  .battery.low { color: var(--danger); }
+  /* Only the fill level inside the outline is color-tiered - the outline itself and the
+     percent text next to it stay neutral. Overrides the rect's own fill="currentColor". */
+  #batteryFill { fill: var(--accent); }
+  #batteryFill.low { fill: var(--warn); }
+  #batteryFill.critical { fill: var(--danger); }
   .battery-warning { background: var(--danger-dim); border: 1px solid #6b1f1f; border-radius: 8px;
                       padding: 6px 12px; margin-bottom: 8px; font-size: 11.5px; display: none; }
   .battery-warning.show { display: block; }
@@ -425,7 +429,9 @@
 </div>
 
 <script>
-var LOW_BATTERY_THRESHOLD = 30;
+var LOW_BATTERY_THRESHOLD = 30; // drives the persistent "Low phone battery" warning banner
+var BATTERY_ICON_CRITICAL = 20; // icon color tiers - separate from the warning banner above
+var BATTERY_ICON_LOW = 50;
 var RING_CIRCUMFERENCE = 2 * Math.PI * 50;
 var REMAINING_MIN_PERCENT = 3; // below this, the estimate is too noisy to show
 var cameraOn = false;
@@ -738,7 +744,8 @@ function renderStatus(s) {
 
   var pct = s.batteryPercent;
   $("batteryPct").textContent = pct >= 0 ? pct : "-";
-  $("batteryWrap").className = "battery" + (pct >= 0 && pct <= LOW_BATTERY_THRESHOLD ? " low" : "");
+  $("batteryFill").setAttribute("class", pct < 0 ? "" : pct <= BATTERY_ICON_CRITICAL ? "critical"
+      : pct <= BATTERY_ICON_LOW ? "low" : "");
   $("batteryFill").setAttribute("width", pct >= 0 ? (13 * pct / 100) : 0);
   $("batteryChargingIcon").textContent = s.batteryCharging ? " ⚡" : "";
   var showWarning = pct >= 0 && pct <= LOW_BATTERY_THRESHOLD && !s.batteryCharging;
@@ -772,7 +779,15 @@ function renderStatus(s) {
   var uploading = s.phase === "UPLOADING";
   $("uploadProgressWrap").style.display = uploading ? "flex" : "none";
   if (uploading) {
-    var pct2 = s.expectedBytes > 0 ? Math.round(100 * s.uploadedBytes / s.expectedBytes) : 0;
+    // uploadedBytes counts the content as normalized for the SD card (comments stripped, every
+    // line forced to end CRLF - see PrinterConnection.uploadFile's own comment), not verbatim
+    // original-file bytes like expectedBytes is. Those two just measure different things, so
+    // this ratio isn't really "how much of expectedBytes is done" - for a file with few
+    // comments and LF-only line endings, forcing CRLF can add more than stripping comments
+    // removes, nudging the raw ratio a little past 100% right near the end. Clamped rather than
+    // fixed at the source: still the best available proxy for "almost done" along the way, and
+    // this is the only place that ever turns it into a percent.
+    var pct2 = s.expectedBytes > 0 ? Math.min(100, Math.round(100 * s.uploadedBytes / s.expectedBytes)) : 0;
     $("uploadProgress").value = pct2;
     $("uploadStatus").textContent = pct2 + "%";
   }

@@ -167,11 +167,25 @@ public class PrinterService extends Service {
         return uploadedFile;
     }
 
+    /** BatteryManager.isCharging() (used here previously) confirmed unreliable on this real
+     *  device: it reported false while actually charging on AC, at the same moment
+     *  "adb shell dumpsys battery" showed "AC powered: true" and "status: 2" (BATTERY_STATUS_
+     *  CHARGING) - a known-flaky convenience method on some OEM builds, not something specific
+     *  to this app. dumpsys itself reads the last sticky ACTION_BATTERY_CHANGED broadcast, so
+     *  reading that same broadcast directly (registerReceiver with a null receiver just returns
+     *  the current sticky intent, no receiver actually registered) matches what dumpsys reports
+     *  instead of going through the less reliable API. */
     private void updateBatteryStatus() {
-        android.os.BatteryManager bm = (android.os.BatteryManager) getSystemService(BATTERY_SERVICE);
-        if (bm == null) return;
-        state.batteryPercent = bm.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY);
-        state.batteryCharging = bm.isCharging();
+        Intent batteryStatus = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+        if (batteryStatus == null) return;
+        int level = batteryStatus.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1);
+        int scale = batteryStatus.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, -1);
+        if (level >= 0 && scale > 0) {
+            state.batteryPercent = level * 100 / scale;
+        }
+        int status = batteryStatus.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1);
+        state.batteryCharging = status == android.os.BatteryManager.BATTERY_STATUS_CHARGING
+                || status == android.os.BatteryManager.BATTERY_STATUS_FULL;
     }
 
     /** So the dashboard's Wake/Lock button can show the right label without the user having to
