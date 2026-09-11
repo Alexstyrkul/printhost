@@ -15,6 +15,7 @@ import android.hardware.usb.UsbManager;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
+import android.net.wifi.WifiManager;
 import android.util.Log;
 
 import com.hoho.android.usbserial.driver.UsbSerialDriver;
@@ -60,6 +61,7 @@ public class PrinterService extends Service {
     private PrintHostHttpServer httpServer;
     private MacNotifier macNotifier;
     private PowerManager.WakeLock wakeLock;
+    private WifiManager.WifiLock wifiLock;
     private UsbManager usbManager;
     private PollerThread pollerThread;
     private TempPollerThread tempPollerThread;
@@ -83,6 +85,13 @@ public class PrinterService extends Service {
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PrintHost:service");
         wakeLock.acquire();
+
+        // PARTIAL_WAKE_LOCK keeps the CPU on but not the Wi-Fi radio - with the screen off,
+        // Android's Wi-Fi power-save mode can make this device sporadically unreachable to
+        // dashboard clients even though the HTTP server thread is alive and healthy.
+        WifiManager wifiManager = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "PrintHost:wifi");
+        wifiLock.acquire();
 
         createNotificationChannel();
 
@@ -114,6 +123,7 @@ public class PrinterService extends Service {
         cameraController.stop();
         printerConnection.disconnect();
         if (wakeLock.isHeld()) wakeLock.release();
+        if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
         super.onDestroy();
     }
 
