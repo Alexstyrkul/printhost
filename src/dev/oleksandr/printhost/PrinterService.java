@@ -72,6 +72,13 @@ public class PrinterService extends Service {
     private GcodeCacheSizeMap gcodeCacheSizeMap;
     private TapoPlugController tapoPlugController;
     private ScheduledPrintStore scheduledPrintStore;
+    private AutoShutoffStore autoShutoffStore;
+    // Set once a print ends (finishes normally or is Stopped) while auto-shutoff is on; cleared
+    // the moment it actually powers the plug off. Only while armed does TempPollerThread watch
+    // for the printer having cooled down - otherwise a printer that's simply idle-but-warm right
+    // after a manual reconnect would get its plug cut immediately, which isn't what "after a
+    // print" means.
+    private volatile boolean autoShutoffArmed = false;
 
     @Override
     public void onCreate() {
@@ -84,6 +91,7 @@ public class PrinterService extends Service {
         gcodeCacheSizeMap = new GcodeCacheSizeMap(new File(getFilesDir(), "gcode_cache_sizes.json"));
         tapoPlugController = new TapoPlugController(this);
         scheduledPrintStore = new ScheduledPrintStore(new File(getFilesDir(), "scheduled_print.json"));
+        autoShutoffStore = new AutoShutoffStore(new File(getFilesDir(), "auto_shutoff.json"));
 
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PrintHost:service");
@@ -177,6 +185,7 @@ public class PrinterService extends Service {
         updateBatteryStatus();
         updateScreenStatus();
         syncScheduledPrintIntoState();
+        state.autoShutoffEnabled = autoShutoffStore.isEnabled();
         return state.toJson();
     }
 
@@ -906,6 +915,32 @@ public class PrinterService extends Service {
         scheduledPrintStore.clear();
     }
 
+    // ---- auto shutoff (power off the plug once the printer cools down after a print) --------
+
+    private static final double AUTO_SHUTOFF_TEMP_C = 50.0;
+
+    public void setAutoShutoffEnabled(boolean enabled) {
+        autoShutoffStore.setEnabled(enabled);
+    }
+
+    /** Called from TempPollerThread after every successful idle temp poll. Only actually does
+     *  anything once a print has ended (autoShutoffArmed) and the toggle is on - a printer that's
+     *  simply idle-but-warm for some other reason (just connected, mid-calibration, ...) is left
+     *  alone. Checks both hotend and bed so it doesn't cut power while either is still cooling. */
+    private void maybeAutoShutoff() {
+        if (!autoShutoffArmed || !autoShutoffStore.isEnabled()) return;
+        if (state.hotendTemp > AUTO_SHUTOFF_TEMP_C || state.bedTemp > AUTO_SHUTOFF_TEMP_C) return;
+        autoShutoffArmed = false;
+        if (!tapoPlugController.isConfigured()) return;
+        try {
+            tapoPlugController.turnOff();
+            state.plugOn = false;
+            updateNotification("Plug off (cooled down)");
+        } catch (IOException e) {
+            Log.w(TAG, "auto shutoff: couldn't turn off Tapo plug", e);
+        }
+    }
+
     /** Runs on ScheduledPrintPollerThread, well outside commandLock's normal holders - grabs it
      *  itself for the connect/select/start sequence, same as a manual dashboard tap would. */
     private void runScheduledPrintIfDue() {
@@ -1015,6 +1050,7 @@ public class PrinterService extends Service {
             state.elapsedSeconds = 0;
             stopPoller();
             updateNotification("Stopped");
+            autoShutoffArmed = true;
         }
         return true;
     }
@@ -1202,6 +1238,12 @@ public class PrinterService extends Service {
                     if (state.phase == PrinterState.Phase.PRINTING) continue;
                     String temps = printerConnection.pollTemperatures();
                     parseTemperatures(temps, state);
+                    // A stale lastError (e.g. a timeout from a command that's long since resolved
+                    // itself) would otherwise sit in the dashboard's error banner forever, since
+                    // most callers only clear it at the START of their own next successful run -
+                    // this background poll is what actually proves things are healthy again.
+                    state.lastError = "";
+                    maybeAutoShutoff();
                 } catch (InterruptedException e) {
                     break;
                 } catch (Exception e) {
@@ -1347,6 +1389,10 @@ public class PrinterService extends Service {
 
             synchronized (PrinterService.this) {
                 parseTemperatures(temps, state);
+                // See TempPollerThread's identical line - a successful poll is proof things are
+                // healthy again, so a stale lastError from some earlier resolved timeout shouldn't
+                // keep sitting in the dashboard's error banner.
+                state.lastError = "";
                 if (SD_PRINTING_BYTE.matcher(progress).find()) sawSdPrinting = true;
                 boolean done = parseProgress(progress, state, sawSdPrinting);
                 state.elapsedSeconds = parseElapsedSeconds(printTime);
@@ -1362,6 +1408,7 @@ public class PrinterService extends Service {
                     state.printProgressPercent = 100;
                     updateNotification("Print finished: " + state.currentFileDisplay);
                     macNotifier.notifyAsync("done");
+                    autoShutoffArmed = true;
                     stopRequested = true;
                 }
             }

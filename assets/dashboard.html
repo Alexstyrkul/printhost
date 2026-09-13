@@ -246,16 +246,31 @@
   .schedule-card { padding: 0; overflow: hidden; }
   .schedule-body { display: flex; flex-direction: column; gap: 9px; padding: 0 16px 16px; }
   .schedule-body select {
-    background: var(--panel-2); color: var(--text); border: 1px solid var(--panel-border);
+    background: var(--panel-2); color: var(--text-faint); border: 1px solid var(--panel-border);
     border-radius: var(--radius-sm); padding: 9px 10px; font-size: 12.5px; font-family: inherit;
     color-scheme: dark;
   }
+  .schedule-body select.has-value { color: var(--text); }
+  #scheduleSetBtn { padding: 11px; font-size: 13px; }
   #scheduleInfo { display: block; line-height: 1.5; }
-  .schedule-body input[type="datetime-local"] {
-    background: var(--panel-2); color: var(--text); border: 1px solid var(--panel-border);
-    border-radius: var(--radius-sm); padding: 9px 10px; font-size: 12.5px; font-family: inherit;
-    color-scheme: dark;
+  .datetime-row { display: flex; gap: 8px; }
+  .datetime-wrap { position: relative; flex: 1; }
+  .datetime-display {
+    display: flex; align-items: center; gap: 7px; background: var(--panel-2); color: var(--text-faint);
+    border: 1px solid var(--panel-border); border-radius: var(--radius-sm); padding: 10px 11px; font-size: 12.5px;
   }
+  .datetime-display svg { flex: none; color: var(--text-faint); }
+  .datetime-display.has-value { color: var(--text); }
+  .datetime-display.has-value svg { color: var(--accent); }
+  /* The real native input stays fully interactive (tapping anywhere still opens the OS picker -
+     see the click listeners below) but is invisible, so the display span above shows a clean
+     "Date"/"Time" placeholder or formatted value instead of the raw dd.mm.yyyy segments. */
+  .datetime-wrap input {
+    position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; padding: 0; border: 0; opacity: 0;
+  }
+  .schedule-divider { border-top: 1px solid var(--panel-border); padding-top: 12px; margin-top: 5px; }
+  .schedule-divider .action-row { padding: 10px 12px; cursor: pointer; }
+  .schedule-divider .action-label { font-weight: 600; }
 </style>
 <script type="importmap">
 {
@@ -404,12 +419,34 @@
     </div>
     <div id="scheduleForm" class="schedule-body">
       <select id="scheduleFileSelect"><option value="">Choose a file already on the SD card&hellip;</option></select>
-      <input type="datetime-local" id="scheduleDateTime">
+      <div class="datetime-row">
+        <div class="datetime-wrap" style="flex: 1.3;">
+          <span id="scheduleDateDisplay" class="datetime-display">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg>
+            <span id="scheduleDateText">Date</span>
+          </span>
+          <input type="date" id="scheduleDate">
+        </div>
+        <div class="datetime-wrap" style="flex: 1;">
+          <span id="scheduleTimeDisplay" class="datetime-display">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>
+            <span id="scheduleTimeText">Time</span>
+          </span>
+          <input type="time" id="scheduleTime">
+        </div>
+      </div>
       <button id="scheduleSetBtn" class="primary small">Schedule</button>
     </div>
     <div id="scheduleActive" class="schedule-body" style="display:none;">
       <div class="pill" id="scheduleInfo" style="font-size: 12px;"></div>
       <button id="scheduleCancelBtn" class="small danger">Cancel</button>
+    </div>
+    <div class="schedule-body schedule-divider">
+      <label class="action-row" title="Turn off the smart plug once the printer has cooled down (&le;50&deg;C) after a print finishes or is stopped">
+        <span class="action-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4v10.54a4 4 0 1 1-4 0V4a2 2 0 0 1 4 0Z"/></svg></span>
+        <span class="action-label">Auto power off after cooldown</span>
+        <span class="switch"><input type="checkbox" id="autoShutoffToggle"><span class="switch-slider"></span></span>
+      </label>
     </div>
   </div>
 
@@ -680,6 +717,11 @@ function populateScheduleFileSelect(files) {
     sel.appendChild(opt);
   });
   sel.value = previous;
+  syncScheduleFileSelectDim();
+}
+
+function syncScheduleFileSelectDim() {
+  $("scheduleFileSelect").classList.toggle("has-value", !!$("scheduleFileSelect").value);
 }
 
 function renderSchedule(s) {
@@ -709,24 +751,48 @@ var schedulePreviewFile = null;
 
 $("scheduleFileSelect").onchange = function () {
   schedulePreviewFile = $("scheduleFileSelect").value || null;
+  syncScheduleFileSelectDim();
 };
 
-// A bare datetime-local input only opens its native picker when you hit the small calendar
-// glyph - showPicker() forces it open no matter where in the field you tap.
-$("scheduleDateTime").addEventListener("click", function () {
-  if (typeof this.showPicker === "function") {
-    try { this.showPicker(); } catch (e) { /* unsupported browser - falls back to normal focus */ }
-  }
+// A bare date/time input only opens its native picker when you hit the small calendar/clock
+// glyph - showPicker() forces it open no matter where in the field you tap. The input itself is
+// invisible (see .datetime-wrap CSS) - these listeners also keep the display span above it
+// showing a clean "Date"/"Time" placeholder or formatted value instead of raw dd.mm.yyyy segments.
+function wireDateTimeField(inputId, displayId, textId, formatter) {
+  var input = $(inputId);
+  input.addEventListener("click", function () {
+    if (typeof this.showPicker === "function") {
+      try { this.showPicker(); } catch (e) { /* unsupported browser - falls back to normal focus */ }
+    }
+  });
+  input.addEventListener("input", function () {
+    var display = $(displayId);
+    if (this.value) {
+      $(textId).textContent = formatter(this.value);
+      display.classList.add("has-value");
+    } else {
+      display.classList.remove("has-value");
+    }
+  });
+}
+var SCHEDULE_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+wireDateTimeField("scheduleDate", "scheduleDateDisplay", "scheduleDateText", function (v) {
+  var d = new Date(v + "T00:00");
+  return d.getDate() + " " + SCHEDULE_MONTHS[d.getMonth()] + " " + d.getFullYear();
+});
+wireDateTimeField("scheduleTime", "scheduleTimeDisplay", "scheduleTimeText", function (v) {
+  return v;
 });
 
 $("scheduleSetBtn").onclick = function () {
   var sel = $("scheduleFileSelect");
   var filename = sel.value;
   var displayName = sel.selectedOptions[0] ? sel.selectedOptions[0].dataset.displayName : "";
-  var dt = $("scheduleDateTime").value; // native picker - Android's own wheel dialog handles input
+  var datePart = $("scheduleDate").value;
+  var timePart = $("scheduleTime").value;
   if (!filename) { showToast("error", "Choose a file first"); return; }
-  if (!dt) { showToast("error", "Pick a date and time first"); return; }
-  var picked = new Date(dt);
+  if (!datePart || !timePart) { showToast("error", "Pick a date and time first"); return; }
+  var picked = new Date(datePart + "T" + timePart);
   var atMillis = picked.getTime();
   if (atMillis <= Date.now()) {
     showToast("error", "Scheduled time must be in the future");
@@ -924,6 +990,7 @@ function renderStatus(s) {
   if (s.plugOn !== null && s.plugOn !== undefined) {
     $("plugToggle").checked = s.plugOn;
   }
+  $("autoShutoffToggle").checked = !!s.autoShutoffEnabled;
 
   renderControls(s.phase);
 
@@ -986,6 +1053,15 @@ $("plugToggle").onchange = function () {
       showToast("error", r.message || (turnOn ? "Plug on failed" : "Plug off failed"));
     } else {
       showToast("success", turnOn ? "Plug turned on" : "Plug turned off");
+    }
+  });
+};
+$("autoShutoffToggle").onchange = function () {
+  var enabled = this.checked;
+  post("/autoshutoff/set?enabled=" + enabled).then(function (r) {
+    if (!r.success) {
+      $("autoShutoffToggle").checked = !enabled;
+      showToast("error", "Couldn't save that");
     }
   });
 };

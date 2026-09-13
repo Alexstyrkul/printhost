@@ -50,6 +50,8 @@ public class PrinterState {
     public volatile long scheduledAtMillis = 0;
     public volatile String scheduledStatus = null; // "PENDING" | "FAILED", null = no active schedule
 
+    public volatile boolean autoShutoffEnabled = false; // power off the plug once cooled after a print
+
     public synchronized JSONObject toJson() {
         JSONObject o = new JSONObject();
         try {
@@ -82,6 +84,7 @@ public class PrinterState {
             o.put("scheduledFileDisplay", scheduledFileDisplay == null ? JSONObject.NULL : scheduledFileDisplay);
             o.put("scheduledAtMillis", scheduledAtMillis);
             o.put("scheduledStatus", scheduledStatus == null ? JSONObject.NULL : scheduledStatus);
+            o.put("autoShutoffEnabled", autoShutoffEnabled);
 
             long remaining = 0;
             if (printProgressPercent > 0 && printProgressPercent < 100) {

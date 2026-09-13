@@ -147,6 +147,9 @@ public class DashboardRouter implements RequestRouter {
         } else if (p.equals("/schedule/cancel") && req.method.equals("POST")) {
             service.cancelScheduledPrint();
             writeJson(out, 200, resultJson(true, service.getStateJson()));
+        } else if (p.equals("/autoshutoff/set") && req.method.equals("POST")) {
+            service.setAutoShutoffEnabled("true".equals(req.queryParam("enabled")));
+            writeJson(out, 200, resultJson(true, service.getStateJson()));
         } else if (p.equals("/delete") && req.method.equals("POST")) {
             String filename = req.queryParam("filename");
             PrinterService.UploadOutcome outcome = service.deleteSdFile(filename);
