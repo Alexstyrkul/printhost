@@ -120,6 +120,33 @@ public class DashboardRouter implements RequestRouter {
             } catch (Exception ignored) {
             }
             writeJson(out, outcome.success ? 200 : 422, json);
+        } else if (p.equals("/sdfiles/known") && req.method.equals("GET")) {
+            JSONObject body = new JSONObject();
+            try {
+                body.put("files", service.listKnownFiles());
+            } catch (Exception ignored) {
+            }
+            writeJson(out, 200, body);
+        } else if (p.equals("/schedule/set") && req.method.equals("POST")) {
+            String filename = req.queryParam("filename");
+            String displayName = req.queryParam("displayName");
+            String atMillisParam = req.queryParam("atMillis");
+            long atMillis;
+            try {
+                atMillis = Long.parseLong(atMillisParam);
+            } catch (NumberFormatException e) {
+                writeJson(out, 400, errorJson("atMillis must be a number"));
+                return;
+            }
+            if (atMillis <= System.currentTimeMillis()) {
+                writeJson(out, 400, errorJson("Scheduled time must be in the future"));
+                return;
+            }
+            service.setScheduledPrint(filename, displayName, atMillis);
+            writeJson(out, 200, resultJson(true, service.getStateJson()));
+        } else if (p.equals("/schedule/cancel") && req.method.equals("POST")) {
+            service.cancelScheduledPrint();
+            writeJson(out, 200, resultJson(true, service.getStateJson()));
         } else if (p.equals("/delete") && req.method.equals("POST")) {
             String filename = req.queryParam("filename");
             PrinterService.UploadOutcome outcome = service.deleteSdFile(filename);
@@ -162,6 +189,8 @@ public class DashboardRouter implements RequestRouter {
             writeJson(out, ok ? 200 : 502, resultJson(ok, service.getStateJson()));
         } else if (p.equals("/gcode/current") && req.method.equals("GET")) {
             writeUploadedGcode(out);
+        } else if (p.equals("/gcode/cached") && req.method.equals("GET")) {
+            writeCachedGcode(out, req.queryParam("filename"));
         } else {
             writeText(out, 404, "text/plain", "Not found: " + p);
         }
@@ -235,6 +264,30 @@ public class DashboardRouter implements RequestRouter {
         out.flush();
     }
 
+    private void writeCachedGcode(OutputStream out, String filename) throws IOException {
+        File file = filename == null ? null : service.getCachedGcodeFile(filename);
+        if (file == null || !file.exists()) {
+            writeText(out, 404, "text/plain", "No local cached copy of that file");
+            return;
+        }
+        String head = "HTTP/1.1 200 OK\r\n"
+                + "Content-Type: text/plain; charset=utf-8\r\n"
+                + "Content-Length: " + file.length() + "\r\n"
+                + "Connection: close\r\n\r\n";
+        out.write(head.getBytes(StandardCharsets.US_ASCII));
+        InputStream in = new FileInputStream(file);
+        try {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) != -1) {
+                out.write(buf, 0, n);
+            }
+        } finally {
+            in.close();
+        }
+        out.flush();
+    }
+
     private static void sleepQuiet(long ms) {
         try {
             Thread.sleep(ms);
@@ -272,6 +325,7 @@ public class DashboardRouter implements RequestRouter {
 
     private static String vendorContentType(String path) {
         if (path.endsWith(".js")) return "application/javascript; charset=utf-8";
+        if (path.endsWith(".css")) return "text/css; charset=utf-8";
         if (path.endsWith(".svg")) return "image/svg+xml";
         if (path.endsWith(".stl")) return "application/octet-stream";
         return "application/octet-stream";

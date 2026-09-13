@@ -48,6 +48,13 @@ public class SdFilenameMap {
         if (shortToDisplay.remove(shortName) != null) save();
     }
 
+    /** Every short-name/display-name pair this app has ever uploaded (and not since deleted) -
+     *  unlike a live M20 listing, this needs no printer connection at all, so callers that must
+     *  work while the printer is powered off (the scheduled-print file picker) can use it. */
+    public synchronized Map<String, String> entries() {
+        return new HashMap<>(shortToDisplay);
+    }
+
     private void load() {
         if (!file.exists()) return;
         try (InputStream in = new FileInputStream(file)) {

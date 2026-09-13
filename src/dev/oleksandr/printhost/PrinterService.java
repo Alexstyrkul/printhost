@@ -66,10 +66,12 @@ public class PrinterService extends Service {
     private PollerThread pollerThread;
     private TempPollerThread tempPollerThread;
     private PlugPollerThread plugPollerThread;
+    private ScheduledPrintPollerThread scheduledPrintPollerThread;
     private File uploadedFile;
     private SdFilenameMap sdFilenameMap;
     private GcodeCacheSizeMap gcodeCacheSizeMap;
     private TapoPlugController tapoPlugController;
+    private ScheduledPrintStore scheduledPrintStore;
 
     @Override
     public void onCreate() {
@@ -81,6 +83,7 @@ public class PrinterService extends Service {
         sdFilenameMap = new SdFilenameMap(new File(getFilesDir(), "sd_filename_map.json"));
         gcodeCacheSizeMap = new GcodeCacheSizeMap(new File(getFilesDir(), "gcode_cache_sizes.json"));
         tapoPlugController = new TapoPlugController(this);
+        scheduledPrintStore = new ScheduledPrintStore(new File(getFilesDir(), "scheduled_print.json"));
 
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PrintHost:service");
@@ -97,6 +100,9 @@ public class PrinterService extends Service {
 
         plugPollerThread = new PlugPollerThread();
         plugPollerThread.start();
+
+        scheduledPrintPollerThread = new ScheduledPrintPollerThread();
+        scheduledPrintPollerThread.start();
     }
 
     @Override
@@ -119,6 +125,7 @@ public class PrinterService extends Service {
         stopPoller();
         stopTempPoller();
         if (plugPollerThread != null) plugPollerThread.requestStop();
+        if (scheduledPrintPollerThread != null) scheduledPrintPollerThread.requestStop();
         if (httpServer != null) httpServer.shutdown();
         cameraController.stop();
         printerConnection.disconnect();
@@ -169,7 +176,23 @@ public class PrinterService extends Service {
     public JSONObject getStateJson() {
         updateBatteryStatus();
         updateScreenStatus();
+        syncScheduledPrintIntoState();
         return state.toJson();
+    }
+
+    private void syncScheduledPrintIntoState() {
+        ScheduledPrintStore.Job job = scheduledPrintStore.get();
+        if (job == null) {
+            state.scheduledFile = null;
+            state.scheduledFileDisplay = null;
+            state.scheduledAtMillis = 0;
+            state.scheduledStatus = null;
+        } else {
+            state.scheduledFile = job.filename;
+            state.scheduledFileDisplay = job.displayName;
+            state.scheduledAtMillis = job.atMillis;
+            state.scheduledStatus = job.status;
+        }
     }
 
     /** Local copy of whatever's currently loaded (see uploadedFile above) - null if nothing has
@@ -228,6 +251,20 @@ public class PrinterService extends Service {
      * name from an earlier upload in this app, and only then to the bare short name.
      */
     public JSONArray listSdFiles() throws IOException, TimeoutException {
+        // Never send a live M20 while a print is running/paused. Confirmed on real hardware: if
+        // this races with the print file's own start gcode (G28/G29 leveling, M190/M109 heating),
+        // this firmware doesn't answer M20 until that blocking preamble finishes - unlike M105,
+        // which it answers immediately even mid-heat - so waitForOk()'s sliding deadline (reset by
+        // every keepalive/auto-report line the preamble keeps emitting) can sit inside commandLock
+        // for a long time. That starved the poller (temps looked frozen) AND queued the Stop
+        // button's own commandLock acquisition behind it for the same duration, making Stop look
+        // like it silently did nothing when it had only been delayed. The dashboard's file list is
+        // locked/read-only during PRINTING/PAUSED anyway (see dashboard.html's sdFilesList.locked
+        // toggle), so there's nothing to gain from a live query in that window - the cached
+        // SdFilenameMap listing this returns instead is exactly what was already selected.
+        if (state.phase == PrinterState.Phase.PRINTING || state.phase == PrinterState.Phase.PAUSED) {
+            return listKnownFiles();
+        }
         synchronized (commandLock) {
             String raw = printerConnection.listSdFiles();
             JSONArray files = new JSONArray();
@@ -260,6 +297,25 @@ public class PrinterService extends Service {
             }
             return files;
         }
+    }
+
+    /** Same shape as listSdFiles(), but built entirely from SdFilenameMap - no M20 query, so no
+     *  printer connection needed. Used by the scheduled-print file picker, which by definition
+     *  has to work while the printer is off (that's the whole point of scheduling it to power on
+     *  and print later). Naturally limited to files this app itself has uploaded - a file copied
+     *  onto the card from a computer was never in SdFilenameMap to begin with. */
+    public JSONArray listKnownFiles() {
+        JSONArray files = new JSONArray();
+        for (java.util.Map.Entry<String, String> e : sdFilenameMap.entries().entrySet()) {
+            try {
+                JSONObject entry = new JSONObject();
+                entry.put("name", e.getKey());
+                entry.put("displayName", e.getValue());
+                files.put(entry);
+            } catch (Exception ignored) {
+            }
+        }
+        return files;
     }
 
     /**
@@ -739,6 +795,15 @@ public class PrinterService extends Service {
         return dir;
     }
 
+    /** Looks up the locally cached copy of an SD file by its short name, if one still exists -
+     *  used by the scheduled-print picker's preview, which needs to show a file's layers before
+     *  it's selected/printing (and possibly before the printer is even connected), unlike
+     *  /gcode/current which only ever serves whatever selectSdFile() most recently set active. */
+    public File getCachedGcodeFile(String printerFilename) {
+        File f = new File(gcodeCacheDir(), sanitizeCacheFilename(printerFilename));
+        return f.exists() ? f : null;
+    }
+
     /** Printer filenames are already constrained to classic 8.3 short names (see
      *  toSafeSdFilename's own comment on why), so this never actually strips anything in
      *  practice - just refuses to let a filename from the wire be used as a raw path. */
@@ -828,33 +893,130 @@ public class PrinterService extends Service {
         }
     }
 
+    // ---- scheduled print ------------------------------------------------------------------------
+    // Deliberately requires `filename` to already be sitting on the printer's SD card (same
+    // short name selectSdFile()/the sdfiles list already use) - the whole point is a fast,
+    // near-instant start at the target time, not kicking off a slow M28/M29 upload unattended.
+
+    public void setScheduledPrint(String filename, String displayName, long atMillis) {
+        scheduledPrintStore.set(filename, displayName, atMillis);
+    }
+
+    public void cancelScheduledPrint() {
+        scheduledPrintStore.clear();
+    }
+
+    /** Runs on ScheduledPrintPollerThread, well outside commandLock's normal holders - grabs it
+     *  itself for the connect/select/start sequence, same as a manual dashboard tap would. */
+    private void runScheduledPrintIfDue() {
+        ScheduledPrintStore.Job job = scheduledPrintStore.get();
+        if (job == null || !"PENDING".equals(job.status)) return;
+        if (System.currentTimeMillis() < job.atMillis) return;
+
+        synchronized (commandLock) {
+            if (state.phase == PrinterState.Phase.PRINTING || state.phase == PrinterState.Phase.PAUSED
+                    || state.phase == PrinterState.Phase.UPLOADING) {
+                Log.w(TAG, "Scheduled print skipped: printer busy (" + state.phase + ")");
+                scheduledPrintStore.markFailed("printer was busy at the scheduled time");
+                return;
+            }
+
+            wakeScreen();
+
+            if (tapoPlugController.isConfigured()) {
+                try {
+                    if (!tapoPlugController.isOn()) {
+                        tapoPlugController.turnOn();
+                        state.plugOn = true;
+                        // Give the printer's mainboard time to fully power up and finish its own
+                        // boot sequence before trying to talk to it over USB - if this isn't
+                        // quite enough for a cold boot, connectPrinter() below still fails
+                        // gracefully and the next poll cycle (SCHEDULED_PRINT_POLL_INTERVAL_MS
+                        // later) just retries, up to SCHEDULED_PRINT_MAX_RETRY_MS.
+                        Thread.sleep(PRINTER_BOOT_DELAY_MS);
+                    }
+                } catch (IOException e) {
+                    Log.w(TAG, "Scheduled print: couldn't turn on Tapo plug (non-fatal, trying to connect anyway)", e);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+
+            if (state.phase != PrinterState.Phase.IDLE && state.phase != PrinterState.Phase.UPLOAD_VERIFIED) {
+                if (!connectPrinter()) {
+                    // connectPrinter() already set state.phase/lastError - leave the job PENDING
+                    // so the next poll (SCHEDULED_PRINT_POLL_INTERVAL_MS later) retries, up to
+                    // SCHEDULED_PRINT_MAX_RETRY_MS after the target time before giving up.
+                    if (System.currentTimeMillis() - job.atMillis > SCHEDULED_PRINT_MAX_RETRY_MS) {
+                        Log.e(TAG, "Scheduled print gave up: could not connect to printer");
+                        scheduledPrintStore.markFailed("could not connect to printer");
+                    }
+                    return;
+                }
+            }
+
+            // Re-check against the live store, not just the `job` snapshot captured above - a
+            // dashboard Cancel click can land at any point during the plug/boot wait or
+            // connectPrinter() above (neither of those go through commandLock's normal callers,
+            // so cancelScheduledPrint() isn't blocked by any of this), and must still be able to
+            // stop the print from actually starting.
+            if (scheduledPrintStore.get() != job) {
+                Log.i(TAG, "Scheduled print aborted: cancelled or changed while starting up");
+                return;
+            }
+
+            UploadOutcome selectOutcome = selectSdFile(job.filename, job.displayName);
+            if (!selectOutcome.success || state.phase != PrinterState.Phase.UPLOAD_VERIFIED) {
+                Log.e(TAG, "Scheduled print failed to select file: " + selectOutcome.message);
+                scheduledPrintStore.markFailed("couldn't select " + job.displayName + ": " + selectOutcome.message);
+                return;
+            }
+
+            if (!startPrint()) {
+                Log.e(TAG, "Scheduled print failed to start: " + state.lastError);
+                scheduledPrintStore.markFailed("couldn't start print: " + state.lastError);
+                return;
+            }
+        }
+        scheduledPrintStore.clear();
+    }
+
+    private static final long SCHEDULED_PRINT_MAX_RETRY_MS = 5 * 60 * 1000L;
+    private static final long PRINTER_BOOT_DELAY_MS = 10000;
+
     public boolean stopPrint() {
+        // Called BEFORE trying to enter commandLock, not from inside it. Confirmed on real
+        // hardware: while a print's own start gcode is doing auto bed leveling, some other command
+        // already in flight (a poll's M105, a file list query, connectPrinter(), ...) can sit
+        // inside waitForOk() unanswered for minutes, holding commandLock the whole time - Stop
+        // must never queue up behind that. This breaks the stuck call out within about a second
+        // (see PrinterConnection.requestAbort()'s javadoc), so the synchronized(commandLock) below
+        // gets in almost immediately instead of waiting behind it.
+        printerConnection.requestAbort();
         synchronized (commandLock) {
             try {
-                // A currently-paused job needs the M24-then-M524 variant - see
-                // PrinterConnection.stopPausedPrint()'s javadoc for why a bare stopPrint() would
-                // silently fail to actually abort it on this firmware.
                 if (state.phase == PrinterState.Phase.PAUSED) {
                     printerConnection.stopPausedPrint();
                 } else {
                     printerConnection.stopPrint();
                 }
-                state.phase = PrinterState.Phase.IDLE;
-                // The job is gone for good after a Stop (unlike Pause) - nothing is printing
-                // any more, so a leftover progress/elapsed reading from before Stop was pressed
-                // would otherwise sit there stale (confirmed on real hardware: survives even a
-                // reconnect, since nothing else ever touches these fields once printing stops).
-                state.printProgressPercent = 0;
-                state.elapsedSeconds = 0;
-                stopPoller();
-                updateNotification("Stopped");
-                return true;
             } catch (IOException | TimeoutException e) {
                 Log.e(TAG, "stopPrint failed", e);
                 state.lastError = String.valueOf(e.getMessage());
                 return false;
             }
+            state.phase = PrinterState.Phase.IDLE;
+            // The job is gone for good after a Stop (unlike Pause) - nothing is printing any more,
+            // so a leftover progress/elapsed reading from before Stop was pressed would otherwise
+            // sit there stale (confirmed on real hardware: survives even a reconnect, since
+            // nothing else ever touches these fields once printing stops).
+            state.printProgressPercent = 0;
+            state.elapsedSeconds = 0;
+            stopPoller();
+            updateNotification("Stopped");
         }
+        return true;
     }
 
     public boolean pausePrint() {
@@ -1086,10 +1248,50 @@ public class PrinterService extends Service {
         }
     }
 
+    private static final int SCHEDULED_PRINT_POLL_INTERVAL_MS = 20000;
+
+    class ScheduledPrintPollerThread extends Thread {
+        private volatile boolean stopRequested = false;
+
+        ScheduledPrintPollerThread() {
+            super("PrintHostScheduledPrintPoller");
+        }
+
+        void requestStop() {
+            stopRequested = true;
+            interrupt();
+        }
+
+        @Override
+        public void run() {
+            while (!stopRequested) {
+                try {
+                    Thread.sleep(SCHEDULED_PRINT_POLL_INTERVAL_MS);
+                    if (stopRequested) break;
+                    runScheduledPrintIfDue();
+                } catch (InterruptedException e) {
+                    break;
+                } catch (Exception e) {
+                    Log.w(TAG, "scheduled print check failed (non-fatal)", e);
+                }
+            }
+        }
+    }
+
     private static final Pattern SD_PRINTING_BYTE = Pattern.compile("SD printing byte (\\d+)/(\\d+)");
 
     class PollerThread extends Thread {
         private volatile boolean stopRequested = false;
+        // Only trust a bare "Not SD printing" M27 reply as "the print finished" once we've
+        // actually seen the printer report real SD-print byte progress at least once. Confirmed
+        // on real hardware: right after M24, while the file's own start gcode (G28/G29 leveling,
+        // M190/M109 heating) is still running, M27 can reply "Not SD printing" even though the
+        // print has genuinely just started (Print time: 0s) - treating that as "done" flipped
+        // state.phase to IDLE and killed this thread within seconds of a scheduled print starting,
+        // which in turn made the very next Stop press send M524 while the firmware's own
+        // sdprinting flag really was false - see PrinterConnection.stopPrint()'s javadoc for why
+        // that silently no-ops instead of aborting anything.
+        private boolean sawSdPrinting = false;
 
         PollerThread() {
             super("PrintHostPoller");
@@ -1145,7 +1347,8 @@ public class PrinterService extends Service {
 
             synchronized (PrinterService.this) {
                 parseTemperatures(temps, state);
-                boolean done = parseProgress(progress, state);
+                if (SD_PRINTING_BYTE.matcher(progress).find()) sawSdPrinting = true;
+                boolean done = parseProgress(progress, state, sawSdPrinting);
                 state.elapsedSeconds = parseElapsedSeconds(printTime);
                 if (uploadedFile != null) {
                     state.fanSpeed = GcodeFanParser.fanSpeedAtByteOffset(uploadedFile, state.uploadedBytes);
@@ -1194,7 +1397,7 @@ public class PrinterService extends Service {
      * now detected three independent ways, any one of which is sufficient - not relying on
      * catching that one-shot message.
      */
-    private static boolean parseProgress(String m27Response, PrinterState state) {
+    private static boolean parseProgress(String m27Response, PrinterState state, boolean sawSdPrintingYet) {
         String lower = m27Response.toLowerCase(java.util.Locale.US);
         if (lower.contains("done printing")) {
             state.printProgressPercent = 100;
@@ -1218,9 +1421,12 @@ public class PrinterService extends Service {
             }
             return false;
         }
-        // No byte-progress line at all - the firmware already stopped reporting one
-        // ("Not SD printing"), which only happens after M1001 has already run.
-        return lower.contains("not sd printing");
+        // No byte-progress line at all. Normally this only happens after M1001 has already run
+        // ("Not SD printing"), the same string the firmware also replies with in the seconds
+        // right after M24 while the file's own start gcode is still running - so only treat it as
+        // completion once real byte progress has actually been observed at least once; otherwise
+        // this is the print just starting, not finishing.
+        return sawSdPrintingYet && lower.contains("not sd printing");
     }
 
     /**

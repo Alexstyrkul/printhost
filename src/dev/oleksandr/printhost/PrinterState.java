@@ -45,6 +45,11 @@ public class PrinterState {
     public volatile boolean unloadingFilament = false;
     public volatile boolean levelingBed = false;
 
+    public volatile String scheduledFile = null; // SD short name, null = nothing scheduled
+    public volatile String scheduledFileDisplay = null;
+    public volatile long scheduledAtMillis = 0;
+    public volatile String scheduledStatus = null; // "PENDING" | "FAILED", null = no active schedule
+
     public synchronized JSONObject toJson() {
         JSONObject o = new JSONObject();
         try {
@@ -73,6 +78,10 @@ public class PrinterState {
             o.put("plugOn", plugOn == null ? JSONObject.NULL : plugOn);
             o.put("unloadingFilament", unloadingFilament);
             o.put("levelingBed", levelingBed);
+            o.put("scheduledFile", scheduledFile == null ? JSONObject.NULL : scheduledFile);
+            o.put("scheduledFileDisplay", scheduledFileDisplay == null ? JSONObject.NULL : scheduledFileDisplay);
+            o.put("scheduledAtMillis", scheduledAtMillis);
+            o.put("scheduledStatus", scheduledStatus == null ? JSONObject.NULL : scheduledStatus);
 
             long remaining = 0;
             if (printProgressPercent > 0 && printProgressPercent < 100) {

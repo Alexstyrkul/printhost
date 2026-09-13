@@ -70,7 +70,6 @@
     body { padding: 8px; }
     .main-grid { grid-template-columns: 1fr; gap: 10px; }
     .card { padding: 12px; }
-    .reserved-card { display: none !important; }
     .camera-frame { max-width: none; }
     .top-row { flex-wrap: wrap; row-gap: 8px; }
     .status-group { flex-direction: column; align-items: flex-start; row-gap: 8px; width: 100%; }
@@ -243,6 +242,20 @@
   .preview-legend-swatches { display: flex; gap: 14px; }
   .preview-legend-swatches span { display: inline-flex; align-items: center; gap: 6px; }
   .swatch { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+
+  .schedule-card { padding: 0; overflow: hidden; }
+  .schedule-body { display: flex; flex-direction: column; gap: 9px; padding: 0 16px 16px; }
+  .schedule-body select {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--panel-border);
+    border-radius: var(--radius-sm); padding: 9px 10px; font-size: 12.5px; font-family: inherit;
+    color-scheme: dark;
+  }
+  #scheduleInfo { display: block; line-height: 1.5; }
+  .schedule-body input[type="datetime-local"] {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--panel-border);
+    border-radius: var(--radius-sm); padding: 9px 10px; font-size: 12.5px; font-family: inherit;
+    color-scheme: dark;
+  }
 </style>
 <script type="importmap">
 {
@@ -384,8 +397,20 @@
     </div>
   </div>
 
-  <div class="card reserved-card" style="border-style: dashed; display: flex; align-items: center; justify-content: center; color: var(--text-faint); font-size: 11px;">
-    Reserved
+  <div class="card schedule-card">
+    <div class="preview-header">
+      <span class="action-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg></span>
+      <span class="action-label">Scheduled Print</span>
+    </div>
+    <div id="scheduleForm" class="schedule-body">
+      <select id="scheduleFileSelect"><option value="">Choose a file already on the SD card&hellip;</option></select>
+      <input type="datetime-local" id="scheduleDateTime">
+      <button id="scheduleSetBtn" class="primary small">Schedule</button>
+    </div>
+    <div id="scheduleActive" class="schedule-body" style="display:none;">
+      <div class="pill" id="scheduleInfo" style="font-size: 12px;"></div>
+      <button id="scheduleCancelBtn" class="small danger">Cancel</button>
+    </div>
   </div>
 
   <div class="card camera-card">
@@ -570,6 +595,16 @@ function loadSdFiles() {
   fetch("/sdfiles").then(function (r) { return r.json(); }).then(function (data) {
     renderSdFiles((data && data.files) || []);
   }).catch(function () {});
+  loadScheduleFiles();
+}
+
+/** Backed by SdFilenameMap, not a live M20 query - unlike loadSdFiles() above, this works
+ *  whether or not the printer is currently connected, which the scheduled-print picker needs
+ *  (the whole point of scheduling is setting it up while the printer's still off). */
+function loadScheduleFiles() {
+  fetch("/sdfiles/known").then(function (r) { return r.json(); }).then(function (data) {
+    populateScheduleFileSelect((data && data.files) || []);
+  }).catch(function () {});
 }
 
 function renderSdFiles(files) {
@@ -631,6 +666,85 @@ function deleteSdFile(name) {
 
 $("refreshSdBtn").onclick = function () { loadSdFiles(); };
 
+// ---- scheduled print --------------------------------------------------------------------------
+
+function populateScheduleFileSelect(files) {
+  var sel = $("scheduleFileSelect");
+  var previous = sel.value;
+  sel.innerHTML = '<option value="">Choose a file already on the SD card&hellip;</option>';
+  files.forEach(function (f) {
+    var opt = document.createElement("option");
+    opt.value = f.name;
+    opt.dataset.displayName = f.displayName || f.name;
+    opt.textContent = f.displayName || f.name;
+    sel.appendChild(opt);
+  });
+  sel.value = previous;
+}
+
+function renderSchedule(s) {
+  var hasJob = !!s.scheduledFile;
+  $("scheduleForm").style.display = hasJob ? "none" : "flex";
+  $("scheduleActive").style.display = hasJob ? "flex" : "none";
+  if (hasJob) {
+    // The picker's gone (replaced by the summary below), so stop it hijacking the main
+    // preview - let ensurePreview() fall back to whatever's actually live on the printer.
+    schedulePreviewFile = null;
+    var when = new Date(s.scheduledAtMillis).toLocaleString();
+    var failed = s.scheduledStatus && s.scheduledStatus.indexOf("FAILED") === 0;
+    var info = $("scheduleInfo");
+    if (failed) {
+      info.textContent = "Failed: " + s.scheduledStatus.substring("FAILED:".length) + " (" + (s.scheduledFileDisplay || s.scheduledFile) + ")";
+      info.style.color = "var(--danger)";
+    } else {
+      info.textContent = (s.scheduledFileDisplay || s.scheduledFile) + " at " + when;
+      info.style.color = "";
+    }
+  }
+}
+
+// Selecting a candidate file re-purposes the same big Print Preview canvas up top (via
+// ensurePreview()) instead of duplicating a second 3D viewer just for this card.
+var schedulePreviewFile = null;
+
+$("scheduleFileSelect").onchange = function () {
+  schedulePreviewFile = $("scheduleFileSelect").value || null;
+};
+
+// A bare datetime-local input only opens its native picker when you hit the small calendar
+// glyph - showPicker() forces it open no matter where in the field you tap.
+$("scheduleDateTime").addEventListener("click", function () {
+  if (typeof this.showPicker === "function") {
+    try { this.showPicker(); } catch (e) { /* unsupported browser - falls back to normal focus */ }
+  }
+});
+
+$("scheduleSetBtn").onclick = function () {
+  var sel = $("scheduleFileSelect");
+  var filename = sel.value;
+  var displayName = sel.selectedOptions[0] ? sel.selectedOptions[0].dataset.displayName : "";
+  var dt = $("scheduleDateTime").value; // native picker - Android's own wheel dialog handles input
+  if (!filename) { showToast("error", "Choose a file first"); return; }
+  if (!dt) { showToast("error", "Pick a date and time first"); return; }
+  var picked = new Date(dt);
+  var atMillis = picked.getTime();
+  if (atMillis <= Date.now()) {
+    showToast("error", "Scheduled time must be in the future");
+    return;
+  }
+  var q = "/schedule/set?filename=" + encodeURIComponent(filename)
+      + "&displayName=" + encodeURIComponent(displayName || "")
+      + "&atMillis=" + atMillis;
+  post(q).then(function (r) {
+    if (r.success) { renderStatus(r.state); showToast("success", "Print scheduled"); }
+    else showToast("error", r.message || r.error || "Couldn't schedule print");
+  });
+};
+
+$("scheduleCancelBtn").onclick = function () {
+  post("/schedule/cancel").then(function (r) { renderStatus(r.state); });
+};
+
 /** Lazily loads the 3D preview once a file is both *selected* and actually ready to read
  *  (UPLOAD_VERIFIED/PRINTING/PAUSED), not once layer info shows up: currentLayer/totalLayers
  *  only start populating once byte-offset progress exists, i.e. once printing is already under
@@ -657,7 +771,52 @@ var previewFile = null;
 var previewLoading = false;
 var PREVIEW_READY_PHASES = { UPLOAD_VERIFIED: true, PRINTING: true, PAUSED: true };
 
+function loadPreview(fileKey, gcodeUrl, initialLayer, onReady) {
+  previewLoading = true;
+  previewFile = fileKey;
+  $("previewLoading").textContent = "Loading preview…";
+  $("previewLoading").classList.remove("hidden", "error");
+  import("/vendor/preview-panel.js").then(function (mod) {
+    return mod.initPrintPreview({
+      ghostCanvas: $("previewGhostCanvas"),
+      solidCanvas: $("previewSolidCanvas"),
+      gcodeUrl: gcodeUrl,
+      initialLayer: initialLayer,
+    });
+  }).then(function (api) {
+    if (previewFile !== fileKey) return; // superseded by a newer selection while this was loading
+    previewApi = api;
+    previewLoading = false;
+    $("previewLoading").classList.add("hidden");
+    onReady(api);
+  }).catch(function (err) {
+    if (previewFile !== fileKey) return;
+    console.error("Print preview failed to load:", err);
+    previewLoading = false;
+    previewApi = null;
+    previewFile = null;
+    $("previewLoading").textContent = "Preview failed: " + (err && err.message ? err.message : String(err));
+    $("previewLoading").classList.remove("hidden");
+    $("previewLoading").classList.add("error");
+  });
+}
+
 function ensurePreview(s) {
+  // Browsing the scheduled-print file picker takes over this same canvas to show what would
+  // get printed - there's nothing live to show yet, so it wins over the status-driven view
+  // below regardless of phase (renderSchedule() clears this the moment a job is actually set).
+  if (schedulePreviewFile) {
+    var skey = "schedule:" + schedulePreviewFile;
+    if (previewApi && previewFile === skey) return;
+    if (previewLoading) return;
+    loadPreview(skey, "/gcode/cached?filename=" + encodeURIComponent(schedulePreviewFile), 0, function (api) {
+      api.setCurrentLayer(api.totalLayers); // nothing's printed yet - show the whole model solid
+      $("previewLayerReadout").textContent = "Preview";
+      $("previewPercentReadout").textContent = "-";
+    });
+    return;
+  }
+
   var ready = !!(s.currentFile || s.currentFileDisplay) && !!PREVIEW_READY_PHASES[s.phase];
   if (!ready) {
     if (previewApi || previewFile) {
@@ -682,32 +841,10 @@ function ensurePreview(s) {
   }
   if (previewLoading) return; // already loading fileKey (or about to be superseded by it)
 
-  previewLoading = true;
-  previewFile = fileKey;
-  $("previewLoading").textContent = "Loading preview…";
-  $("previewLoading").classList.remove("hidden", "error");
-  import("/vendor/preview-panel.js").then(function (mod) {
-    return mod.initPrintPreview({
-      ghostCanvas: $("previewGhostCanvas"),
-      solidCanvas: $("previewSolidCanvas"),
-      gcodeUrl: "/gcode/current",
-      initialLayer: layer,
-    });
-  }).then(function (api) {
-    previewApi = api;
-    previewLoading = false;
-    $("previewLoading").classList.add("hidden");
+  loadPreview(fileKey, "/gcode/current", layer, function (api) {
     var total = s.totalLayers != null ? s.totalLayers : api.totalLayers;
     $("previewLayerReadout").textContent = "Layer " + layer + "/" + total;
     $("previewPercentReadout").textContent = (s.printProgressPercent || 0) + "%";
-  }).catch(function (err) {
-    console.error("Print preview failed to load:", err);
-    previewLoading = false;
-    previewApi = null;
-    previewFile = null;
-    $("previewLoading").textContent = "Preview failed: " + (err && err.message ? err.message : String(err));
-    $("previewLoading").classList.remove("hidden");
-    $("previewLoading").classList.add("error");
   });
 }
 
@@ -753,8 +890,13 @@ function renderStatus(s) {
   highlightSelectedSdFile();
   $("sdFilesList").classList.toggle("locked",
       s.phase === "PRINTING" || s.phase === "PAUSED" || s.phase === "UPLOADING");
-  if (live && !wasLive) loadSdFiles();
+  // Skip while PRINTING/PAUSED: the list is locked (see above) and hitting the live M20 query
+  // right as a print's own start gcode is heating/leveling can stall the connection for minutes
+  // (server now refuses it too, but no reason to even ask).
+  if (live && !wasLive && s.phase !== "PRINTING" && s.phase !== "PAUSED") loadSdFiles();
   wasLive = live;
+
+  renderSchedule(s);
 
   var pct = s.batteryPercent;
   $("batteryPct").textContent = pct >= 0 ? pct : "-";
@@ -1017,6 +1159,7 @@ $("torchBtn").onclick = function () {
 };
 
 refreshStatus();
+loadScheduleFiles();
 setInterval(refreshStatus, 2000);
 
 // ?demo=success or ?demo=error opens straight into a toast, so it can be shown/heard on the

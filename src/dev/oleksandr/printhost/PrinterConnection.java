@@ -36,9 +36,13 @@ public class PrinterConnection {
 
     private final UsbManager usbManager;
     private UsbDeviceConnection usbConnection;
-    private UsbSerialPort port;
+    private volatile UsbSerialPort port;
     private final byte[] readBuf = new byte[4096];
     private final ByteArrayOutputStream leftover = new ByteArrayOutputStream();
+    // Set by requestAbort() to break another thread out of waitForOk() early - see that method
+    // and requestAbort()'s own javadoc for why this exists (Stop must never wait behind a stuck
+    // command for up to HARD_TIMEOUT_MS).
+    private volatile boolean abortRequested = false;
 
     public PrinterConnection(UsbManager usbManager) {
         this.usbManager = usbManager;
@@ -230,8 +234,22 @@ public class PrinterConnection {
      * See PRINTHOST_STATUS.md #6 for the DWIN screen caveat this doesn't (and structurally can't
      * fully) fix: no gcode command reaches the touchscreen's own checkkey/Popup_Window_Home UI
      * state, only card.abortFilePrintSoon() and the thermal/timer state that command touches.
+     *
+     * Callers MUST call requestAbort() before calling this - see that method's javadoc for why:
+     * without it, this can sit behind commandLock's real holder (whichever earlier call is stuck
+     * in waitForOk()) for up to HARD_TIMEOUT_MS before even starting.
      */
     public synchronized String stopPrint() throws IOException, TimeoutException {
+        abortRequested = false; // the thread we just interrupted has already released the monitor
+        // M410 (Quick Stop) is one of the 3 commands (with M108/M112) Marlin's EMERGENCY_PARSER
+        // is meant to scan for in the raw incoming byte stream itself, ahead of the normal
+        // line-buffered gcode queue - the same out-of-band path the touchscreen's own Stop button
+        // gets, but WITHOUT M112's full KILL state (no reset/power-cycle needed after). Harmless
+        // to send even if this firmware's EMERGENCY_PARSER doesn't actually honor it as advertised
+        // (Cap:EMERGENCY_PARSER:1 in M115) - it just becomes one more queued command. Only clears
+        // the planner's queued moves though - doesn't touch heaters or the SD file - so
+        // M104/M140/M524 still follow to actually finish the job off.
+        sendAndWaitForOk("M410", DEFAULT_TIMEOUT_MS);
         sendAndWaitForOk("M104 S0", DEFAULT_TIMEOUT_MS);
         sendAndWaitForOk("M140 S0", DEFAULT_TIMEOUT_MS);
         return sendAndWaitForOk("M524", DEFAULT_TIMEOUT_MS);
@@ -243,13 +261,35 @@ public class PrinterConnection {
      * resuming (M24) flips it true again just long enough for the immediately-following M524 to
      * take the real abort path instead of M524.cpp's "just close the file" fallback. Heaters are
      * killed first (same as stopPrint()), so nothing re-heats during that brief resume, and the
-     * abort itself is what stops any resumed motion almost immediately after.
+     * abort itself is what stops any resumed motion almost immediately after. Callers MUST call
+     * requestAbort() first, same as stopPrint().
      */
     public synchronized String stopPausedPrint() throws IOException, TimeoutException {
+        abortRequested = false;
         sendAndWaitForOk("M104 S0", DEFAULT_TIMEOUT_MS);
         sendAndWaitForOk("M140 S0", DEFAULT_TIMEOUT_MS);
         sendAndWaitForOk("M24", DEFAULT_TIMEOUT_MS);
         return sendAndWaitForOk("M524", DEFAULT_TIMEOUT_MS);
+    }
+
+    /**
+     * Breaks whatever's currently stuck inside another thread's waitForOk() call out of it almost
+     * immediately (within ~1s - see the abortRequested check there), instead of it sitting there
+     * for up to HARD_TIMEOUT_MS (3 minutes). Confirmed on real hardware: while a print's own start
+     * gcode is doing auto bed leveling, this firmware can leave a poll's M105 (or any other
+     * command) unanswered for minutes, and since that call is a `synchronized` method, it holds
+     * this object's monitor - and PrinterService.stopPrint()'s own commandLock, since that's
+     * always held by whoever's stuck inside a connection call too - for exactly as long. Stop must
+     * never wait behind that.
+     *
+     * Call this BEFORE trying to enter commandLock/call stopPrint(), not from inside it - the
+     * whole point is to unstick the current holder before we even try to acquire what it's
+     * holding. The unstuck call fails with an IOException (harmless - every other caller already
+     * handles a failed command normally) and its synchronized block releases the monitor as it
+     * unwinds, so stopPrint() usually gets in within about a second of this being called.
+     */
+    public void requestAbort() {
+        abortRequested = true;
     }
 
     /** Pause only - the job stays selected, so resumePrint() can continue it from where it left off. */
@@ -555,6 +595,12 @@ public class PrinterConnection {
         long hardDeadline = start + Math.max(timeoutMs, HARD_TIMEOUT_MS);
         long slidingDeadline = start + timeoutMs;
         while (true) {
+            // readLine() below caps each underlying port.read() at 1000ms regardless of how much
+            // of the deadline is left, so this check fires within ~1s of requestAbort() being
+            // called from another thread - not up to HARD_TIMEOUT_MS later.
+            if (abortRequested) {
+                throw new IOException("Aborted: a higher-priority command (Stop) needs the port");
+            }
             long now = System.currentTimeMillis();
             long deadline = Math.min(slidingDeadline, hardDeadline);
             long remaining = deadline - now;
