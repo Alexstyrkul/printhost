@@ -73,6 +73,8 @@ public class PrinterService extends Service {
     private TapoPlugController tapoPlugController;
     private ScheduledPrintStore scheduledPrintStore;
     private AutoShutoffStore autoShutoffStore;
+    private final WsHub wsHub = new WsHub();
+    private StateBroadcasterThread stateBroadcasterThread;
     // Set once a print ends (finishes normally or is Stopped) while auto-shutoff is on; cleared
     // the moment it actually powers the plug off. Only while armed does TempPollerThread watch
     // for the printer having cooled down - otherwise a printer that's simply idle-but-warm right
@@ -117,8 +119,12 @@ public class PrinterService extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         startForegroundCompat();
         if (httpServer == null) {
-            httpServer = new PrintHostHttpServer(HTTP_PORT, new DashboardRouter(this));
+            httpServer = new PrintHostHttpServer(HTTP_PORT, new DashboardRouter(this), wsHub);
             httpServer.start();
+        }
+        if (stateBroadcasterThread == null) {
+            stateBroadcasterThread = new StateBroadcasterThread();
+            stateBroadcasterThread.start();
         }
         return START_STICKY;
     }
@@ -134,6 +140,7 @@ public class PrinterService extends Service {
         stopTempPoller();
         if (plugPollerThread != null) plugPollerThread.requestStop();
         if (scheduledPrintPollerThread != null) scheduledPrintPollerThread.requestStop();
+        if (stateBroadcasterThread != null) stateBroadcasterThread.requestStop();
         if (httpServer != null) httpServer.shutdown();
         cameraController.stop();
         printerConnection.disconnect();
@@ -277,6 +284,7 @@ public class PrinterService extends Service {
         synchronized (commandLock) {
             String raw = printerConnection.listSdFiles();
             JSONArray files = new JSONArray();
+            java.util.Set<String> liveNames = new java.util.HashSet<>();
             boolean inList = false;
             for (String line : raw.split("\n")) {
                 String trimmed = line.trim();
@@ -300,8 +308,23 @@ public class PrinterService extends Service {
                     entry.put("displayName", displayName);
                     entry.put("size", size);
                     files.put(entry);
+                    liveNames.add(name);
                 } catch (Exception ignored) {
                     // a line that doesn't parse as "NAME SIZE [LONGNAME]" is skipped, not fatal
+                }
+            }
+            // A file deleted from the card some other way (a card reader on a computer, not
+            // through this app's own Delete button) leaves a stale SdFilenameMap entry behind -
+            // deleteSdFile() only ever prunes the one it itself removes, so nothing else notices
+            // the card no longer has it. This is the one place that already has a fresh, real M20
+            // listing to check against, so it's the natural place to reconcile: anything
+            // SdFilenameMap remembers that this listing didn't just report gets dropped, along
+            // with its gcode cache entry - keeps the scheduled-print picker (listKnownFiles(),
+            // backed by the same map) from going on offering a file that's actually gone.
+            for (String known : sdFilenameMap.entries().keySet()) {
+                if (!liveNames.contains(known)) {
+                    sdFilenameMap.remove(known);
+                    deleteGcodeCacheEntry(known);
                 }
             }
             return files;
@@ -1254,6 +1277,51 @@ public class PrinterService extends Service {
     }
 
     private static final int PLUG_POLL_INTERVAL_MS = 15000;
+
+    private static final int STATE_BROADCAST_INTERVAL_MS = 750;
+
+    /** Pushes PrinterState.toJson() to every connected WebSocket client (see WsHub) whenever it
+     *  actually changes, replacing the dashboard's old "fresh HTTP request every 2 seconds"
+     *  polling - that pattern meant a brand new TCP connection roughly every 2 seconds, forever,
+     *  which competes for the same WiFi radio as everything else this app does (including a
+     *  multi-megabyte gcode preview fetch - confirmed as the direct trigger for "dashboard looks
+     *  disconnected while a preview is loading"). One long-lived WS connection avoids that churn
+     *  entirely. Skips the toJson()+diff work when nobody's listening rather than literally
+     *  starting/stopping this thread on connect/disconnect - simpler than wiring connect/
+     *  disconnect callbacks through WsHub, and the idle cost is one cheap boolean check per tick,
+     *  the same style TempPollerThread already uses to skip its own work while PRINTING. */
+    class StateBroadcasterThread extends Thread {
+        private volatile boolean stopRequested = false;
+        private String lastSent = null;
+
+        StateBroadcasterThread() {
+            super("PrintHostStateBroadcaster");
+        }
+
+        void requestStop() {
+            stopRequested = true;
+            interrupt();
+        }
+
+        @Override
+        public void run() {
+            while (!stopRequested) {
+                try {
+                    Thread.sleep(STATE_BROADCAST_INTERVAL_MS);
+                    if (stopRequested) break;
+                    if (!wsHub.hasConnections()) continue;
+                    String json = getStateJson().toString();
+                    if (json.equals(lastSent)) continue;
+                    lastSent = json;
+                    wsHub.broadcast("{\"type\":\"state\",\"state\":" + json + "}");
+                } catch (InterruptedException e) {
+                    break;
+                } catch (Exception e) {
+                    Log.w(TAG, "state broadcast failed (non-fatal)", e);
+                }
+            }
+        }
+    }
 
     /** Independent of the printer connection - the plug's own state doesn't depend on whether
      *  the printer is currently talked to over USB. Runs for the service's whole lifetime so the

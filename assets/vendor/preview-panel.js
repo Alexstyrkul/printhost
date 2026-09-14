@@ -245,12 +245,19 @@ export async function initPrintPreview({ ghostCanvas, solidCanvas, gcodeUrl, ini
   // is driven by startLayer/endLayer. Render once, synchronously, ourselves.
   //
   // Each instance parses independently (the library keeps parsing coupled
-  // to one job per GCodePreview) — an accepted cost, worth revisiting if it
-  // proves too slow on very large files.
-  await Promise.all([
-    ghostPreview.processGCodeStream(stream(), { render: false }),
-    solidPreview.processGCodeStream(stream(), { render: false }),
-  ]);
+  // to one job per GCodePreview). Sequential, not Promise.all - confirmed on
+  // a real device (iPhone 14, Chrome): running both passes concurrently on a
+  // large model (500+ layers) overlaps each pass's own peak memory (parsing
+  // buffers + growing geometry) on top of the other's, and mobile Safari/
+  // Chrome's renderer process gets killed by iOS under that combined peak -
+  // shows up as a generic "Can't open this page", indistinguishable from a
+  // network failure. Running the solid pass only after the ghost pass has
+  // fully finished (so its own scratch/parsing buffers are already released,
+  // leaving just its final geometry) keeps the peak to roughly one pass's
+  // worth instead of two, at the cost of a bit more wall-clock time - a
+  // trade worth making since nothing here is time-critical.
+  await ghostPreview.processGCodeStream(stream(), { render: false });
+  await solidPreview.processGCodeStream(stream(), { render: false });
 
   const totalLayers = solidPreview.countLayers;
 

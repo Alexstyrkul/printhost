@@ -75,6 +75,19 @@
     .status-group { flex-direction: column; align-items: flex-start; row-gap: 8px; width: 100%; }
     .status-toggles { flex-wrap: wrap; row-gap: 6px; }
   }
+  /* Gated on the .is-mobile class (added by isMobileDevice()'s actual user-agent check, see the
+     script below), not a width media query - a narrow desktop browser window must NOT trip this,
+     only a real phone. The 3D preview builds real WebGL tube geometry for the whole model twice
+     (ghost + solid) - iOS Safari/Chrome (both WebKit) cap WebGL heap memory at roughly 300-500MB
+     regardless of the device's actual RAM, and a large model (500+ layers) reliably exceeds that,
+     crashing the tab. No reduced-detail setting reliably stays under that cap for an arbitrary
+     file, so mobile skips the whole card - the layer pill below covers the layer count; percent
+     is already shown in the progress ring above, so this pill doesn't repeat it. */
+  .is-mobile .preview-card { display: none; }
+  /* Two classes, not one - .pill's own base rule (display: flex) is defined further down this
+     stylesheet and would otherwise win on source order alone despite equal specificity. */
+  .time-pill.mobile-layer-pill { display: none; }
+  .is-mobile .time-pill.mobile-layer-pill { display: flex; }
 
   .print-card { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 
@@ -344,6 +357,11 @@
         <div class="time-elapsed"><span id="elapsed" class="num">-</span></div>
         <div class="time-remaining"><span id="remaining" class="num">-</span></div>
       </div>
+    </div>
+
+    <div class="pill time-pill mobile-layer-pill">
+      <svg class="pill-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 2 7l10 5 10-5-10-5Z"/><path d="M2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+      <div class="time-elapsed"><span id="mobileLayerReadout" class="num">Layer -/-</span></div>
     </div>
 
     <div class="temps-row">
@@ -867,7 +885,32 @@ function loadPreview(fileKey, gcodeUrl, initialLayer, onReady) {
   });
 }
 
+// iOS Safari/Chrome (both WebKit under the hood) cap WebGL heap memory at roughly 300-500MB
+// regardless of the device's actual RAM - confirmed on real hardware (iPhone 14): a big model
+// (500+ layers) building two full WebGL scenes (ghost + solid, each with real 3D tube geometry)
+// reliably exceeds that ceiling and the tab gets killed by the OS, showing a generic "Can't open
+// this page" indistinguishable from a network failure. There's no reduced-detail setting that
+// reliably stays under that cap for an arbitrarily large file, so mobile skips the 3D preview
+// entirely rather than risk crashing the page - desktop (not WebGL-capped the same way) is
+// unaffected by this check.
+function isMobileDevice() {
+  return /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+}
+// Stamped once at load, not re-checked per call - drives the .is-mobile CSS rules above, so the
+// hide-preview-card/show-layer-pill behavior is tied to the actual device, not window width (a
+// narrow desktop browser window must keep showing the full preview).
+if (isMobileDevice()) document.documentElement.classList.add("is-mobile");
+
 function ensurePreview(s) {
+  if (isMobileDevice()) {
+    // The whole preview-card is hidden on mobile (see the .is-mobile CSS rules) - this only
+    // needs to keep the mobile-layer-pill that replaces it up to date, never touch the 3D
+    // canvases at all. No percent here - the progress ring above already shows it.
+    if (previewApi || previewFile) { previewApi = null; previewFile = null; }
+    $("mobileLayerReadout").textContent = s.currentLayer != null && s.totalLayers != null
+        ? "Layer " + s.currentLayer + "/" + s.totalLayers : "Layer -/-";
+    return;
+  }
   // Browsing the scheduled-print file picker takes over this same canvas to show what would
   // get printed - there's nothing live to show yet, so it wins over the status-driven view
   // below regardless of phase (renderSchedule() clears this the moment a job is actually set).
@@ -916,6 +959,52 @@ function ensurePreview(s) {
 
 function refreshStatus() {
   fetch("/status").then(function (r) { return r.json(); }).then(renderStatus).catch(function () {});
+}
+
+// Replaces the old "fetch /status every 2 seconds forever" loop with one long-lived WebSocket
+// connection the server pushes state over whenever it actually changes (see PrinterService's
+// StateBroadcasterThread) - that old pattern meant a brand new TCP connection roughly every 2
+// seconds, competing with everything else on the same WiFi radio (confirmed: it's why the
+// dashboard looked disconnected while a multi-megabyte gcode preview was loading - the poll and
+// the preview fetch were fighting for the same constrained link). The plain HTTP polling loop
+// below is now only a fallback, active while the WS connection itself is down/reconnecting.
+var ws = null;
+var wsReconnectDelayMs = 1000;
+var wsFallbackPollTimer = null;
+
+function connectWs() {
+  var proto = location.protocol === "https:" ? "wss:" : "ws:";
+  var socket = new WebSocket(proto + "//" + location.host + "/ws");
+  ws = socket;
+  socket.onopen = function () {
+    wsReconnectDelayMs = 1000;
+    stopWsFallbackPoll();
+  };
+  socket.onmessage = function (ev) {
+    var msg;
+    try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    if (msg && msg.type === "state") renderStatus(msg.state);
+  };
+  socket.onclose = function () {
+    if (ws === socket) ws = null;
+    startWsFallbackPoll();
+    setTimeout(connectWs, wsReconnectDelayMs);
+    wsReconnectDelayMs = Math.min(wsReconnectDelayMs * 2, 15000);
+  };
+  socket.onerror = function () {
+    socket.close();
+  };
+}
+
+function startWsFallbackPoll() {
+  if (wsFallbackPollTimer) return;
+  refreshStatus();
+  wsFallbackPollTimer = setInterval(refreshStatus, 3000);
+}
+function stopWsFallbackPoll() {
+  if (!wsFallbackPollTimer) return;
+  clearInterval(wsFallbackPollTimer);
+  wsFallbackPollTimer = null;
 }
 
 function renderStatus(s) {
@@ -1236,7 +1325,7 @@ $("torchBtn").onclick = function () {
 
 refreshStatus();
 loadScheduleFiles();
-setInterval(refreshStatus, 2000);
+connectWs();
 
 // ?demo=success or ?demo=error opens straight into a toast, so it can be shown/heard on the
 // actual device by opening a link - no console needed.

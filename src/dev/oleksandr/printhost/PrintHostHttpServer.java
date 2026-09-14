@@ -20,13 +20,15 @@ public class PrintHostHttpServer extends Thread {
 
     private final int port;
     private final RequestRouter router;
+    private final WsHub wsHub;
     private volatile ServerSocket serverSocket;
     private volatile boolean running = true;
 
-    public PrintHostHttpServer(int port, RequestRouter router) {
+    public PrintHostHttpServer(int port, RequestRouter router, WsHub wsHub) {
         super("PrintHostHttpServer");
         this.port = port;
         this.router = router;
+        this.wsHub = wsHub;
     }
 
     @Override
@@ -48,7 +50,7 @@ public class PrintHostHttpServer extends Thread {
                 }
                 break;
             }
-            ConnectionHandler handler = new ConnectionHandler(socket, router);
+            ConnectionHandler handler = new ConnectionHandler(socket, router, wsHub);
             handler.start();
         }
         closeQuietly(serverSocket);
@@ -73,17 +75,20 @@ public class PrintHostHttpServer extends Thread {
     static class ConnectionHandler extends Thread {
         private final Socket socket;
         private final RequestRouter router;
+        private final WsHub wsHub;
 
-        ConnectionHandler(Socket socket, RequestRouter router) {
+        ConnectionHandler(Socket socket, RequestRouter router, WsHub wsHub) {
             super("PrintHostConn");
             this.socket = socket;
             this.router = router;
+            this.wsHub = wsHub;
         }
 
         @Override
         public void run() {
             try {
-                socket.setSoTimeout(0); // streaming routes (MJPEG) may run indefinitely
+                socket.setSoTimeout(0); // streaming routes (MJPEG, WS) may run indefinitely
+                boolean closeSocket = true;
                 try {
                     InputStream rawIn = socket.getInputStream();
                     OutputStream rawOut = socket.getOutputStream();
@@ -92,9 +97,21 @@ public class PrintHostHttpServer extends Thread {
                         writeError(rawOut, 400, "Bad Request");
                         return;
                     }
+                    if (WebSocketHandshake.isUpgradeRequest(request)) {
+                        WebSocketHandshake.doHandshake(rawOut, request);
+                        WsConnection conn = new WsConnection(socket);
+                        wsHub.register(conn);
+                        closeSocket = false; // conn.close() (called by runReadLoop's finally) owns it now
+                        try {
+                            conn.runReadLoop(); // blocks until the client disconnects
+                        } finally {
+                            wsHub.unregister(conn);
+                        }
+                        return;
+                    }
                     router.handle(request, rawOut);
                 } finally {
-                    socket.close();
+                    if (closeSocket) socket.close();
                 }
             } catch (IOException e) {
                 Log.d(TAG, "connection closed: " + e.getMessage());
