@@ -551,8 +551,8 @@ function $(id) { return document.getElementById(id); }
 
 function fmtTime(sec) {
   sec = Math.max(0, Math.floor(sec));
-  var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
-  return (h > 0 ? h + "h " : "") + m + "m " + s + "s";
+  var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60);
+  return (h > 0 ? h + "h " : "") + m + "m";
 }
 
 function post(path) {
