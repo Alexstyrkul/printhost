@@ -190,6 +190,9 @@ public class DashboardRouter implements RequestRouter {
         } else if (p.equals("/torch/off") && req.method.equals("POST")) {
             boolean ok = service.torch(false);
             writeJson(out, ok ? 200 : 502, resultJson(ok, service.getStateJson()));
+        } else if (p.equals("/camera/force") && req.method.equals("POST")) {
+            service.setCameraForce("1".equals(req.queryParam("on")));
+            writeJson(out, 200, resultJson(true, service.getStateJson()));
         } else if (p.equals("/gcode/current") && req.method.equals("GET")) {
             writeUploadedGcode(out);
         } else if (p.equals("/gcode/cached") && req.method.equals("GET")) {

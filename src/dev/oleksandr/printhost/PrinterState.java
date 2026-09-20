@@ -15,6 +15,10 @@ public class PrinterState {
 
     public volatile Phase phase = Phase.DISCONNECTED;
     public volatile String lastError = "";
+    /** A file on the ESP32's SD card is chosen and verified, ready to print once the printer is connected. */
+    public volatile boolean fileReady = false;
+    /** The camera is forced on regardless of the printer plug (for testing). */
+    public volatile boolean cameraForce = false;
 
     public volatile double hotendTemp = 0;
     public volatile double hotendTarget = 0;
@@ -57,6 +61,8 @@ public class PrinterState {
         try {
             o.put("phase", phase.name());
             o.put("lastError", lastError);
+            o.put("fileReady", fileReady);
+            o.put("cameraForce", cameraForce);
             o.put("hotendTemp", hotendTemp);
             o.put("hotendTarget", hotendTarget);
             o.put("bedTemp", bedTemp);

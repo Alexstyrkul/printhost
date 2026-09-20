@@ -57,6 +57,8 @@ public class PrinterService extends Service {
     // consistent snapshot of its (volatile) fields, which is all status reads need.
     private final Object commandLock = new Object();
     private PrinterConnection printerConnection;
+    /** Address of the ESP32 camera board, which doubles as the mock printer's "SD card". */
+    private String espHost = "192.168.50.190";
     private CameraController cameraController;
     private PrintHostHttpServer httpServer;
     private MacNotifier macNotifier;
@@ -66,6 +68,7 @@ public class PrinterService extends Service {
     private PollerThread pollerThread;
     private TempPollerThread tempPollerThread;
     private PlugPollerThread plugPollerThread;
+    private CameraSyncThread cameraSyncThread;
     private ScheduledPrintPollerThread scheduledPrintPollerThread;
     private File uploadedFile;
     private SdFilenameMap sdFilenameMap;
@@ -86,7 +89,11 @@ public class PrinterService extends Service {
     public void onCreate() {
         super.onCreate();
         usbManager = (UsbManager) getSystemService(Context.USB_SERVICE);
-        printerConnection = new PrinterConnection(usbManager);
+        android.content.SharedPreferences prefs = getSharedPreferences("printhost", MODE_PRIVATE);
+        espHost = prefs.getString("esp_host", espHost);
+        // The printer is always driven by the ESP32 board; this phone never opens USB.
+        printerConnection = new EspPrinterConnection("http://" + espHost, "usb");
+        state.cameraForce = prefs.getBoolean("camera_force", false);
         cameraController = new CameraController(this);
         macNotifier = new MacNotifier(this);
         sdFilenameMap = new SdFilenameMap(new File(getFilesDir(), "sd_filename_map.json"));
@@ -110,6 +117,8 @@ public class PrinterService extends Service {
 
         plugPollerThread = new PlugPollerThread();
         plugPollerThread.start();
+        cameraSyncThread = new CameraSyncThread();
+        cameraSyncThread.start();
 
         scheduledPrintPollerThread = new ScheduledPrintPollerThread();
         scheduledPrintPollerThread.start();
@@ -139,6 +148,7 @@ public class PrinterService extends Service {
         stopPoller();
         stopTempPoller();
         if (plugPollerThread != null) plugPollerThread.requestStop();
+        if (cameraSyncThread != null) cameraSyncThread.requestStop();
         if (scheduledPrintPollerThread != null) scheduledPrintPollerThread.requestStop();
         if (stateBroadcasterThread != null) stateBroadcasterThread.requestStop();
         if (httpServer != null) httpServer.shutdown();
@@ -372,9 +382,8 @@ public class PrinterService extends Service {
      */
     public UploadOutcome selectSdFile(String filename, String displayName) {
         synchronized (commandLock) {
-            if (!printerConnection.isOpen()) {
-                return new UploadOutcome(false, "Not connected");
-            }
+            // The files live on the ESP32's SD card, not in the printer: choosing one needs no
+            // printer connection.
             if (filename == null || filename.trim().isEmpty()) {
                 return new UploadOutcome(false, "Missing filename");
             }
@@ -384,7 +393,8 @@ public class PrinterService extends Service {
             }
             try {
                 long size = printerConnection.selectFile(filename);
-                state.phase = PrinterState.Phase.UPLOAD_VERIFIED;
+                state.phase = printerConnection.isOpen() ? PrinterState.Phase.UPLOAD_VERIFIED : PrinterState.Phase.DISCONNECTED;
+                state.fileReady = true;
                 state.currentFile = filename;
                 state.currentFileDisplay = (displayName != null && !displayName.trim().isEmpty())
                         ? displayName : sdFilenameMap.displayNameFor(filename);
@@ -400,7 +410,7 @@ public class PrinterService extends Service {
                 return new UploadOutcome(true, "Selected " + filename);
             } catch (IOException | TimeoutException e) {
                 Log.e(TAG, "selectSdFile failed", e);
-                state.phase = PrinterState.Phase.ERROR;
+                state.phase = printerConnection.isOpen() ? PrinterState.Phase.ERROR : PrinterState.Phase.DISCONNECTED;
                 state.lastError = String.valueOf(e.getMessage());
                 return new UploadOutcome(false, state.lastError);
             }
@@ -415,9 +425,6 @@ public class PrinterService extends Service {
      */
     public UploadOutcome deleteSdFile(String filename) {
         synchronized (commandLock) {
-            if (!printerConnection.isOpen()) {
-                return new UploadOutcome(false, "Not connected");
-            }
             if (filename == null || filename.trim().isEmpty()) {
                 return new UploadOutcome(false, "Missing filename");
             }
@@ -427,9 +434,11 @@ public class PrinterService extends Service {
             }
             try {
                 String response = printerConnection.deleteFile(filename);
+                state.lastError = "";
                 sdFilenameMap.remove(filename);
                 deleteGcodeCacheEntry(filename);
                 if (filename.equals(state.currentFile)) {
+                    state.fileReady = false;
                     state.currentFile = "";
                     state.currentFileDisplay = "";
                     state.uploadedBytes = 0;
@@ -465,19 +474,7 @@ public class PrinterService extends Service {
             }
             state.phase = PrinterState.Phase.CONNECTING;
             try {
-                UsbDevice target = findCandidateDevice();
-                if (target == null) {
-                    state.phase = PrinterState.Phase.ERROR;
-                    state.lastError = "No supported USB-serial device attached";
-                    return false;
-                }
-                if (!usbManager.hasPermission(target)) {
-                    if (!requestUsbPermissionAndWait(target)) {
-                        state.phase = PrinterState.Phase.ERROR;
-                        state.lastError = "USB permission denied or timed out";
-                        return false;
-                    }
-                }
+                UsbDevice target = null;  // unused: the ESP32 board owns the USB link
                 printerConnection.connect(target);
                 state.firmwareInfo = firstLine(printerConnection.queryFirmwareInfo());
                 state.zOffset = parseZOffset(printerConnection.queryZOffset());
@@ -494,7 +491,7 @@ public class PrinterService extends Service {
                     updateNotification("Printing " + state.currentFileDisplay);
                     startPoller();
                 } else {
-                    state.phase = PrinterState.Phase.IDLE;
+                    state.phase = state.fileReady ? PrinterState.Phase.UPLOAD_VERIFIED : PrinterState.Phase.IDLE;
                 }
                 return true;
             } catch (IOException | TimeoutException e) {
@@ -563,6 +560,18 @@ public class PrinterService extends Service {
         return name.isEmpty() ? null : name;
     }
 
+    /** Testing switch: keep the camera on even when the printer's plug is off. */
+    public void setCameraForce(boolean on) {
+        state.cameraForce = on;
+        getSharedPreferences("printhost", MODE_PRIVATE).edit().putBoolean("camera_force", on).apply();
+        if (cameraSyncThread != null) cameraSyncThread.wakeNow();
+    }
+
+    /** Address of the ESP32 board that drives the printer and stores the gcode files. */
+    public String getEspHost() {
+        return espHost;
+    }
+
     public void disconnectPrinter() {
         synchronized (commandLock) {
             stopPoller();
@@ -579,16 +588,12 @@ public class PrinterService extends Service {
             state.bedTarget = 0;
             state.zOffset = 0;
             state.firmwareInfo = "";
-            state.currentFile = "";
-            state.currentFileDisplay = "";
-            state.uploadedBytes = 0;
-            state.expectedBytes = 0;
+            // The chosen file lives on the ESP32's SD card, not in the printer, so it stays selected.
             state.printProgressPercent = 0;
             state.elapsedSeconds = 0;
             state.fanSpeed = null;
             state.currentLayer = null;
             state.totalLayers = null;
-            uploadedFile = null;
             updateNotification("Idle");
         }
     }
@@ -670,13 +675,16 @@ public class PrinterService extends Service {
         }
     }
 
+    /** A file operation failed. Only a connected printer is put into ERROR; otherwise the printer is
+     *  simply still disconnected and lastError carries the message. */
+    private PrinterState.Phase fileErrorPhase() {
+        return printerConnection.isOpen() ? PrinterState.Phase.ERROR : PrinterState.Phase.DISCONNECTED;
+    }
+
     /** Uses commandLock, not the service monitor - a multi-minute transfer must never block
      *  getStateJson(), which is what the dashboard polls to show live upload progress. */
     public UploadOutcome upload(String filename, InputStream body, long contentLength) {
       synchronized (commandLock) {
-        if (!printerConnection.isOpen()) {
-            return new UploadOutcome(false, "Not connected");
-        }
         if (filename == null || filename.trim().isEmpty()) {
             return new UploadOutcome(false, "Missing filename");
         }
@@ -686,6 +694,15 @@ public class PrinterService extends Service {
         state.currentFileDisplay = filename;
         state.uploadedBytes = 0;
         state.expectedBytes = contentLength;
+        // A new file starts from scratch: without this, the layer/fan/progress left over from the
+        // previous print (even a stopped one) made the 3D preview show part of the new model as
+        // already printed right after the upload.
+        state.currentLayer = null;
+        state.totalLayers = null;
+        state.fanSpeed = null;
+        state.printProgressPercent = 0;
+        state.elapsedSeconds = 0;
+        state.fileReady = false;
         uploadCancelRequested = false;
         updateNotification("Uploading " + filename);
 
@@ -693,7 +710,7 @@ public class PrinterService extends Service {
         try {
             saveToLocalFile(body, localCopy);
         } catch (IOException e) {
-            state.phase = PrinterState.Phase.ERROR;
+            state.phase = fileErrorPhase();
             state.lastError = "Failed to receive upload: " + e.getMessage();
             return new UploadOutcome(false, state.lastError);
         }
@@ -705,7 +722,8 @@ public class PrinterService extends Service {
             state.uploadedBytes = result.bytesSent;
             state.currentFile = result.printerFilename;
             if (verified) {
-                state.phase = PrinterState.Phase.UPLOAD_VERIFIED;
+                state.phase = printerConnection.isOpen() ? PrinterState.Phase.UPLOAD_VERIFIED : PrinterState.Phase.DISCONNECTED;
+                state.fileReady = true;
                 uploadedFile = localCopy;
                 sdFilenameMap.put(result.printerFilename, filename);
                 cacheGcodeFile(localCopy, result.printerFilename, result.bytesSent);
@@ -713,7 +731,7 @@ public class PrinterService extends Service {
                 return new UploadOutcome(true, "Uploaded as " + result.printerFilename
                         + " (from " + filename + "), verified " + result.bytesSent + " bytes");
             } else {
-                state.phase = PrinterState.Phase.ERROR;
+                state.phase = fileErrorPhase();
                 state.lastError = "Upload verification failed (size mismatch on SD card)";
                 updateNotification("Upload FAILED verification");
                 return new UploadOutcome(false, state.lastError);
@@ -731,7 +749,8 @@ public class PrinterService extends Service {
                         + " (non-fatal, but " + e.printerFilename + " is now junk on the SD card)",
                         deleteFailure);
             }
-            state.phase = PrinterState.Phase.IDLE;
+            state.phase = printerConnection.isOpen() ? PrinterState.Phase.IDLE : PrinterState.Phase.DISCONNECTED;
+            state.fileReady = false;
             state.currentFile = "";
             state.currentFileDisplay = "";
             state.uploadedBytes = 0;
@@ -741,7 +760,7 @@ public class PrinterService extends Service {
             return new UploadOutcome(true, "Upload cancelled");
         } catch (IOException | TimeoutException e) {
             Log.e(TAG, "upload failed", e);
-            state.phase = PrinterState.Phase.ERROR;
+            state.phase = fileErrorPhase();
             state.lastError = String.valueOf(e.getMessage());
             return new UploadOutcome(false, state.lastError);
         }
@@ -903,12 +922,18 @@ public class PrinterService extends Service {
 
     public boolean startPrint() {
         synchronized (commandLock) {
-            if (state.phase != PrinterState.Phase.UPLOAD_VERIFIED) {
-                state.lastError = "Cannot start: upload not verified yet";
+            if (!state.fileReady || state.phase == PrinterState.Phase.PRINTING || state.phase == PrinterState.Phase.PAUSED
+                    || state.phase == PrinterState.Phase.UPLOADING) {
+                state.lastError = "Cannot start: choose a file first";
+                return false;
+            }
+            if (!printerConnection.isOpen()) {
+                state.lastError = "Printer is not connected - switch Printer on first";
                 return false;
             }
             try {
                 printerConnection.startPrint(state.currentFile);
+                state.fileReady = false;
                 state.phase = PrinterState.Phase.PRINTING;
                 state.printProgressPercent = 0;
                 state.elapsedSeconds = 0;
@@ -1354,6 +1379,74 @@ public class PrinterService extends Service {
                 } catch (Exception e) {
                     Log.w(TAG, "plug status poll failed (non-fatal)", e);
                 }
+            }
+        }
+    }
+
+    /**
+     * The camera on the ESP32 board is powered only while the printer's smart plug is on (the board itself
+     * always runs). The phone owns the plug, so it tells the board: every few seconds it pushes the desired
+     * camera state, which also re-syncs a board that rebooted and forgot. Unknown plug state (Tapo
+     * unreachable) leaves the camera as it is.
+     */
+    class CameraSyncThread extends Thread {
+        private volatile boolean stopRequested = false;
+        private Boolean lastSent = null;
+        private long lastSentAt = 0;
+
+        CameraSyncThread() {
+            super("PrintHostCameraSync");
+        }
+
+        void requestStop() {
+            stopRequested = true;
+            interrupt();
+        }
+
+        void wakeNow() {
+            interrupt();
+        }
+
+        @Override
+        public void run() {
+            while (!stopRequested) {
+                try {
+                    try {
+                        Thread.sleep(3000);
+                    } catch (InterruptedException e) {
+                        if (stopRequested) break;  // otherwise: woken early to apply a change right away
+                    }
+                    // Forced on (testing) wins; otherwise the camera follows the printer's plug.
+                    Boolean want = state.cameraForce ? Boolean.TRUE : state.plugOn;
+                    if (want == null) continue;
+                    long now = System.currentTimeMillis();
+                    if (lastSent == null || lastSent.booleanValue() != want.booleanValue() || now - lastSentAt > 30000) {
+                        if (postCamera(want.booleanValue())) {
+                            lastSent = want;
+                            lastSentAt = now;
+                        }
+                    }
+                } catch (Exception e) {
+                    Log.w(TAG, "camera sync failed (non-fatal)", e);
+                }
+            }
+        }
+
+        private boolean postCamera(boolean on) {
+            try {
+                java.net.HttpURLConnection c = (java.net.HttpURLConnection)
+                        new java.net.URL("http://" + espHost + "/camera?on=" + (on ? 1 : 0)).openConnection();
+                c.setRequestMethod("POST");
+                c.setConnectTimeout(2000);
+                c.setReadTimeout(4000);
+                c.setFixedLengthStreamingMode(0);
+                c.setDoOutput(true);
+                c.getOutputStream().close();
+                int code = c.getResponseCode();
+                c.disconnect();
+                return code == 200;
+            } catch (java.io.IOException e) {
+                return false;  // board unreachable right now; the next round tries again
             }
         }
     }
