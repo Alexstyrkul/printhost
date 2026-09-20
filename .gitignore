@@ -5,3 +5,7 @@ debug.keystore
 design/printhost-dashboard.html
 .DS_Store
 assets/tapo.properties
+esp32-firmware/.pio/
+esp32-firmware/src/secrets.h
+esp32-firmware/sdkconfig.esp32s3_*
+esp32-firmware/dependencies.lock
