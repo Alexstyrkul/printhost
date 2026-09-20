@@ -77,3 +77,7 @@ licensed, same as this project.
 ## License
 
 MIT - see [LICENSE](LICENSE).
+
+## ESP32 bridge
+
+The printer is now driven by an ESP32-S3 board (camera, file store, print engine); the phone only serves the dashboard. See [docs/HANDOFF_ESP32_BRIDGE.md](docs/HANDOFF_ESP32_BRIDGE.md) and [esp32-firmware/README.md](esp32-firmware/README.md).
