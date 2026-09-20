@@ -42,15 +42,6 @@
   .phase.PAUSED, .phase.UPLOADING, .phase.UPLOAD_VERIFIED, .phase.CONNECTING { background: var(--warn-dim); color: var(--warn); }
   .phase.DISCONNECTED { background: #333; color: var(--text-dim); }
 
-  .battery { display: flex; align-items: center; gap: 5px; font-weight: 600; color: var(--text-dim); }
-  /* Only the fill level inside the outline is color-tiered - the outline itself and the
-     percent text next to it stay neutral. Overrides the rect's own fill="currentColor". */
-  #batteryFill { fill: var(--accent); }
-  #batteryFill.low { fill: var(--warn); }
-  #batteryFill.critical { fill: var(--danger); }
-  .battery-warning { background: var(--danger-dim); border: 1px solid #6b1f1f; border-radius: 8px;
-                      padding: 6px 12px; margin-bottom: 8px; font-size: 11.5px; display: none; }
-  .battery-warning.show { display: block; }
   .msg { font-size: 11.5px; color: var(--danger); min-height: 15px; margin-bottom: 4px; }
 
   button {
@@ -70,7 +61,9 @@
     body { padding: 8px; }
     .main-grid { grid-template-columns: 1fr; gap: 10px; }
     .card { padding: 12px; }
-    .camera-frame { max-width: none; }
+    .cam-stats { grid-template-columns: repeat(2, 1fr); }
+    .cam-modal { align-items: flex-end; padding: 0; }
+    .cam-modal-card { max-width: none; border-radius: var(--radius) var(--radius) 0 0; max-height: 88vh; }
     .top-row { flex-wrap: wrap; row-gap: 8px; }
     .status-group { flex-direction: column; align-items: flex-start; row-gap: 8px; width: 100%; }
     .status-toggles { flex-wrap: wrap; row-gap: 6px; }
@@ -141,18 +134,49 @@
   .sdfiles-list.locked .sdfile-row { pointer-events: none; opacity: 0.5; cursor: not-allowed; }
 
   .camera-card { display: flex; flex-direction: column; justify-content: center; gap: 10px; }
-  /* Fixed aspect-ratio on the frame itself (not just its children) - this is what the phone's
-     rotated portrait capture actually looks like, and it must stay this size whether the camera
-     is on or off, never resizing when toggled or when the sibling column's height changes. */
-  .camera-frame { aspect-ratio: 3/4; width: 100%; max-width: 240px; margin: 0 auto; border-radius: var(--radius-sm); background: #000;
+  /* The camera is the ESP32 board's wide (16:9) stream, always on. The frame keeps its size whether or
+     not the stream is up, so the card never jumps when the connection drops and comes back. */
+  .camera-frame { aspect-ratio: 16/9; width: 100%; border-radius: var(--radius-sm); background: #000;
                    position: relative; overflow: hidden; display: flex; align-items: center; justify-content: center; }
-  #cameraImg { display: none; width: 100%; height: 100%; object-fit: contain; background: #0a0a0c; }
-  .camera-placeholder { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; color: #3a3d42; }
+  #cameraImg { width: 100%; height: 100%; object-fit: contain; background: #0a0a0c; display: none; }
+  .camera-placeholder { width: 100%; height: 100%; display: flex; flex-direction: column; gap: 6px; align-items: center; justify-content: center; color: #3a3d42; font-size: 11.5px; }
   .live-badge { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.55); color: var(--text-dim);
                 font-size: 10.5px; font-weight: 600; padding: 3px 8px; border-radius: 20px; display: none; }
   .live-badge.show { display: block; }
-  .camera-controls { display: flex; gap: 8px; }
-  .camera-controls button { flex: 1; padding: 10px 0; font-size: 12.5px; display: flex; align-items: center; justify-content: center; gap: 7px; }
+  .cam-menu { border: 1px solid var(--panel-border); border-radius: var(--radius-sm); overflow: hidden; background: var(--panel-2); }
+  .cam-menu-head { width: 100%; display: flex; align-items: center; gap: 10px; background: transparent; border: none; border-radius: 0;
+                    color: var(--text); padding: 11px 12px; font-size: 12.5px; font-weight: 600; text-align: left; }
+  .cam-menu-head .grow { flex: 1; }
+  .cam-menu-title { cursor: default; }
+  .cam-menu-head .chev { color: var(--text-faint); transition: transform .15s; }
+  .cam-menu-head[aria-expanded="true"] .chev.down { transform: rotate(180deg); }
+  .cam-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-faint); flex: none; }
+  .cam-dot.ok { background: var(--accent); } .cam-dot.warn { background: var(--warn); } .cam-dot.bad { background: var(--danger); }
+  .cam-menu-body { padding: 0 10px 10px; }
+  .cam-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 8px; }
+  .cam-stat { background: var(--panel); border-radius: var(--radius-sm); padding: 8px 6px; text-align: center; }
+  .cam-stat b { display: block; font-size: 14px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .cam-stat span { display: block; font-size: 10px; color: var(--text-faint); margin-top: 2px; text-transform: uppercase; letter-spacing: .04em; }
+  .cam-stat.warn b { color: var(--warn); }
+  .cam-stat.bad b { color: var(--danger); }
+  .cam-menu-body .cam-menu-head.sub { background: var(--panel); border-radius: var(--radius-sm); }
+
+  .cam-modal { position: fixed; inset: 0; z-index: 60; background: rgba(0,0,0,0.6); display: none; align-items: center; justify-content: center; padding: 12px; }
+  .cam-modal.show { display: flex; }
+  .cam-modal-card { background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius); width: 100%; max-width: 560px;
+                     max-height: 90vh; display: flex; flex-direction: column; overflow: hidden; }
+  .cam-modal-top { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px 8px; }
+  .cam-modal-top h3 { margin: 0; font-size: 14px; }
+  .cam-modal-x { width: 30px; height: 30px; padding: 0; font-size: 18px; line-height: 1; }
+  .cam-modal-body { padding: 0 16px 16px; overflow-y: auto; }
+  .cam-chart { width: 100%; height: 120px; background: #0a0a0c; border-radius: 8px; display: block; }
+  .cam-legend { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-dim); margin: 6px 0 10px; }
+  .cam-kv { display: flex; justify-content: space-between; padding: 3px 0; font-size: 12px; color: var(--text-dim); }
+  .cam-kv b { color: var(--text); font-weight: 600; text-align: right; }
+  .cam-events { margin: 10px 0 0; padding: 10px; background: #0a0a0c; border-radius: 8px; font: 10.5px/1.5 ui-monospace, Menlo, monospace;
+                 color: var(--text-dim); white-space: pre-wrap; max-height: 220px; overflow-y: auto; }
+  .cam-modal-actions { display: flex; gap: 8px; margin-top: 10px; }
+  .cam-modal-actions button { flex: 1; padding: 10px 0; }
 
   .footer { text-align: center; font-size: 10.5px; color: var(--text-faint); margin-top: 8px; }
 
@@ -264,7 +288,7 @@
     color-scheme: dark;
   }
   .schedule-body select.has-value { color: var(--text); }
-  #scheduleSetBtn { padding: 11px; font-size: 13px; }
+  .schedule-section { display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--panel-border); margin-top: 10px; padding-top: 10px; }
   #scheduleInfo { display: block; line-height: 1.5; }
   .datetime-row { display: flex; gap: 8px; }
   .datetime-wrap { position: relative; flex: 1; }
@@ -310,14 +334,6 @@
         <svg class="phase-dot" width="7" height="7" viewBox="0 0 8 8" aria-hidden="true"><circle cx="4" cy="4" r="4" fill="currentColor"/></svg>
         <span id="phaseText">-</span>
       </span>
-      <span class="battery" id="batteryWrap">
-        <svg width="17" height="15" viewBox="0 0 24 24">
-          <rect x="2" y="6" width="18" height="12" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/>
-          <path d="M21 10v4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
-          <rect id="batteryFill" x="4.5" y="8.5" width="0" height="7" rx="1" fill="currentColor"/>
-        </svg>
-        <span id="batteryPct" class="num">-</span>%<span id="batteryChargingIcon"></span>
-      </span>
     </div>
     <div class="status-toggles">
       <label class="switch-item" title="Turn the Tapo smart plug on or off">
@@ -336,9 +352,6 @@
   </div>
 </div>
 
-<div class="battery-warning" id="batteryWarning">
-  &#9888; Low phone battery: <span id="batteryWarningPct">-</span>% remaining.
-</div>
 <div class="msg" id="errorMsg"></div>
 
 <div class="main-grid">
@@ -392,7 +405,7 @@
         </button>
       </div>
       <div class="sdfiles-list" id="sdFilesList">
-        <div class="sdfiles-empty">Connect the printer to see stored files</div>
+        <div class="sdfiles-empty">No files yet - upload one below</div>
       </div>
     </div>
 
@@ -405,6 +418,74 @@
       <progress id="uploadProgress" value="0" max="100" style="width:100%; height:8px;"></progress>
       <span id="uploadStatus" style="font-size:11px; white-space:nowrap;"></span>
       <button id="cancelUploadBtn" class="small danger" style="flex: none;">Cancel</button>
+    </div>
+
+    <div class="schedule-section">
+      <div id="scheduleRow">
+        <label class="action-row" title="Start the print at a chosen date and time instead of right now">
+          <span class="action-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg></span>
+          <span class="action-label">Scheduled print</span>
+          <span class="switch"><input type="checkbox" id="scheduleToggle"><span class="switch-slider"></span></span>
+        </label>
+        <div class="datetime-row" id="scheduleFields" style="display:none; margin-top:8px;">
+        <div class="datetime-wrap" style="flex: 1.3;">
+          <span id="scheduleDateDisplay" class="datetime-display">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg>
+            <span id="scheduleDateText">Date</span>
+          </span>
+          <input type="date" id="scheduleDate">
+        </div>
+        <div class="datetime-wrap" style="flex: 1;">
+          <span id="scheduleTimeDisplay" class="datetime-display">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>
+            <span id="scheduleTimeText">Time</span>
+          </span>
+          <input type="time" id="scheduleTime">
+        </div>
+        </div>
+      </div>
+      <div id="scheduleActive" class="schedule-body" style="display:none;">
+        <div class="pill" id="scheduleInfo" style="font-size: 12px;"></div>
+        <button id="scheduleCancelBtn" class="small danger">Cancel</button>
+      </div>
+      <label class="action-row" title="Turn off the smart plug once the printer has cooled down (&le;50&deg;C) after a print finishes or is stopped">
+        <span class="action-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4v10.54a4 4 0 1 1-4 0V4a2 2 0 0 1 4 0Z"/></svg></span>
+        <span class="action-label">Auto power off after cooldown</span>
+        <span class="switch"><input type="checkbox" id="autoShutoffToggle"><span class="switch-slider"></span></span>
+      </label>
+    </div>
+  </div>
+
+  <div class="card camera-card">
+    <div class="camera-frame">
+      <img id="cameraImg" alt="camera stream">
+      <div class="camera-placeholder" id="cameraPlaceholder">
+        <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8a2 2 0 0 1 2-2h1.5l1-1.5h7l1 1.5H18a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/><circle cx="12" cy="13" r="3.5"/></svg>
+        <span id="camMsg">Connecting to camera&hellip;</span>
+      </div>
+      <span class="live-badge" id="liveBadge">LIVE</span>
+    </div>
+    <div class="cam-menu">
+      <div class="cam-menu-head cam-menu-title">
+        <span class="cam-dot" id="camDot"></span>
+        <span class="grow">Camera board</span>
+      </div>
+      <div class="cam-menu-body" id="camMenuBody">
+        <div class="cam-stats">
+          <div class="cam-stat" id="stFps"><b>&ndash;</b><span>FPS</span></div>
+          <div class="cam-stat" id="stWifi"><b>&ndash;</b><span>Wi-Fi</span></div>
+          <div class="cam-stat" id="stTemp"><b>&ndash;</b><span>Chip temp</span></div>
+          <div class="cam-stat" id="stCpu"><b>&ndash;</b><span>CPU</span></div>
+        </div>
+        <button class="cam-menu-head sub" id="camLogBtn">
+          <span class="grow">Log</span>
+          <svg class="chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
+        </button>
+        <label class="cam-menu-head sub" style="cursor:pointer; margin-top:8px" title="Keep the camera on even when the printer power is off (for testing)">
+          <span class="grow">Turn on camera</span>
+          <span class="switch"><input type="checkbox" id="camForceToggle"><span class="switch-slider"></span></span>
+        </label>
+      </div>
     </div>
   </div>
 
@@ -430,55 +511,22 @@
     </div>
   </div>
 
-  <div class="card schedule-card">
-    <div class="preview-header">
-      <span class="action-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg></span>
-      <span class="action-label">Scheduled Print</span>
-    </div>
-    <div id="scheduleForm" class="schedule-body">
-      <select id="scheduleFileSelect"><option value="">Choose a file already on the SD card&hellip;</option></select>
-      <div class="datetime-row">
-        <div class="datetime-wrap" style="flex: 1.3;">
-          <span id="scheduleDateDisplay" class="datetime-display">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg>
-            <span id="scheduleDateText">Date</span>
-          </span>
-          <input type="date" id="scheduleDate">
-        </div>
-        <div class="datetime-wrap" style="flex: 1;">
-          <span id="scheduleTimeDisplay" class="datetime-display">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>
-            <span id="scheduleTimeText">Time</span>
-          </span>
-          <input type="time" id="scheduleTime">
-        </div>
-      </div>
-      <button id="scheduleSetBtn" class="primary small">Schedule</button>
-    </div>
-    <div id="scheduleActive" class="schedule-body" style="display:none;">
-      <div class="pill" id="scheduleInfo" style="font-size: 12px;"></div>
-      <button id="scheduleCancelBtn" class="small danger">Cancel</button>
-    </div>
-    <div class="schedule-body schedule-divider">
-      <label class="action-row" title="Turn off the smart plug once the printer has cooled down (&le;50&deg;C) after a print finishes or is stopped">
-        <span class="action-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4v10.54a4 4 0 1 1-4 0V4a2 2 0 0 1 4 0Z"/></svg></span>
-        <span class="action-label">Auto power off after cooldown</span>
-        <span class="switch"><input type="checkbox" id="autoShutoffToggle"><span class="switch-slider"></span></span>
-      </label>
-    </div>
-  </div>
 
-  <div class="card camera-card">
-    <div class="camera-frame">
-      <img id="cameraImg" alt="camera stream">
-      <div class="camera-placeholder" id="cameraPlaceholder">
-        <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8a2 2 0 0 1 2-2h1.5l1-1.5h7l1 1.5H18a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/><circle cx="12" cy="13" r="3.5"/></svg>
-      </div>
-      <span class="live-badge" id="liveBadge">LIVE</span>
-    </div>
-    <div class="camera-controls">
-      <button id="cameraBtn" class="primary">Camera On</button>
-      <button id="torchBtn">Flashlight</button>
+
+
+</div>
+
+<div class="cam-modal" id="camLogModal">
+  <div class="cam-modal-card">
+    <div class="cam-modal-top"><h3>Camera board log</h3><button class="cam-modal-x" id="camLogClose" aria-label="Close">&times;</button></div>
+    <div class="cam-modal-body">
+      <canvas class="cam-chart" id="camChart" width="600" height="120"></canvas>
+      <div class="cam-legend"><span><span style="color:var(--accent)">&#9632;</span> FPS (0&ndash;30)</span><span><span style="color:var(--warn)">&#9632;</span> Wi-Fi signal</span></div>
+      <div class="cam-kv"><span>Last restart</span><b id="lgReset">&ndash;</b></div>
+      <div class="cam-kv"><span>Uptime</span><b id="lgUp">&ndash;</b></div>
+      <div class="cam-kv"><span>Wi-Fi drops</span><b id="lgDrops">&ndash;</b></div>
+      <pre class="cam-events" id="camEvents">Loading&hellip;</pre>
+      <div class="cam-modal-actions"><button id="camLogCopy">Copy log</button></div>
     </div>
   </div>
 </div>
@@ -523,15 +571,11 @@
 </div>
 
 <script>
-var LOW_BATTERY_THRESHOLD = 30; // drives the persistent "Low phone battery" warning banner
-var BATTERY_ICON_CRITICAL = 20; // icon color tiers - separate from the warning banner above
-var BATTERY_ICON_LOW = 50;
 var RING_CIRCUMFERENCE = 2 * Math.PI * 50;
 var REMAINING_MIN_PERCENT = 3; // below this, the estimate is too noisy to show
-var cameraOn = false;
-var torchOn = false;
 var selectedFile = null;
 var wasLive = false;
+var sdListLoadedOnce = false;
 var screenToggleSyncSuppressedUntil = 0;
 var currentSdFilename = null;
 var lastPhase = null;
@@ -650,17 +694,8 @@ function loadSdFiles() {
   fetch("/sdfiles").then(function (r) { return r.json(); }).then(function (data) {
     renderSdFiles((data && data.files) || []);
   }).catch(function () {});
-  loadScheduleFiles();
 }
 
-/** Backed by SdFilenameMap, not a live M20 query - unlike loadSdFiles() above, this works
- *  whether or not the printer is currently connected, which the scheduled-print picker needs
- *  (the whole point of scheduling is setting it up while the printer's still off). */
-function loadScheduleFiles() {
-  fetch("/sdfiles/known").then(function (r) { return r.json(); }).then(function (data) {
-    populateScheduleFileSelect((data && data.files) || []);
-  }).catch(function () {});
-}
 
 function renderSdFiles(files) {
   var list = $("sdFilesList");
@@ -723,33 +758,14 @@ $("refreshSdBtn").onclick = function () { loadSdFiles(); };
 
 // ---- scheduled print --------------------------------------------------------------------------
 
-function populateScheduleFileSelect(files) {
-  var sel = $("scheduleFileSelect");
-  var previous = sel.value;
-  sel.innerHTML = '<option value="">Choose a file already on the SD card&hellip;</option>';
-  files.forEach(function (f) {
-    var opt = document.createElement("option");
-    opt.value = f.name;
-    opt.dataset.displayName = f.displayName || f.name;
-    opt.textContent = f.displayName || f.name;
-    sel.appendChild(opt);
-  });
-  sel.value = previous;
-  syncScheduleFileSelectDim();
-}
-
-function syncScheduleFileSelectDim() {
-  $("scheduleFileSelect").classList.toggle("has-value", !!$("scheduleFileSelect").value);
-}
+var scheduledNow = false;
 
 function renderSchedule(s) {
   var hasJob = !!s.scheduledFile;
-  $("scheduleForm").style.display = hasJob ? "none" : "flex";
+  scheduledNow = hasJob;
+  $("scheduleRow").style.display = hasJob ? "none" : "";
   $("scheduleActive").style.display = hasJob ? "flex" : "none";
   if (hasJob) {
-    // The picker's gone (replaced by the summary below), so stop it hijacking the main
-    // preview - let ensurePreview() fall back to whatever's actually live on the printer.
-    schedulePreviewFile = null;
     var when = new Date(s.scheduledAtMillis).toLocaleString();
     var failed = s.scheduledStatus && s.scheduledStatus.indexOf("FAILED") === 0;
     var info = $("scheduleInfo");
@@ -763,13 +779,18 @@ function renderSchedule(s) {
   }
 }
 
-// Selecting a candidate file re-purposes the same big Print Preview canvas up top (via
-// ensurePreview()) instead of duplicating a second 3D viewer just for this card.
+// Kept only so ensurePreview() has nothing left to hijack the main preview with.
 var schedulePreviewFile = null;
 
-$("scheduleFileSelect").onchange = function () {
-  schedulePreviewFile = $("scheduleFileSelect").value || null;
-  syncScheduleFileSelectDim();
+// The Start button doubles as "schedule it" while the Scheduled print switch is on.
+function updateStartLabel() {
+  var on = $("scheduleToggle").checked;
+  var d = $("scheduleDate").value, tm = $("scheduleTime").value;
+  $("startBtn").textContent = !on ? "Start" : (d && tm ? "Start at " + tm : "Start (pick date and time)");
+}
+$("scheduleToggle").onchange = function () {
+  $("scheduleFields").style.display = this.checked ? "flex" : "none";
+  updateStartLabel();
 };
 
 // A bare date/time input only opens its native picker when you hit the small calendar/clock
@@ -802,28 +823,31 @@ wireDateTimeField("scheduleTime", "scheduleTimeDisplay", "scheduleTimeText", fun
   return v;
 });
 
-$("scheduleSetBtn").onclick = function () {
-  var sel = $("scheduleFileSelect");
-  var filename = sel.value;
-  var displayName = sel.selectedOptions[0] ? sel.selectedOptions[0].dataset.displayName : "";
-  var datePart = $("scheduleDate").value;
-  var timePart = $("scheduleTime").value;
-  if (!filename) { showToast("error", "Choose a file first"); return; }
+["scheduleDate", "scheduleTime"].forEach(function (id) { $(id).addEventListener("input", updateStartLabel); });
+
+function scheduleFromStart() {
+  var s = lastState || {};
+  var filename = s.currentFile;
+  if (!s.fileReady || !filename) { showToast("error", "Choose a file first"); return; }
+  var datePart = $("scheduleDate").value, timePart = $("scheduleTime").value;
   if (!datePart || !timePart) { showToast("error", "Pick a date and time first"); return; }
-  var picked = new Date(datePart + "T" + timePart);
-  var atMillis = picked.getTime();
-  if (atMillis <= Date.now()) {
-    showToast("error", "Scheduled time must be in the future");
-    return;
-  }
+  var atMillis = new Date(datePart + "T" + timePart).getTime();
+  if (atMillis <= Date.now()) { showToast("error", "Scheduled time must be in the future"); return; }
   var q = "/schedule/set?filename=" + encodeURIComponent(filename)
-      + "&displayName=" + encodeURIComponent(displayName || "")
+      + "&displayName=" + encodeURIComponent(s.currentFileDisplay || "")
       + "&atMillis=" + atMillis;
   post(q).then(function (r) {
-    if (r.success) { renderStatus(r.state); showToast("success", "Print scheduled"); }
-    else showToast("error", r.message || r.error || "Couldn't schedule print");
+    if (r.success) {
+      renderStatus(r.state);
+      $("scheduleToggle").checked = false;
+      $("scheduleFields").style.display = "none";
+      updateStartLabel();
+      showToast("success", "Print scheduled");
+    } else {
+      showToast("error", r.message || r.error || "Couldn't schedule print");
+    }
   });
-};
+}
 
 $("scheduleCancelBtn").onclick = function () {
   post("/schedule/cancel").then(function (r) { renderStatus(r.state); });
@@ -1007,7 +1031,9 @@ function stopWsFallbackPoll() {
   wsFallbackPollTimer = null;
 }
 
+var lastState = null;
 function renderStatus(s) {
+  lastState = s;
   checkForNotifiableTransition(s);
   var phaseEl = $("phase");
   $("phaseText").textContent = FRIENDLY_PHASE[s.phase] || s.phase;
@@ -1048,20 +1074,16 @@ function renderStatus(s) {
   // Skip while PRINTING/PAUSED: the list is locked (see above) and hitting the live M20 query
   // right as a print's own start gcode is heating/leveling can stall the connection for minutes
   // (server now refuses it too, but no reason to even ask).
-  if (live && !wasLive && s.phase !== "PRINTING" && s.phase !== "PAUSED") loadSdFiles();
+  // The file list is the ESP32 SD card, so it does not depend on the printer being connected: load it
+  // once on the first status, and again whenever the printer (re)connects.
+  if ((!sdListLoadedOnce || (live && !wasLive)) && s.phase !== "PRINTING" && s.phase !== "PAUSED") {
+    sdListLoadedOnce = true;
+    loadSdFiles();
+  }
   wasLive = live;
 
   renderSchedule(s);
 
-  var pct = s.batteryPercent;
-  $("batteryPct").textContent = pct >= 0 ? pct : "-";
-  $("batteryFill").setAttribute("class", pct < 0 ? "" : pct <= BATTERY_ICON_CRITICAL ? "critical"
-      : pct <= BATTERY_ICON_LOW ? "low" : "");
-  $("batteryFill").setAttribute("width", pct >= 0 ? (13 * pct / 100) : 0);
-  $("batteryChargingIcon").textContent = s.batteryCharging ? " ⚡" : "";
-  var showWarning = pct >= 0 && pct <= LOW_BATTERY_THRESHOLD && !s.batteryCharging;
-  $("batteryWarning").className = "battery-warning" + (showWarning ? " show" : "");
-  $("batteryWarningPct").textContent = pct;
 
   $("connectToggle").checked = showAsConnected;
   $("connectToggle").disabled = s.phase === "CONNECTING";
@@ -1080,8 +1102,9 @@ function renderStatus(s) {
     $("plugToggle").checked = s.plugOn;
   }
   $("autoShutoffToggle").checked = !!s.autoShutoffEnabled;
+  $("camForceToggle").checked = !!s.cameraForce;
 
-  renderControls(s.phase);
+  renderControls(s.phase, !!s.fileReady, !!s.scheduledFile);
 
   // Progress bar reflects the real bottleneck - the phone-to-printer serial transfer
   // (state.uploadedBytes/expectedBytes, polled from the server) - not the browser-to-phone
@@ -1106,8 +1129,10 @@ function renderStatus(s) {
 }
 
 /** Only the buttons relevant to the current phase are shown at all - not just disabled. */
-function renderControls(phase) {
-  $("startBtn").style.display = phase === "UPLOAD_VERIFIED" ? "" : "none";
+function renderControls(phase, fileReady, scheduled) {
+  // A chosen file can be started once the printer is on; while it is off the button stays visible and says why.
+  var idleish = phase === "UPLOAD_VERIFIED" || phase === "IDLE" || phase === "DISCONNECTED" || phase === "ERROR";
+  $("startBtn").style.display = (fileReady && idleish && !scheduled) ? "" : "none";
   $("pauseBtn").style.display = phase === "PRINTING" ? "" : "none";
   $("resumeBtn").style.display = phase === "PAUSED" ? "" : "none";
   $("stopBtn").style.display = (phase === "PRINTING" || phase === "PAUSED") ? "" : "none";
@@ -1115,7 +1140,10 @@ function renderControls(phase) {
 
 $("connectToggle").onchange = function () {
   var wantConnected = this.checked;
-  if (!wantConnected && !confirm("Disconnect the printer?")) {
+  var printing = lastPhase === "PRINTING" || lastPhase === "PAUSED";
+  if (!wantConnected && !confirm(printing
+      ? "Stop watching the printer? The print keeps running on the ESP32 board."
+      : "Disconnect the printer?")) {
     this.checked = true;
     return;
   }
@@ -1145,6 +1173,14 @@ $("plugToggle").onchange = function () {
     }
   });
 };
+$("camForceToggle").onchange = function () {
+  var on = this.checked;
+  post("/camera/force?on=" + (on ? 1 : 0)).then(function (r) {
+    if (r.state) renderStatus(r.state);
+    showToast("success", on ? "Camera forced on" : "Camera follows the printer power again");
+  });
+};
+
 $("autoShutoffToggle").onchange = function () {
   var enabled = this.checked;
   post("/autoshutoff/set?enabled=" + enabled).then(function (r) {
@@ -1245,7 +1281,14 @@ $("gridToggle").onclick = function (e) {
   if (willOpen) loadLevelingGrid();
 };
 
-$("startBtn").onclick = function () { post("/start").then(function(r){ renderStatus(r.state); }); };
+$("startBtn").onclick = function () {
+  if ($("scheduleToggle").checked) { scheduleFromStart(); return; }
+  if (lastPhase === "DISCONNECTED" || lastPhase === "ERROR") {
+    showToast("error", "Switch the Printer toggle on first");
+    return;
+  }
+  post("/start").then(function(r){ renderStatus(r.state); });
+};
 $("pauseBtn").onclick = function () {
   if (confirm("Pause the print?")) {
     post("/pause").then(function(r){ renderStatus(r.state); });
@@ -1294,37 +1337,128 @@ function uploadSelectedFile(file) {
   xhr.send(file);
 }
 
-$("cameraBtn").onclick = function () {
-  var startingUp = !cameraOn;
-  var path = startingUp ? "/camera/start" : "/camera/stop";
-  post(path).then(function (r) {
-    cameraOn = startingUp ? r.success : false;
-    $("cameraBtn").textContent = cameraOn ? "Camera Off" : "Camera On";
-    var img = $("cameraImg");
-    var placeholder = $("cameraPlaceholder");
-    $("liveBadge").className = "live-badge" + (cameraOn ? " show" : "");
-    if (cameraOn) {
-      img.style.display = "block";
-      placeholder.style.display = "none";
-      img.src = "/camera/stream?_=" + Date.now();
-    } else {
-      img.style.display = "none";
-      placeholder.style.display = "flex";
-      img.src = "";
-    }
-  });
-};
+// ---- Camera: the ESP32-CAM board streams MJPEG on its own (always on); this page only displays it.
+// Give the board a fixed address in the router (DHCP reservation), or override with ?cam=<host>.
+var ESP_CAM_HOST = (location.search.match(/[?&]cam=([^&]+)/) || [])[1] || "192.168.50.190";
+var espBase = "http://" + ESP_CAM_HOST;
+var camStreamUp = false;
 
-$("torchBtn").onclick = function () {
-  var path = torchOn ? "/torch/off" : "/torch/on";
-  post(path).then(function (r) {
-    torchOn = path === "/torch/on" ? r.success : false;
-    $("torchBtn").textContent = torchOn ? "Flashlight Off" : "Flashlight";
+function setCamStat(id, text, level) {
+  var el = $(id);
+  el.firstElementChild.textContent = text;
+  el.className = "cam-stat" + (level ? " " + level : "");
+}
+function showCamStream(on, msg) {
+  $("cameraImg").style.display = on ? "block" : "none";
+  $("cameraPlaceholder").style.display = on ? "none" : "flex";
+  $("liveBadge").className = "live-badge" + (on ? " show" : "");
+  if (msg) $("camMsg").textContent = msg;
+}
+var camWanted = false, camRetryTimer = null;
+function stopCamStream() {
+  camWanted = false;
+  clearTimeout(camRetryTimer);
+  var img = $("cameraImg");
+  img.onload = img.onerror = null;
+  img.src = "";
+  camStreamUp = false;
+}
+function startCamStream() {
+  camWanted = true;
+  var img = $("cameraImg");
+  img.onload = function () { camStreamUp = true; showCamStream(true); };
+  img.onerror = function () {
+    camStreamUp = false;
+    showCamStream(false, "Camera offline - retrying\u2026");
+    if (camWanted) camRetryTimer = setTimeout(startCamStream, 3000);
+  };
+  img.src = espBase + ":81/stream?_=" + Date.now();
+}
+var camFpsHist = [];
+function pollCamStatus() {
+  fetch(espBase + "/status").then(function (r) { return r.json(); }).then(function (s) {
+    // The camera runs only while the printer's smart plug is on; the board itself always runs.
+    if (s.cameraOn === false) {
+      if (camWanted || camStreamUp) stopCamStream();
+      showCamStream(false, "Camera is off - it turns on with the printer power");
+    } else if (!camWanted) {
+      startCamStream();
+    }
+    // Average the last ~10 s: a single 2 s window jumps around with the scene.
+    camFpsHist.push(s.fps); if (camFpsHist.length > 5) camFpsHist.shift();
+    var fps = camFpsHist.reduce(function (a, b) { return a + b; }, 0) / camFpsHist.length;
+    var cpu = Math.max(s.cpu0, s.cpu1);
+    var lFps = fps < 8 ? "bad" : (fps < 12 ? "warn" : ""), lWifi = s.rssi < -75 ? "bad" : (s.rssi < -67 ? "warn" : ""),
+        lTemp = s.tempC > 75 ? "bad" : (s.tempC > 65 ? "warn" : ""), lCpu = cpu > 90 ? "bad" : "";
+    setCamStat("stFps", fps.toFixed(0), lFps);
+    setCamStat("stWifi", s.rssi + " dBm", lWifi);
+    setCamStat("stTemp", s.tempC.toFixed(0) + " \u00b0C", lTemp);
+    setCamStat("stCpu", cpu + "%", lCpu);
+    var worst = [lFps, lWifi, lTemp, lCpu].indexOf("bad") >= 0 ? "bad" : ([lFps, lWifi, lTemp, lCpu].indexOf("warn") >= 0 ? "warn" : "ok");
+    $("camDot").className = "cam-dot " + worst;
+  }).catch(function () {
+    ["stFps", "stWifi", "stTemp", "stCpu"].forEach(function (id) { setCamStat(id, "\u2013"); });
+    $("camDot").className = "cam-dot";
   });
+}
+
+// ---- Camera board menu + log window
+var camLogText = "", camLogTimer = null;
+function camLogRows(txt) {
+  var i = txt.indexOf("--- samples");
+  return txt.slice(i).split("\n").slice(1).filter(Boolean).map(function (l) { return l.split(",").map(Number); })
+    .filter(function (r) { return r.length > 3 && !isNaN(r[1]); });
+}
+function drawCamChart(rows) {
+  var c = $("camChart"), g = c.getContext("2d"), W = c.width, H = c.height;
+  g.clearRect(0, 0, W, H);
+  g.strokeStyle = "#2a2d32"; g.lineWidth = 1;
+  [0.25, 0.5, 0.75].forEach(function (f) { g.beginPath(); g.moveTo(0, H * f); g.lineTo(W, H * f); g.stroke(); });
+  if (rows.length < 2) return;
+  function line(idx, lo, hi, color) {
+    g.strokeStyle = color; g.lineWidth = 2; g.beginPath();
+    rows.forEach(function (r, i) {
+      var v = Math.max(lo, Math.min(hi, r[idx])), x = i * W / (rows.length - 1), y = H - (v - lo) / (hi - lo) * (H - 6) - 3;
+      if (i === 0) g.moveTo(x, y); else g.lineTo(x, y);
+    });
+    g.stroke();
+  }
+  line(1, 0, 30, "#00c853");
+  line(2, -90, -40, "#f0b90b");
+}
+function fmtUp(s) { var h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60); return h + "h " + m + "m"; }
+function refreshCamLog() {
+  fetch(espBase + "/log").then(function (r) { return r.text(); }).then(function (txt) {
+    camLogText = txt;
+    var m = txt.match(/boot reason: (.*)/); if (m) $("lgReset").textContent = m[1];
+    m = txt.match(/uptime (\d+) s, wifi drops (\d+)/); if (m) { $("lgUp").textContent = fmtUp(+m[1]); $("lgDrops").textContent = m[2]; }
+    drawCamChart(camLogRows(txt));
+    var a = txt.indexOf("--- events"), b = txt.indexOf("--- samples");
+    var ev = txt.slice(a, b).split("\n").slice(1).filter(Boolean);
+    $("camEvents").textContent = ev.length ? ev.slice().reverse().join("\n") : "No events yet.";
+  }).catch(function () { $("camEvents").textContent = "Cannot reach the camera board."; });
+}
+function openCamLog() {
+  $("camLogModal").className = "cam-modal show";
+  refreshCamLog();
+  camLogTimer = setInterval(refreshCamLog, 3000);
+}
+function closeCamLog() {
+  $("camLogModal").className = "cam-modal";
+  clearInterval(camLogTimer); camLogTimer = null;
+}
+$("camLogBtn").onclick = openCamLog;
+$("camLogClose").onclick = closeCamLog;
+$("camLogModal").onclick = function (e) { if (e.target === this) closeCamLog(); };
+document.addEventListener("keydown", function (e) { if (e.key === "Escape") closeCamLog(); });
+$("camLogCopy").onclick = function () {
+  var btn = this, done = function () { btn.textContent = "Copied"; setTimeout(function () { btn.textContent = "Copy log"; }, 1500); };
+  if (navigator.clipboard) navigator.clipboard.writeText(camLogText).then(done, function () {});
 };
+pollCamStatus();
+setInterval(pollCamStatus, 2000);
 
 refreshStatus();
-loadScheduleFiles();
 connectWs();
 
 // ?demo=success or ?demo=error opens straight into a toast, so it can be shown/heard on the
