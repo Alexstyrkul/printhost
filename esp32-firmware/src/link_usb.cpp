@@ -16,8 +16,6 @@ extern "C" {
 #include "common.h"
 #include "printer.h"
 
-volatile bool g_usbLookIn = true;  // brief RX look-ins while quiet (diagnostic switch)
-volatile bool g_usbGate = true;    // gate RX polling at all; off = original always-polling behaviour
 
 namespace {
 
@@ -34,8 +32,6 @@ bool cdcInstalled = false;
 cdc_acm_dev_hdl_t dev = nullptr;
 StreamBufferHandle_t rxBuf = nullptr;
 volatile bool devGone = false;
-volatile uint32_t hotUntilMs = 0;  // poll the printer continuously until this time (after a write / while data flows)
-volatile bool expectReply = false;  // a command was sent and its "ok" has not been seen yet
 
 void usbLibTask(void *) {
   for (;;) {
@@ -46,7 +42,6 @@ void usbLibTask(void *) {
 }
 
 bool onData(const uint8_t *data, size_t len, void *) {
-  hotUntilMs = millis() + 40;
   if (rxBuf) xStreamBufferSend(rxBuf, data, len, 0);
   return true;
 }
@@ -120,7 +115,10 @@ class UsbLink : public PrinterLink {
     cdc_acm_host_device_config_t dc = {};
     dc.connection_timeout_ms = 2500;
     dc.out_buffer_size = 512;
-    dc.in_buffer_size = 512;
+    // IN transfers are exactly one packet (0 = the endpoint max packet size, 64 B). With a bigger buffer a printer reply
+    // whose length is a multiple of 64 bytes never completes (no short packet ends it) and sits in the buffer until
+    // the printer sends something else: a G92/M114 reply of exactly 64 B froze the print for 4 s at every layer.
+    dc.in_buffer_size = 0;
     dc.event_cb = onEvent;
     dc.data_cb = onData;
     dc.user_arg = nullptr;
@@ -159,9 +157,6 @@ class UsbLink : public PrinterLink {
     }
     pendLen = pendPos = 0;
     lineLen = 0;
-    rxOn = true;
-    hotUntilMs = millis() + 60;
-    expectReply = false;
     return true;
   }
 
@@ -175,9 +170,6 @@ class UsbLink : public PrinterLink {
   bool isOpen() override { return dev != nullptr && !devGone; }
 
   bool writeBytes(const uint8_t *d, size_t n) override {
-    expectReply = true;
-    hotUntilMs = millis() + 60;
-    applyRxPolicy();
     while (n > 0) {
       if (!isOpen()) return false;
       size_t chunk = n > 512 ? 512 : n;
@@ -199,7 +191,7 @@ class UsbLink : public PrinterLink {
             memcpy(buf, line, n);
             buf[n] = 0;
             lineLen = 0;
-            if (n >= 2 && buf[0] == 'o' && buf[1] == 'k') expectReply = false;
+
             return (int)n;
           }
         } else if (c != '\r' && lineLen + 1 < sizeof(line)) {
@@ -208,7 +200,6 @@ class UsbLink : public PrinterLink {
       }
       uint32_t left = millis() - t0 >= timeoutMs ? 0 : timeoutMs - (millis() - t0);
       uint32_t slice = left < 4 ? left : 4;
-      applyRxPolicy();
       size_t got = xStreamBufferReceive(rxBuf, pend, sizeof(pend), pdMS_TO_TICKS(slice));
       if (got == 0) {
         if (left <= slice) return -1;
@@ -219,7 +210,6 @@ class UsbLink : public PrinterLink {
     }
   }
 
-  void tick() override { applyRxPolicy(); }
 
   void flushInput() override {
     if (rxBuf) xStreamBufferReset(rxBuf);
@@ -228,25 +218,9 @@ class UsbLink : public PrinterLink {
   }
 
  private:
-  // A silent printer NAKs every bulk IN poll, and that constant traffic wrecks the 2.4 GHz Wi-Fi on this board
-  // (measured: 33 ms ping with polling off, 300 ms with it on). So poll only when it is needed:
-  //  - a few tens of ms right after a write and while data is flowing (replies arrive within milliseconds),
-  //  - brief look-ins (8 ms every 100 ms) while a command is still waiting for its "ok" (slow commands),
-  //  - not at all when nothing is expected. The printer's own FIFO holds anything it says meanwhile.
-  bool rxOn = true;
-  void applyRxPolicy() {
-    if (!dev || devGone) return;
-    uint32_t now = millis();
-    bool hot = (int32_t)(hotUntilMs - now) > 0 || lineLen > 0;
-    bool lookIn = g_usbLookIn && expectReply && (now % 100) < 8;
-    bool want = !g_usbGate || hot || lookIn;
-    if (want && !rxOn) {
-      if (cdc_acm_host_rx_resume(dev) == ESP_OK) rxOn = true;
-    } else if (!want && rxOn) {
-      if (cdc_acm_host_rx_pause(dev) == ESP_OK) rxOn = false;
-    }
-  }
-
+  // Receiving is always on: the bulk IN transfer is polled continuously (an earlier scheme that paused it to spare the
+  // Wi-Fi lost the first bytes of printer lines and swallowed replies - the Wi-Fi trouble it was meant to cure came from
+  // a crowded 2.4 GHz channel, not from USB).
   uint8_t pend[128];
   size_t pendLen = 0, pendPos = 0;
   char line[300];

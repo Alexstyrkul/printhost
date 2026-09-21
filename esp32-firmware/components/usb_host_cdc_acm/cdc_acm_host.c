@@ -941,6 +941,7 @@ esp_err_t cdc_acm_host_data_tx_blocking(cdc_acm_dev_hdl_t cdc_hdl, const uint8_t
 
     memcpy(cdc_dev->data.out_xfer->data_buffer, data, data_len);
     cdc_dev->data.out_xfer->num_bytes = data_len;
+    cdc_dev->data.out_xfer->flags |= USB_TRANSFER_FLAG_ZERO_PACK;  // end a 64/128/... byte line with a zero-length packet, like the IN side needs
     cdc_dev->data.out_xfer->timeout_ms = timeout_ms;
     ESP_GOTO_ON_ERROR(usb_host_transfer_submit(cdc_dev->data.out_xfer), unblock, TAG,);
 

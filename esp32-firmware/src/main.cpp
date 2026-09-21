@@ -215,7 +215,12 @@ struct Sample {
   uint8_t prof;
   int8_t tempC;
   uint8_t cpu0, cpu1;
+  uint8_t pst;             // printer state (PrinterState)
+  uint16_t lps10;          // lines/s x10 (last ~10 s window)
+  uint16_t ackMaxMs, gapMaxMs, resends;
+  int16_t hot10, bed10;    // temperatures x10
 };
+static const char *PRN_STATE[] = {"NO_LINK", "DISCONNECTED", "IDLE", "PRINTING", "PAUSED", "ERROR"};
 static const int SAMPLE_N = 300;  // 5 minutes at 1 Hz
 static const int EVENT_N = 64;
 static Sample samples[SAMPLE_N];
@@ -268,28 +273,57 @@ static void wifiEvent(arduino_event_id_t ev, arduino_event_info_t info) {
 
 // Logs live in their own folder, apart from /gcode, so they never show up in the dashboard file list.
 static const char *LOG_DIR = "/logs";
-static const char *LOG_PATH = "/logs/printhost.log";
-static const char *LOG_TMP = "/logs/logtmp.txt";
+// Logs: one continuous log written into numbered files (log-0001.txt, log-0002.txt ...). A file grows to 10 MB, then the
+// next one starts; only the newest 5 are kept. Nothing is ever trimmed or copied, and old files are deleted only while
+// no print is running, so the log never gets in the way of a print.
+static const size_t LOG_FILE_MAX = 10UL * 1024 * 1024;
+static const int LOG_KEEP = 5;
+static int logSeq = 1;              // number of the file being written
+static bool logCleanupDue = false;  // more than LOG_KEEP files exist: delete the oldest when the printer is idle
 
-// One log file with a size cap: when it gets too big, keep only the newest half.
-static const size_t LOG_MAX_BYTES = 1024 * 1024;
-static void trimLogFile() {
-  File in = SD_MMC.open(LOG_PATH, FILE_READ);
-  if (!in) return;
-  in.seek(in.size() / 2);
-  in.readStringUntil('\n');  // skip the partial line we landed in
-  File out = SD_MMC.open(LOG_TMP, FILE_WRITE);
-  if (!out) {
-    in.close();
-    return;
+static String logPathFor(int n) {
+  char b[40];
+  snprintf(b, sizeof(b), "/logs/log-%04d.txt", n);
+  return String(b);
+}
+static bool logNameOk(const String &n) {
+  if (n.length() != 12 || !n.startsWith("log-") || !n.endsWith(".txt")) return false;
+  for (int i = 4; i < 8; i++)
+    if (n[i] < '0' || n[i] > '9') return false;
+  return true;
+}
+static String baseName(String n) {
+  int i = n.lastIndexOf('/');
+  return i >= 0 ? n.substring(i + 1) : n;
+}
+// Highest log number on the card (0 = none) and, optionally, the lowest and the number of files. Card mutex held by the caller.
+static int logScan(int *count, int *lowest) {
+  int hi = 0, lo = 100000, c = 0;
+  File dir = SD_MMC.open(LOG_DIR);
+  if (dir && dir.isDirectory()) {
+    for (File e = dir.openNextFile(); e; e = dir.openNextFile()) {
+      String n = baseName(e.name());
+      if (!logNameOk(n)) continue;
+      c++;
+      int v = n.substring(4, 8).toInt();
+      if (v > hi) hi = v;
+      if (v < lo) lo = v;
+    }
+    dir.close();
   }
-  static uint8_t buf[2048];  // static: keeps the stack small whichever task calls this
-  int n;
-  while ((n = in.read(buf, sizeof(buf))) > 0) out.write(buf, n);
-  in.close();
-  out.close();
-  SD_MMC.remove(LOG_PATH);
-  SD_MMC.rename(LOG_TMP, LOG_PATH);
+  if (count) *count = c;
+  if (lowest) *lowest = lo;
+  return hi;
+}
+// Delete the oldest files beyond LOG_KEEP. Card mutex held by the caller, printer idle.
+static void logCleanup() {
+  for (int guard = 0; guard < 20; guard++) {
+    int count = 0, lo = 0;
+    logScan(&count, &lo);
+    if (count <= LOG_KEEP) return;
+    SD_MMC.remove(logPathFor(lo));
+    logEvent("log: deleted the oldest file log-%04d.txt", lo);
+  }
 }
 
 
@@ -343,7 +377,22 @@ static void logTick(uint32_t nowMs) {
   s.tempC = (int8_t)chipTempC;
   s.cpu0 = cpuLoad[0];
   s.cpu1 = cpuLoad[1];
+  PrinterSnap ps;
+  printerSnapshot(ps);
+  s.pst = ps.state;
+  s.lps10 = (uint16_t)(ps.lps * 10);
+  s.ackMaxMs = ps.ackMaxUs / 1000 > 65535 ? 65535 : ps.ackMaxUs / 1000;
+  s.gapMaxMs = ps.gapMaxUs / 1000 > 65535 ? 65535 : ps.gapMaxUs / 1000;
+  s.resends = ps.resends > 65535 ? 65535 : ps.resends;
+  s.hot10 = (int16_t)(ps.hot * 10);
+  s.bed10 = (int16_t)(ps.bed * 10);
   sampleCount++;
+
+  static uint32_t lastMemWarn = 0;  // running low on internal RAM: leave a trace (at most every 30 s)
+  if (s.heap < 30 * 1024 && nowMs - lastMemWarn > 30000) {
+    lastMemWarn = nowMs;
+    logEvent("memory: only %u KB free (lowest so far %u KB)", (unsigned)(s.heap / 1024), (unsigned)(ESP.getMinFreeHeap() / 1024));
+  }
 
   if (xSemaphoreTake(sdMutex, 0) != pdTRUE) return;  // a file upload is using the card right now
   struct Give {
@@ -353,7 +402,8 @@ static void logTick(uint32_t nowMs) {
   if (sdStatus == "not detected" || sdStatus == "not tested") return;
   if (nowMs < sdRetryAt) return;
   bool newEvents = eventsFlushed < eventCount;
-  uint32_t sdEvery = streamActive ? 10000 : 60000;  // log less while nobody is watching
+  bool printing = ps.state == PS_PRINTING || ps.state == PS_PAUSED;
+  uint32_t sdEvery = printing ? 10000 : 60000;  // a measurement line every 10 s while printing, every minute otherwise
   if (!newEvents && nowMs - lastSd < sdEvery) return;
   lastSd = nowMs;
   static bool logDirReady = false;
@@ -361,25 +411,38 @@ static void logTick(uint32_t nowMs) {
     if (!SD_MMC.exists(LOG_DIR)) SD_MMC.mkdir(LOG_DIR);
     logDirReady = true;
   }
-  File f = SD_MMC.open(LOG_PATH, FILE_APPEND);
+  if (logCleanupDue && !printing) {  // old files go only while no print is running
+    logCleanup();
+    logCleanupDue = false;
+  }
+  File f = SD_MMC.open(logPathFor(logSeq), FILE_APPEND);
   if (!f) {
     sdRetryAt = nowMs + 60000;  // don't hammer a missing/failed card every second
     sdStatus = "log write failed";
     return;
   }
-  if (f.size() > LOG_MAX_BYTES) {
+  if (f.size() >= LOG_FILE_MAX) {  // this file is full: the next one starts (nothing is copied or trimmed)
     f.close();
-    trimLogFile();
-    f = SD_MMC.open(LOG_PATH, FILE_APPEND);
+    logSeq++;
+    logCleanupDue = true;
+    f = SD_MMC.open(logPathFor(logSeq), FILE_APPEND);
     if (!f) return;
+    logEvent("log: continuing in log-%04d.txt", logSeq);
   }
   while (eventsFlushed < eventCount) {
     if (eventCount - eventsFlushed > EVENT_N) eventsFlushed = eventCount - EVENT_N;
     f.println(events[eventsFlushed % EVENT_N]);
     eventsFlushed++;
   }
-  f.printf("[%lus] fps=%.1f rssi=%d temp=%dC cpu=%u/%u%% get=%u send=%u delay=%u frame=%uB heap=%u psram=%u prof=%s\n", (unsigned long)s.t, s.fps,
-           s.rssi, s.tempC, s.cpu0, s.cpu1, s.getMs, s.sendMs, s.delayMs, (unsigned)s.frameB, (unsigned)s.heap, (unsigned)s.psram, PROFILES[s.prof].name);
+  f.printf("[%lus] fps=%.1f rssi=%d temp=%dC cpu=%u/%u%% get=%u send=%u delay=%u frame=%uB heap=%u minheap=%u psram=%u prof=%s", (unsigned long)s.t, s.fps,
+           s.rssi, s.tempC, s.cpu0, s.cpu1, s.getMs, s.sendMs, s.delayMs, (unsigned)s.frameB, (unsigned)s.heap, (unsigned)ESP.getMinFreeHeap(),
+           (unsigned)s.psram, PROFILES[s.prof].name);
+  if (ps.state >= PS_IDLE)
+    f.printf(" prn=%s line=%u/%uB lps=%.1f ack=%u/%ums gap=%u/%ums tx=%uB/s rx=%uB/s resends=%u hot=%.1f/%.1f bed=%.1f/%.1f", PRN_STATE[ps.state],
+             (unsigned)ps.line, (unsigned)ps.bytesDone, ps.lps, (unsigned)(ps.ackAvgUs / 1000), (unsigned)(ps.ackMaxUs / 1000),
+             (unsigned)(ps.gapAvgUs / 1000), (unsigned)(ps.gapMaxUs / 1000), (unsigned)ps.txBps, (unsigned)ps.rxBps, (unsigned)ps.resends,
+             ps.hot, ps.hotT, ps.bed, ps.bedT);
+  f.println();
   f.close();
 }
 
@@ -416,6 +479,22 @@ static esp_err_t captureHandler(httpd_req_t *req) {
   return r;
 }
 
+// Address of the client that sent this request (for the log).
+static String peerIp(httpd_req_t *req) {
+  struct sockaddr_storage a;
+  socklen_t l = sizeof(a);
+  if (getpeername(httpd_req_to_sockfd(req), (struct sockaddr *)&a, &l) != 0) return "?";
+  char b[48] = "?";
+  struct in_addr v4;
+  if (a.ss_family == AF_INET6) {  // the HTTP server listens dual-stack: an IPv4 client shows up as ::ffff:a.b.c.d
+    memcpy(&v4, (uint8_t *)&((struct sockaddr_in6 *)&a)->sin6_addr + 12, 4);
+  } else {
+    v4 = ((struct sockaddr_in *)&a)->sin_addr;
+  }
+  inet_ntop(AF_INET, &v4, b, sizeof(b));
+  return String(b);
+}
+
 static esp_err_t streamHandler(httpd_req_t *req) {
   if (!camEnabled) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "camera is off");
   int one = 1;
@@ -425,7 +504,7 @@ static esp_err_t streamHandler(httpd_req_t *req) {
   esp_err_t res = ESP_OK;
   int misses = 0;
   streamActive = true;
-  logEvent("stream: viewer connected (%s)", PROFILES[curProfile].name);
+  logEvent("stream: viewer %s connected (%s)", peerIp(req).c_str(), PROFILES[curProfile].name);
   // No task watchdog here: a stalled Wi-Fi client must end its own stream (the HTTP send timeout does that),
   // never reboot the board - a reboot would abort a print in progress.
   int adaptCount = 0;
@@ -504,34 +583,214 @@ static esp_err_t controlHandler(httpd_req_t *req) {
 
 
 
+// GET /log: the RAM ring (events + one sample per second), streamed in small pieces so a request never needs a big buffer.
 static esp_err_t logHandler(httpd_req_t *req) {
-  String out;
-  out.reserve(16000);
-  out += "boot reason: " + resetReasonText + "\n";
-  out += "uptime " + String(millis() / 1000) + " s, wifi drops " + String(wifiDrops) + ", min free heap " +
-         String(ESP.getMinFreeHeap() / 1024) + " KB, free psram " + String(ESP.getFreePsram() / 1024) + " KB\n";
-  out += "--- events (oldest first)\n";
+  httpd_resp_set_type(req, "text/plain");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  const size_t CAP = 2048;
+  char *b = (char *)malloc(CAP);
+  if (!b) return httpd_resp_send_500(req);
+  size_t len = 0;
+  esp_err_t res = ESP_OK;
+  auto flush = [&]() {
+    if (len && res == ESP_OK) res = httpd_resp_send_chunk(req, b, len);
+    len = 0;
+  };
+  auto add = [&](const char *s, size_t n) {
+    if (len + n > CAP) flush();
+    if (n > CAP) n = CAP;
+    memcpy(b + len, s, n);
+    len += n;
+  };
+  char line[256];
+  int n = snprintf(line, sizeof(line), "boot reason: %s\nuptime %lu s, wifi drops %lu, min free heap %u KB, free psram %u KB\n--- events (oldest first)\n",
+                   resetReasonText.c_str(), (unsigned long)(millis() / 1000), (unsigned long)wifiDrops, (unsigned)(ESP.getMinFreeHeap() / 1024),
+                   (unsigned)(ESP.getFreePsram() / 1024));
+  add(line, n);
   portENTER_CRITICAL(&logMux);
-  uint32_t n = eventCount, start = n > EVENT_N ? n - EVENT_N : 0;
+  uint32_t ec = eventCount, start = ec > EVENT_N ? ec - EVENT_N : 0;
   portEXIT_CRITICAL(&logMux);
-  for (uint32_t i = start; i < n; i++) {
-    out += events[i % EVENT_N];
-    out += "\n";
+  for (uint32_t i = start; i < ec; i++) {
+    n = snprintf(line, sizeof(line), "%s\n", events[i % EVENT_N]);
+    add(line, n);
   }
-  out += "--- samples: t,fps,rssi,getMs,sendMs,delayMs,frameKB,heapKB,psramKB,profile,tempC,cpu0,cpu1\n";
+  n = snprintf(line, sizeof(line), "--- samples: t,fps,rssi,getMs,sendMs,delayMs,frameKB,heapKB,psramKB,profile,tempC,cpu0,cpu1,prn,lps,ackMaxMs,gapMaxMs,resends,hotC,bedC\n");
+  add(line, n);
   uint32_t sc = sampleCount, first = sc > SAMPLE_N ? sc - SAMPLE_N : 0;
   for (uint32_t i = first; i < sc; i++) {
     const Sample &s = samples[i % SAMPLE_N];
-    char row[128];
-    snprintf(row, sizeof(row), "%u,%.1f,%d,%u,%u,%u,%.1f,%u,%u,%s,%d,%u,%u\n", (unsigned)s.t, s.fps, s.rssi, s.getMs, s.sendMs, s.delayMs,
-             s.frameB / 1024.0f, (unsigned)(s.heap / 1024), (unsigned)(s.psram / 1024), PROFILES[s.prof].name, s.tempC, s.cpu0, s.cpu1);
-    out += row;
+    n = snprintf(line, sizeof(line), "%u,%.1f,%d,%u,%u,%u,%.1f,%u,%u,%s,%d,%u,%u,%s,%.1f,%u,%u,%u,%.1f,%.1f\n", (unsigned)s.t, s.fps, s.rssi, s.getMs,
+                 s.sendMs, s.delayMs, s.frameB / 1024.0f, (unsigned)(s.heap / 1024), (unsigned)(s.psram / 1024), PROFILES[s.prof].name, s.tempC, s.cpu0,
+                 s.cpu1, PRN_STATE[s.pst], s.lps10 / 10.0f, s.ackMaxMs, s.gapMaxMs, s.resends, s.hot10 / 10.0f, s.bed10 / 10.0f);
+    if (n > (int)sizeof(line) - 1) n = sizeof(line) - 1;
+    add(line, n);
   }
-  httpd_resp_set_type(req, "text/plain");
-  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  return httpd_resp_send(req, out.c_str(), HTTPD_RESP_USE_STRLEN);
+  flush();
+  free(b);
+  if (res != ESP_OK) return res;
+  return httpd_resp_send_chunk(req, nullptr, 0);
 }
 
+static esp_err_t sendJsonStatus(httpd_req_t *req, const char *status, const String &json);
+
+// GET /logs: the numbered log files on the SD card, newest first.
+static esp_err_t logsListHandler(httpd_req_t *req) {
+  String names[12];
+  size_t sizes[12];
+  int cnt = 0;
+  if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1500)) == pdTRUE) {
+    File dir = SD_MMC.open(LOG_DIR);
+    if (dir && dir.isDirectory()) {
+      for (File e = dir.openNextFile(); e && cnt < 12; e = dir.openNextFile()) {
+        String nm = baseName(e.name());
+        if (!logNameOk(nm)) continue;
+        names[cnt] = nm;
+        sizes[cnt] = e.size();
+        cnt++;
+      }
+      dir.close();
+    }
+    xSemaphoreGive(sdMutex);
+  }
+  for (int i = 1; i < cnt; i++)  // names are zero-padded numbers: newest first
+    for (int j = i; j > 0 && names[j] > names[j - 1]; j--) {
+      String tn = names[j];
+      names[j] = names[j - 1];
+      names[j - 1] = tn;
+      size_t ts = sizes[j];
+      sizes[j] = sizes[j - 1];
+      sizes[j - 1] = ts;
+    }
+  String cur = baseName(logPathFor(logSeq));
+  String out = String("{\"ok\":true,\"keep\":") + LOG_KEEP + ",\"maxBytes\":" + String((unsigned long)LOG_FILE_MAX) + ",\"files\":[";
+  for (int i = 0; i < cnt; i++) {
+    if (i) out += ",";
+    out += String("{\"name\":\"") + names[i] + "\",\"size\":" + String((unsigned long)sizes[i]) + ",\"current\":" + (names[i] == cur ? "true" : "false") + "}";
+  }
+  out += "]}";
+  return sendJsonStatus(req, "200 OK", out);
+}
+
+// GET /logs/read?name=log-0003.txt&from=<offset>&max=<bytes>: a piece of one log file. Without "from" (or from=-1) it is
+// the END of the file, starting on a line boundary; with "from" it is everything after that offset, so a viewer can
+// follow a file that is still being written by asking only for what is new. Headers tell the viewer where it is:
+// X-Log-Size (file size), X-Log-From (offset of the first byte sent), X-Log-Next (offset to ask for next time).
+static char logHdrSize[24], logHdrFrom[24], logHdrNext[24];
+static esp_err_t logsReadHandler(httpd_req_t *req) {
+  char nm[32] = "", v[16];
+  if (!queryParam(req, "name", nm, sizeof(nm)) || !logNameOk(String(nm))) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad log name");
+  long from = -1, maxb = 32768;
+  if (queryParam(req, "from", v, sizeof(v))) from = atol(v);
+  if (queryParam(req, "max", v, sizeof(v))) maxb = atol(v);
+  if (maxb < 1) maxb = 1;
+  if (maxb > 65536) maxb = 65536;
+  uint8_t *buf = (uint8_t *)malloc(4096);
+  if (!buf) return httpd_resp_send_500(req);
+  String path = String(LOG_DIR) + "/" + nm;
+  File f;
+  size_t size = 0, pos = 0;
+  if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1500)) == pdTRUE) {
+    f = SD_MMC.open(path, FILE_READ);
+    if (f) {
+      size = f.size();
+      bool tail = from < 0 || (size_t)from > size;
+      pos = tail ? (size > (size_t)maxb ? size - (size_t)maxb : 0) : (size_t)from;
+      if (tail && pos > 0) {  // start on a line boundary
+        f.seek(pos);
+        int got = f.read(buf, 4096);
+        int i = 0;
+        while (i < got && buf[i] != '\n') i++;
+        pos += (i < got) ? i + 1 : (got > 0 ? got : 0);
+      }
+      f.seek(pos);
+    }
+    xSemaphoreGive(sdMutex);
+  }
+  if (!f) {
+    free(buf);
+    return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "no such log file");
+  }
+  size_t toSend = size > pos ? size - pos : 0;
+  if (toSend > (size_t)maxb) toSend = (size_t)maxb;
+  snprintf(logHdrSize, sizeof(logHdrSize), "%u", (unsigned)size);
+  snprintf(logHdrFrom, sizeof(logHdrFrom), "%u", (unsigned)pos);
+  snprintf(logHdrNext, sizeof(logHdrNext), "%u", (unsigned)(pos + toSend));
+  httpd_resp_set_type(req, "text/plain");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_hdr(req, "Access-Control-Expose-Headers", "X-Log-Size, X-Log-From, X-Log-Next");
+  httpd_resp_set_hdr(req, "X-Log-Size", logHdrSize);
+  httpd_resp_set_hdr(req, "X-Log-From", logHdrFrom);
+  httpd_resp_set_hdr(req, "X-Log-Next", logHdrNext);
+  esp_err_t res = ESP_OK;
+  size_t left = toSend;
+  while (res == ESP_OK && left > 0) {
+    int want = left > 4096 ? 4096 : (int)left, got = 0;
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1500)) != pdTRUE) break;
+    got = f.read(buf, want);
+    xSemaphoreGive(sdMutex);
+    if (got <= 0) break;
+    res = httpd_resp_send_chunk(req, (const char *)buf, got);
+    left -= (size_t)got;
+  }
+  xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1500));
+  f.close();
+  xSemaphoreGive(sdMutex);
+  free(buf);
+  if (res != ESP_OK) return res;
+  return httpd_resp_send_chunk(req, nullptr, 0);
+}
+
+
+// GET /log/sd?tail=<KB>: the end of the persistent log on the SD card (default 64 KB, 0 = whole file).
+// Reads 4 KB at a time and holds the card only for each read, never while sending, so a running print is not starved.
+static esp_err_t logSdHandler(httpd_req_t *req) {
+  char v[12];
+  long kb = 64;
+  if (queryParam(req, "tail", v, sizeof(v))) kb = atol(v);
+  httpd_resp_set_type(req, "text/plain");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  uint8_t *buf = (uint8_t *)malloc(4096);
+  if (!buf) return httpd_resp_send_500(req);
+  File f;
+  size_t size = 0, pos = 0;
+  if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1500)) == pdTRUE) {
+    f = SD_MMC.open(logPathFor(logSeq), FILE_READ);
+    if (f) {
+      size = f.size();
+      if (kb > 0 && size > (size_t)kb * 1024) pos = size - (size_t)kb * 1024;
+      f.seek(pos);
+    }
+    xSemaphoreGive(sdMutex);
+  }
+  if (!f) {
+    free(buf);
+    return httpd_resp_send(req, "(log file not available)\n", HTTPD_RESP_USE_STRLEN);
+  }
+  bool skipPartial = pos > 0;  // we start mid-line: drop everything up to the first newline
+  esp_err_t res = ESP_OK;
+  while (res == ESP_OK) {
+    int n = 0;
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1500)) != pdTRUE) break;
+    n = f.read(buf, 4096);
+    xSemaphoreGive(sdMutex);
+    if (n <= 0) break;
+    uint8_t *p = buf;
+    if (skipPartial) {
+      uint8_t *nl = (uint8_t *)memchr(buf, '\n', n);
+      if (!nl) continue;
+      skipPartial = false;
+      n -= (int)(nl + 1 - buf);
+      p = nl + 1;
+    }
+    if (n > 0) res = httpd_resp_send_chunk(req, (const char *)p, n);
+  }
+  xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1500));
+  f.close();
+  xSemaphoreGive(sdMutex);
+  free(buf);
+  if (res != ESP_OK) return res;
+  return httpd_resp_send_chunk(req, nullptr, 0);
+}
 
 // ---- G-code files on the SD card: upload (streamed, CRC-checked), list, delete -------------------
 const char *GCODE_DIR = "/gcode";
@@ -744,7 +1003,7 @@ static esp_err_t printerDisconnectHandler(httpd_req_t *req) {
 }
 static esp_err_t printerPrintHandler(httpd_req_t *req) {
   String err;
-  bool ok = printerStartPrint(queryValue(req, "file"), err);
+  bool ok = printerStartPrint(queryValue(req, "file"), err, (uint32_t)queryValue(req, "dry").toInt());
   return printerReply(req, ok, err);
 }
 static esp_err_t printerPauseHandler(httpd_req_t *req) {
@@ -772,17 +1031,17 @@ static esp_err_t printerGcodeHandler(httpd_req_t *req) {
   return printerReply(req, ok, err, "\"reply\":\"" + reply + "\"");
 }
 
-static esp_err_t printerUsbTuneHandler(httpd_req_t *req) {
-  auto val = [&](const char *k) { String v = queryValue(req, k); return v.length() ? (int)v.toInt() : -1; };
-  printerUsbTune(val("idlePoll"), val("lookIn"), val("gate"));
-  return printerReply(req, true, "");
+static esp_err_t printerWindowHandler(httpd_req_t *req) {
+  String n = queryValue(req, "n");
+  if (n.length()) printerSetWindow((int)n.toInt());
+  return printerReply(req, true, "window=" + String(printerGetWindow()));
 }
 
 static esp_err_t printerSimHandler(httpd_req_t *req) {
   String err;
   int speed = queryValue(req, "speed").toInt();
   int every = queryValue(req, "resendEvery").toInt();
-  bool ok = printerSimTune(speed ? speed : 600, every, err);
+  bool ok = printerSimTune(speed ? speed : 600, every, (int)queryValue(req, "latency").toInt(), err);
   return printerReply(req, ok, err);
 }
 
@@ -791,18 +1050,20 @@ static esp_err_t printerSimHandler(httpd_req_t *req) {
 static esp_err_t cameraPowerHandler(httpd_req_t *req) {
   String v = queryValue(req, "on");
   if (v != "0" && v != "1") return sendJsonStatus(req, "400 Bad Request", "{\"ok\":false,\"error\":\"use on=1 or on=0\"}");
+  logEvent("camera: %s requested by %s", v == "1" ? "ON" : "OFF", peerIp(req).c_str());
   setCameraEnabled(v == "1");
   return sendJsonStatus(req, "200 OK", String("{\"ok\":true,\"cameraOn\":") + (camEnabled ? "true" : "false") + "}");
 }
 
 static esp_err_t statusHandler(httpd_req_t *req) {
-  char buf[768];
+  char buf[1024];
   snprintf(buf, sizeof(buf),
            "{\"fps\":%.2f,\"frameBytes\":%u,\"mode\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,"
-           "\"freePsram\":%u,\"sd\":\"%s\",\"uptime\":%lu,\"latencyMs\":%u,\"profile\":\"%s\",\"getMs\":%u,\"sendMs\":%u,\"wifiDrops\":%lu,\"reset\":\"%s\",\"tempC\":%.1f,\"cpu0\":%u,\"cpu1\":%u,\"cameraOn\":%s,\"quality\":%d}",
+           "\"freePsram\":%u,\"sd\":\"%s\",\"uptime\":%lu,\"latencyMs\":%u,\"profile\":\"%s\",\"getMs\":%u,\"sendMs\":%u,\"wifiDrops\":%lu,\"reset\":\"%s\",\"tempC\":%.1f,\"cpu0\":%u,\"cpu1\":%u,\"cameraOn\":%s,\"quality\":%d,\"freeHeapKB\":%u,\"minHeapKB\":%u,\"totalHeapKB\":%u}",
            currentFps, (unsigned)lastFrameBytes, staMode ? "sta" : "ap", WiFi.SSID().c_str(),
            (staMode ? WiFi.localIP() : WiFi.softAPIP()).toString().c_str(), staMode ? WiFi.RSSI() : 0,
-           (unsigned)ESP.getFreePsram(), sdStatus.c_str(), millis() / 1000, (unsigned)lastLatencyMs, PROFILES[curProfile].name, (unsigned)avgGetMs, (unsigned)avgSendMs, (unsigned long)wifiDrops, resetReasonText.c_str(), chipTempC, cpuLoad[0], cpuLoad[1], camEnabled ? "true" : "false", curQuality);
+           (unsigned)ESP.getFreePsram(), sdStatus.c_str(), millis() / 1000, (unsigned)lastLatencyMs, PROFILES[curProfile].name, (unsigned)avgGetMs, (unsigned)avgSendMs, (unsigned long)wifiDrops, resetReasonText.c_str(), chipTempC, cpuLoad[0], cpuLoad[1], camEnabled ? "true" : "false", curQuality,
+           (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getMinFreeHeap() / 1024), (unsigned)(ESP.getHeapSize() / 1024));
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");  // the main dashboard reads this from the phone
   return httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
@@ -856,6 +1117,7 @@ static void startServers() {
       {"/control", HTTP_GET, controlHandler, nullptr},
       {"/status", HTTP_GET, statusHandler, nullptr},
       {"/log", HTTP_GET, logHandler, nullptr},
+      {"/log/sd", HTTP_GET, logSdHandler, nullptr},
       {"/camera", HTTP_POST, cameraPowerHandler, nullptr},
       {"/printer/status", HTTP_GET, printerStatusHandler, nullptr},
       {"/printer/link", HTTP_POST, printerLinkHandler, nullptr},
@@ -867,7 +1129,9 @@ static void startServers() {
       {"/printer/stop", HTTP_POST, printerStopHandler, nullptr},
       {"/printer/gcode", HTTP_POST, printerGcodeHandler, nullptr},
       {"/printer/sim", HTTP_POST, printerSimHandler, nullptr},
-      {"/printer/usbtune", HTTP_POST, printerUsbTuneHandler, nullptr},
+      {"/logs", HTTP_GET, logsListHandler, nullptr},
+      {"/logs/read", HTTP_GET, logsReadHandler, nullptr},
+      {"/printer/window", HTTP_POST, printerWindowHandler, nullptr},
       {"/files", HTTP_POST, filesUploadHandler, nullptr},
       {"/files", HTTP_GET, filesListHandler, nullptr},
       {"/files", HTTP_OPTIONS, filesOptionsHandler, nullptr},
@@ -881,7 +1145,7 @@ static void startServers() {
   httpd_config_t scfg = HTTPD_DEFAULT_CONFIG();
   scfg.server_port = 81;
   scfg.max_open_sockets = 3;
-  scfg.lru_purge_enable = true;
+  scfg.lru_purge_enable = false;  // a second viewer must never cut off the first
   scfg.ctrl_port += 1;
   httpd_uri_t streamUri = {"/stream", HTTP_GET, streamHandler, nullptr};
   if (httpd_start(&streamServer, &scfg) == ESP_OK) httpd_register_uri_handler(streamServer, &streamUri);
@@ -949,8 +1213,20 @@ void setup() {
     SD_MMC.remove("/phlog.old");
     SD_MMC.remove("/sdtest.txt");
     if (!SD_MMC.exists(LOG_DIR)) SD_MMC.mkdir(LOG_DIR);
-    if (SD_MMC.exists("/phlog.txt") && !SD_MMC.exists(LOG_PATH)) SD_MMC.rename("/phlog.txt", LOG_PATH);  // move the old root log
     SD_MMC.remove("/phlog.txt");
+    SD_MMC.remove("/logs/logtmp.txt");
+    // the single 1 MB log of the earlier firmware becomes a numbered file
+    if (SD_MMC.exists("/logs/printhost.log")) SD_MMC.rename("/logs/printhost.log", logPathFor(logScan(nullptr, nullptr) + 1));
+    logSeq = logScan(nullptr, nullptr);
+    if (logSeq == 0) logSeq = 1;
+    else {
+      File last = SD_MMC.open(logPathFor(logSeq), FILE_READ);
+      if (last) {
+        if (last.size() >= LOG_FILE_MAX) logSeq++;
+        last.close();
+      }
+    }
+    logCleanupDue = true;  // no print can be running yet: the first log tick tidies up
   }
   logEvent("BOOT: %s, OTA-verified build %s %s, free heap %u KB, SD %s", resetReasonText.c_str(), __DATE__, __TIME__, (unsigned)(ESP.getFreeHeap() / 1024), sdStatus.c_str());
   // The camera stays powered down until the phone reports the printer plug is on (POST /camera?on=1).

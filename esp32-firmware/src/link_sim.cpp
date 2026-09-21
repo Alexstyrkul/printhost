@@ -8,14 +8,16 @@
 
 static int simMotionPerSec = 600;   // how many G0/G1 lines it "executes" per second
 static int simResendEvery = 0;      // inject a checksum error every N numbered lines (0 = never)
+static int simLatencyMs = 0;        // round-trip delay of the wire + firmware per command (real printer: about 10 ms)
 
-bool printerSimTune(int linesPerSec, int resendEvery, String &err) {
-  if (linesPerSec < 10 || linesPerSec > 50000 || resendEvery < 0) {
+bool printerSimTune(int linesPerSec, int resendEvery, int latencyMs, String &err) {
+  if (linesPerSec < 10 || linesPerSec > 50000 || resendEvery < 0 || latencyMs < 0 || latencyMs > 500) {
     err = "bad values";
     return false;
   }
   simMotionPerSec = linesPerSec;
   simResendEvery = resendEvery;
+  simLatencyMs = latencyMs;
   return true;
 }
 
@@ -82,7 +84,8 @@ class SimLink : public PrinterLink {
 
   void push(const char *text, uint32_t delayMs = 0) {
     uint32_t now = millis();
-    uint32_t at = (int32_t)(lastAt - now) > 0 ? lastAt : now;
+    uint32_t base = now + simLatencyMs;  // the wire delay overlaps for commands that are queued back to back
+    uint32_t at = (int32_t)(lastAt - base) > 0 ? lastAt : base;
     at += delayMs;
     lastAt = at;
     int next = (qt + 1) % QN;

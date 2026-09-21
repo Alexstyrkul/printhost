@@ -29,18 +29,30 @@ String printerStatusJson();
 bool printerSelectLink(const String &kind, String &err);  // "sim" | "usb" | "none"
 bool printerConnect(String &err);
 bool printerDisconnect(String &err);
-bool printerStartPrint(const String &file, String &err);
+// dryLines > 0: rehearsal - heater commands are skipped and the run ends after that many lines (no heating needed).
+bool printerStartPrint(const String &file, String &err, uint32_t dryLines = 0);
 bool printerPause(String &err);
 bool printerResume(String &err);
 bool printerStop(String &err);
 // One-off command (not while printing). Returns the printer's answer text (ends with "ok").
 bool printerGcode(const String &cmd, uint32_t timeoutMs, String &reply, String &err);
 // Simulator tuning: motion lines per second, and inject a checksum error every N lines (0 = never).
-bool printerSimTune(int linesPerSec, int resendEvery, String &err);
-// Diagnostics for the USB link: idle temperature polling, brief look-ins, and gated IN polling (all default on).
-void printerUsbTune(int idlePoll, int lookIn, int gate);
+bool printerSimTune(int linesPerSec, int resendEvery, int latencyMs, String &err);
+// Lines the engine keeps in flight (1 = stop-and-wait, default 3, max 6).
+void printerSetWindow(int n);
+int printerGetWindow();
 // True if the engine is using this file (the file store refuses to delete/overwrite it).
 bool printerFileInUse(const String &name);
 
 PrinterLink *makeSimLink();
 PrinterLink *makeUsbLink();
+
+// Read-only snapshot for the runtime log (once-a-second samples and the SD log).
+struct PrinterSnap {
+  uint8_t state;  // PrinterState
+  uint32_t line, bytesDone, bytesTotal;
+  float lps;  // lines per second over the last ~10 s window
+  uint32_t ackAvgUs, ackMaxUs, gapAvgUs, gapMaxUs, txBps, rxBps, resends;
+  float hot, hotT, bed, bedT;
+};
+void printerSnapshot(PrinterSnap &s);
