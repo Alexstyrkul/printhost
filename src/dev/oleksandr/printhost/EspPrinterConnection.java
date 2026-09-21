@@ -41,6 +41,15 @@ public class EspPrinterConnection extends EspStoreConnection {
 
     // ---- connection ---------------------------------------------------------------------------
 
+    /** The board's own printer state (NO_LINK, DISCONNECTED, IDLE, PRINTING, PAUSED, ERROR), or "" when it cannot be reached. */
+    public synchronized String boardState() {
+        try {
+            return statusFresh().optString("state");
+        } catch (IOException e) {
+            return "";
+        }
+    }
+
     @Override
     public synchronized boolean isOpen() {
         return open;

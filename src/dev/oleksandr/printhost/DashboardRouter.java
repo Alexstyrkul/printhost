@@ -22,8 +22,26 @@ public class DashboardRouter implements RequestRouter {
     private final PrinterService service;
     private byte[] cachedDashboardHtml;
 
+    /** One connection to the board's camera, shared by every viewer (see EspCameraRelay). */
+    private final EspCameraRelay relay;
+
     public DashboardRouter(PrinterService service) {
         this.service = service;
+        this.relay = new EspCameraRelay(new EspCameraRelay.HostSource() {
+            @Override
+            public String host() {
+                return DashboardRouter.this.service.getEspHost();
+            }
+        });
+    }
+
+    /** The board pages the dashboard may read through this phone (so it also works away from the home Wi-Fi). */
+    private static String espProxyTarget(String path) {
+        if (path.equals("/esp/status")) return "/status";
+        if (path.equals("/esp/log")) return "/log";
+        if (path.equals("/esp/log/sd")) return "/log/sd";
+        if (path.equals("/esp/printer/status")) return "/printer/status";
+        return null;
     }
 
     @Override
@@ -184,6 +202,12 @@ public class DashboardRouter implements RequestRouter {
             writeJson(out, 200, resultJson(true, service.getStateJson()));
         } else if (p.equals("/camera/stream") && req.method.equals("GET")) {
             streamMjpeg(out);
+        } else if (p.equals("/camera/relay") && req.method.equals("GET")) {
+            relayMjpeg(out);
+        } else if (p.equals("/camera/relay/stats") && req.method.equals("GET")) {
+            writeText(out, 200, "application/json", relay.statsJson());
+        } else if (espProxyTarget(p) != null && req.method.equals("GET")) {
+            proxyEspGet(out, espProxyTarget(p), req);
         } else if (p.equals("/torch/on") && req.method.equals("POST")) {
             boolean ok = service.torch(true);
             writeJson(out, ok ? 200 : 502, resultJson(ok, service.getStateJson()));
@@ -292,6 +316,78 @@ public class DashboardRouter implements RequestRouter {
             in.close();
         }
         out.flush();
+    }
+
+    /** Every viewer gets the newest frame the board sent; a viewer that cannot keep up skips frames on its own. */
+    private void relayMjpeg(OutputStream rawOut) throws IOException {
+        java.io.BufferedOutputStream out = new java.io.BufferedOutputStream(rawOut, 65536);
+        String head = "HTTP/1.1 200 OK\r\n"
+                + "Content-Type: multipart/x-mixed-replace; boundary=" + MJPEG_BOUNDARY + "\r\n"
+                + "Connection: close\r\n"
+                + "Cache-Control: no-cache\r\n\r\n";
+        out.write(head.getBytes(StandardCharsets.US_ASCII));
+        out.flush();
+        relay.register();
+        try {
+            long lastSeq = 0;
+            int idleMs = 0;
+            while (idleMs < 15000) {  // no frame for 15 s (camera off / board gone): end, the page retries by itself
+                EspCameraRelay.Frame f;
+                try {
+                    f = relay.awaitFrame(lastSeq, 1000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                if (f == null) {
+                    idleMs += 1000;
+                    continue;
+                }
+                idleMs = 0;
+                lastSeq = f.seq;
+                String partHeader = "--" + MJPEG_BOUNDARY + "\r\n"
+                        + "Content-Type: image/jpeg\r\n"
+                        + "Content-Length: " + f.jpeg.length + "\r\n\r\n";
+                out.write(partHeader.getBytes(StandardCharsets.US_ASCII));
+                out.write(f.jpeg);
+                out.write("\r\n".getBytes(StandardCharsets.US_ASCII));
+                out.flush();
+            }
+        } finally {
+            relay.unregister();
+        }
+    }
+
+    /** Fetches one read-only page from the board and passes it on unchanged. */
+    private void proxyEspGet(OutputStream out, String espPath, HttpRequest req) throws IOException {
+        String query = "";
+        String tail = req.queryParam("tail");
+        if (tail.length() > 0 && tail.matches("[0-9]{1,5}")) query = "?tail=" + tail;
+        java.net.HttpURLConnection c = null;
+        try {
+            c = (java.net.HttpURLConnection) new java.net.URL("http://" + service.getEspHost() + espPath + query).openConnection();
+            c.setConnectTimeout(2500);
+            c.setReadTimeout(8000);
+            int code = c.getResponseCode();
+            InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
+            String type = c.getContentType();
+            String head = "HTTP/1.1 " + code + " " + statusText(code) + "\r\n"
+                    + "Content-Type: " + (type == null ? "text/plain" : type) + "\r\n"
+                    + "Cache-Control: no-cache\r\n"
+                    + "Connection: close\r\n\r\n";
+            out.write(head.getBytes(StandardCharsets.US_ASCII));
+            if (in != null) {
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                in.close();
+            }
+            out.flush();
+        } catch (IOException e) {
+            writeJson(out, 502, errorJson("camera board unreachable"));
+        } finally {
+            if (c != null) c.disconnect();
+        }
     }
 
     private static void sleepQuiet(long ms) {

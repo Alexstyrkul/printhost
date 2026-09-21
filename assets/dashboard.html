@@ -160,6 +160,10 @@
   .cam-stat.warn b { color: var(--warn); }
   .cam-stat.bad b { color: var(--danger); }
   .cam-menu-body .cam-menu-head.sub { background: var(--panel); border-radius: var(--radius-sm); }
+  .cam-menu + .cam-menu { margin-top: 10px; }
+  .switch input:disabled + .switch-slider { opacity: 0.55; cursor: not-allowed; }
+  #camLogBody { margin-top: 8px; }
+  .cam-hint { font-size: 11px; color: var(--text-faint); margin: 6px 2px 0; }
 
   .cam-modal { position: fixed; inset: 0; z-index: 60; background: rgba(0,0,0,0.6); display: none; align-items: center; justify-content: center; padding: 12px; }
   .cam-modal.show { display: flex; }
@@ -175,6 +179,9 @@
   .cam-kv b { color: var(--text); font-weight: 600; text-align: right; }
   .cam-events { margin: 10px 0 0; padding: 10px; background: #0a0a0c; border-radius: 8px; font: 10.5px/1.5 ui-monospace, Menlo, monospace;
                  color: var(--text-dim); white-space: pre-wrap; max-height: 220px; overflow-y: auto; }
+  .cam-tabs { display: flex; gap: 6px; margin-top: 10px; }
+  .cam-tabs button { flex: 1; padding: 8px 0; font-size: 12px; opacity: 0.55; }
+  .cam-tabs button.on { opacity: 1; }
   .cam-modal-actions { display: flex; gap: 8px; margin-top: 10px; }
   .cam-modal-actions button { flex: 1; padding: 10px 0; }
 
@@ -340,14 +347,6 @@
         <span class="switch-label">Plug</span>
         <span class="switch"><input type="checkbox" id="plugToggle"><span class="switch-slider"></span></span>
       </label>
-      <label class="switch-item" title="Wake or lock the phone's screen">
-        <span class="switch-label">Screen</span>
-        <span class="switch"><input type="checkbox" id="screenToggle"><span class="switch-slider"></span></span>
-      </label>
-      <label class="switch-item" title="Connect or disconnect the printer">
-        <span class="switch-label">Printer</span>
-        <span class="switch"><input type="checkbox" id="connectToggle"><span class="switch-slider"></span></span>
-      </label>
     </div>
   </div>
 </div>
@@ -477,14 +476,35 @@
           <div class="cam-stat" id="stTemp"><b>&ndash;</b><span>Chip temp</span></div>
           <div class="cam-stat" id="stCpu"><b>&ndash;</b><span>CPU</span></div>
         </div>
-        <button class="cam-menu-head sub" id="camLogBtn">
-          <span class="grow">Log</span>
-          <svg class="chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
-        </button>
-        <label class="cam-menu-head sub" style="cursor:pointer; margin-top:8px" title="Keep the camera on even when the printer power is off (for testing)">
+        <label class="cam-menu-head sub" style="cursor:pointer">
           <span class="grow">Turn on camera</span>
           <span class="switch"><input type="checkbox" id="camForceToggle"><span class="switch-slider"></span></span>
         </label>
+      </div>
+    </div>
+    <div class="cam-menu">
+      <div class="cam-menu-head cam-menu-title">
+        <span class="cam-dot" id="healthDot"></span>
+        <span class="grow">Board status</span>
+      </div>
+      <div class="cam-menu-body">
+        <div class="cam-stats">
+          <div class="cam-stat" id="stMem" title="Free working memory of the board."><b>&ndash;</b><span>Free RAM</span></div>
+          <div class="cam-stat" id="stPause" title="Board delay before each line. Yellow or red = slowing the print."><b>&ndash;</b><span>Board delay</span></div>
+          <div class="cam-stat" id="stResend" title="Lines resent after the printer got them damaged."><b>&ndash;</b><span>Resends</span></div>
+          <div class="cam-stat" id="stAck" title="How fast the printer answers each line. Long is normal."><b>&ndash;</b><span>Printer reply</span></div>
+        </div>
+        <button class="cam-menu-head sub" id="camLogBtn" aria-expanded="false">
+          <span class="grow">Log</span>
+          <svg class="chev down" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+        </button>
+        <div id="camLogBody" hidden>
+          <div class="cam-kv"><span>Uptime</span><b id="lgUp">&ndash;</b></div>
+          <div class="cam-tabs"><button id="camTabEvents" class="on">Events</button><button id="camTabFull">Full log (SD card)</button></div>
+          <div class="cam-hint" id="camTabHint">Last ~64 messages (lost on restart).</div>
+          <pre class="cam-events" id="camEvents">Loading&hellip;</pre>
+          <div class="cam-modal-actions"><button id="camLogCopy">Copy log</button></div>
+        </div>
       </div>
     </div>
   </div>
@@ -514,21 +534,6 @@
 
 
 
-</div>
-
-<div class="cam-modal" id="camLogModal">
-  <div class="cam-modal-card">
-    <div class="cam-modal-top"><h3>Camera board log</h3><button class="cam-modal-x" id="camLogClose" aria-label="Close">&times;</button></div>
-    <div class="cam-modal-body">
-      <canvas class="cam-chart" id="camChart" width="600" height="120"></canvas>
-      <div class="cam-legend"><span><span style="color:var(--accent)">&#9632;</span> FPS (0&ndash;30)</span><span><span style="color:var(--warn)">&#9632;</span> Wi-Fi signal</span></div>
-      <div class="cam-kv"><span>Last restart</span><b id="lgReset">&ndash;</b></div>
-      <div class="cam-kv"><span>Uptime</span><b id="lgUp">&ndash;</b></div>
-      <div class="cam-kv"><span>Wi-Fi drops</span><b id="lgDrops">&ndash;</b></div>
-      <pre class="cam-events" id="camEvents">Loading&hellip;</pre>
-      <div class="cam-modal-actions"><button id="camLogCopy">Copy log</button></div>
-    </div>
-  </div>
 </div>
 
 <div class="footer" id="firmwareInfo"></div>
@@ -576,7 +581,6 @@ var REMAINING_MIN_PERCENT = 3; // below this, the estimate is too noisy to show
 var selectedFile = null;
 var wasLive = false;
 var sdListLoadedOnce = false;
-var screenToggleSyncSuppressedUntil = 0;
 var currentSdFilename = null;
 var lastPhase = null;
 
@@ -1085,15 +1089,8 @@ function renderStatus(s) {
   renderSchedule(s);
 
 
-  $("connectToggle").checked = showAsConnected;
-  $("connectToggle").disabled = s.phase === "CONNECTING";
-
   $("unloadFilamentBtn").disabled = !!s.unloadingFilament;
   $("levelBedBtn").disabled = !!s.levelingBed;
-
-  if (Date.now() >= screenToggleSyncSuppressedUntil) {
-    $("screenToggle").checked = !!s.screenOn;
-  }
 
   // Only the background plug poller and our own on/off clicks ever change plugOn - never
   // force the switch to a state while the user might be mid-drag, but there's no drag state
@@ -1102,7 +1099,7 @@ function renderStatus(s) {
     $("plugToggle").checked = s.plugOn;
   }
   $("autoShutoffToggle").checked = !!s.autoShutoffEnabled;
-  $("camForceToggle").checked = !!s.cameraForce;
+  phoneCamForce = !!s.cameraForce; phonePlugOn = s.plugOn === true; syncCamToggle();
 
   renderControls(s.phase, !!s.fileReady, !!s.scheduledFile);
 
@@ -1138,25 +1135,6 @@ function renderControls(phase, fileReady, scheduled) {
   $("stopBtn").style.display = (phase === "PRINTING" || phase === "PAUSED") ? "" : "none";
 }
 
-$("connectToggle").onchange = function () {
-  var wantConnected = this.checked;
-  var printing = lastPhase === "PRINTING" || lastPhase === "PAUSED";
-  if (!wantConnected && !confirm(printing
-      ? "Stop watching the printer? The print keeps running on the ESP32 board."
-      : "Disconnect the printer?")) {
-    this.checked = true;
-    return;
-  }
-  post(wantConnected ? "/connect" : "/disconnect").then(function (r) { renderStatus(r.state); });
-};
-$("screenToggle").onchange = function () {
-  // Locking/waking the screen isn't instant on the phone's side (accessibility-service action,
-  // animation) - PowerManager.isInteractive() lags a beat behind it. Confirmed on real hardware:
-  // without this suppression window, the next status poll or two still reports the OLD state,
-  // flipping the switch back then forward again a moment after the user's own click.
-  screenToggleSyncSuppressedUntil = Date.now() + 2500;
-  post(this.checked ? "/screen/wake" : "/screen/lock");
-};
 $("plugToggle").onchange = function () {
   var turnOn = this.checked;
   var toggle = this;
@@ -1175,10 +1153,12 @@ $("plugToggle").onchange = function () {
 };
 $("camForceToggle").onchange = function () {
   var on = this.checked;
+  camToggleHoldUntil = Date.now() + 5000;  // the camera needs a few seconds to follow; do not flip the switch back meanwhile
+  var self = this;
   post("/camera/force?on=" + (on ? 1 : 0)).then(function (r) {
     if (r.state) renderStatus(r.state);
     showToast("success", on ? "Camera forced on" : "Camera follows the printer power again");
-  });
+  }).catch(function () { camToggleHoldUntil = 0; self.checked = !on; });
 };
 
 $("autoShutoffToggle").onchange = function () {
@@ -1341,7 +1321,22 @@ function uploadSelectedFile(file) {
 // Give the board a fixed address in the router (DHCP reservation), or override with ?cam=<host>.
 var ESP_CAM_HOST = (location.search.match(/[?&]cam=([^&]+)/) || [])[1] || "192.168.50.190";
 var espBase = "http://" + ESP_CAM_HOST;
+// Viewers go through this phone (one shared connection to the board, works away from home too). ?direct=1 talks to the board itself.
+var CAM_DIRECT = /[?&]direct=1/.test(location.search);
+var camStreamUrl = CAM_DIRECT ? espBase + ":81/stream" : "/camera/relay";
+var camStatusUrl = CAM_DIRECT ? espBase + "/status" : "/esp/status";
+var camLogUrl = CAM_DIRECT ? espBase + "/log" : "/esp/log";
+var camPrinterUrl = CAM_DIRECT ? espBase + "/printer/status" : "/esp/printer/status";
 var camStreamUp = false;
+var boardCamOn = null, phoneCamForce = false, phonePlugOn = false, camToggleHoldUntil = 0;
+// The toggle shows whether the camera is really on (from the board). It is greyed out while the camera is on only
+// because the printer is powered - that one cannot be switched off from here.
+function syncCamToggle() {
+  if (boardCamOn === null || Date.now() < camToggleHoldUntil) return;
+  var t = $("camForceToggle");
+  t.checked = boardCamOn;
+  t.disabled = boardCamOn && !phoneCamForce && phonePlugOn;
+}
 
 function setCamStat(id, text, level) {
   var el = $(id);
@@ -1372,11 +1367,12 @@ function startCamStream() {
     showCamStream(false, "Camera offline - retrying\u2026");
     if (camWanted) camRetryTimer = setTimeout(startCamStream, 3000);
   };
-  img.src = espBase + ":81/stream?_=" + Date.now();
+  img.src = camStreamUrl + "?_=" + Date.now();
 }
 var camFpsHist = [];
 function pollCamStatus() {
-  fetch(espBase + "/status").then(function (r) { return r.json(); }).then(function (s) {
+  fetch(camStatusUrl).then(function (r) { return r.json(); }).then(function (s) {
+    boardCamOn = s.cameraOn !== false; syncCamToggle();
     // The camera runs only while the printer's smart plug is on; the board itself always runs.
     if (s.cameraOn === false) {
       if (camWanted || camStreamUp) stopCamStream();
@@ -1387,6 +1383,7 @@ function pollCamStatus() {
     // Average the last ~10 s: a single 2 s window jumps around with the scene.
     camFpsHist.push(s.fps); if (camFpsHist.length > 5) camFpsHist.shift();
     var fps = camFpsHist.reduce(function (a, b) { return a + b; }, 0) / camFpsHist.length;
+    if (s.freeHeapKB != null) { boardHeapNow = s.freeHeapKB; if (s.minHeapKB != null) boardHeapMin = s.minHeapKB; renderHealth(); }
     var cpu = Math.max(s.cpu0, s.cpu1);
     var lFps = fps < 8 ? "bad" : (fps < 12 ? "warn" : ""), lWifi = s.rssi < -75 ? "bad" : (s.rssi < -67 ? "warn" : ""),
         lTemp = s.tempC > 75 ? "bad" : (s.tempC > 65 ? "warn" : ""), lCpu = cpu > 90 ? "bad" : "";
@@ -1402,61 +1399,91 @@ function pollCamStatus() {
   });
 }
 
+// ---- Board status: free memory, the board's pause between print lines, resends, the printer's answer time
+var boardHeapNow = null, boardHeapMin = null, boardPrinter = null, bootHeapKB = 256;  // ~256 KB is free right after the board starts
+function renderHealth() {
+  var p = boardPrinter, live = !!p && (p.state === "PRINTING" || p.state === "PAUSED");
+  var lMem = "", lPause = "", lResend = "";
+  if (boardHeapNow != null) {
+    lMem = boardHeapNow < 15 ? "bad" : (boardHeapNow < 30 ? "warn" : "");
+    setCamStat("stMem", Math.round(boardHeapNow) + " / " + bootHeapKB + " KB", lMem);
+    $("stMem").title = "Free working memory. Lowest so far: " + (boardHeapMin != null ? boardHeapMin : "\u2013") + " KB.";
+  } else setCamStat("stMem", "–");
+  if (live) {
+    lPause = p.gapMaxMs > 300 ? "bad" : (p.gapMaxMs > 100 ? "warn" : "");
+    lResend = p.resends >= 20 ? "bad" : (p.resends >= 1 ? "warn" : "");
+    setCamStat("stPause", Math.round(p.gapAvgMs) + " ms", lPause);  // shown: average; colour: worst case
+    setCamStat("stResend", String(p.resends), lResend);
+    setCamStat("stAck", Math.round(p.ackAvgMs) + " ms", "");
+  } else {
+    ["stPause", "stResend", "stAck"].forEach(function (id) { setCamStat(id, "–"); });
+  }
+  var lv = [lMem, lPause, lResend];
+  $("healthDot").className = "cam-dot " + (lv.indexOf("bad") >= 0 ? "bad" : (lv.indexOf("warn") >= 0 ? "warn" : (boardHeapNow != null || live ? "ok" : "")));
+}
+function pollBoardHealth() {
+  fetch(camPrinterUrl).then(function (r) { return r.json(); }).then(function (p) { boardPrinter = p; renderHealth(); })
+    .catch(function () { boardPrinter = null; renderHealth(); });
+}
+
 // ---- Camera board menu + log window
-var camLogText = "", camLogTimer = null;
+var camLogText = "", camLogTimer = null, camLogMode = "events", camEventsText = "Loading\u2026", camFullText = "Loading\u2026";
+var camFullUrl = CAM_DIRECT ? espBase + "/log/sd" : "/esp/log/sd";
+function showCamText() { $("camEvents").textContent = camLogMode === "full" ? camFullText : camEventsText; }
 function camLogRows(txt) {
   var i = txt.indexOf("--- samples");
   return txt.slice(i).split("\n").slice(1).filter(Boolean).map(function (l) { return l.split(",").map(Number); })
     .filter(function (r) { return r.length > 3 && !isNaN(r[1]); });
 }
-function drawCamChart(rows) {
-  var c = $("camChart"), g = c.getContext("2d"), W = c.width, H = c.height;
-  g.clearRect(0, 0, W, H);
-  g.strokeStyle = "#2a2d32"; g.lineWidth = 1;
-  [0.25, 0.5, 0.75].forEach(function (f) { g.beginPath(); g.moveTo(0, H * f); g.lineTo(W, H * f); g.stroke(); });
-  if (rows.length < 2) return;
-  function line(idx, lo, hi, color) {
-    g.strokeStyle = color; g.lineWidth = 2; g.beginPath();
-    rows.forEach(function (r, i) {
-      var v = Math.max(lo, Math.min(hi, r[idx])), x = i * W / (rows.length - 1), y = H - (v - lo) / (hi - lo) * (H - 6) - 3;
-      if (i === 0) g.moveTo(x, y); else g.lineTo(x, y);
-    });
-    g.stroke();
-  }
-  line(1, 0, 30, "#00c853");
-  line(2, -90, -40, "#f0b90b");
-}
 function fmtUp(s) { var h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60); return h + "h " + m + "m"; }
 function refreshCamLog() {
-  fetch(espBase + "/log").then(function (r) { return r.text(); }).then(function (txt) {
+  fetch(camLogUrl).then(function (r) { return r.text(); }).then(function (txt) {
     camLogText = txt;
-    var m = txt.match(/boot reason: (.*)/); if (m) $("lgReset").textContent = m[1];
-    m = txt.match(/uptime (\d+) s, wifi drops (\d+)/); if (m) { $("lgUp").textContent = fmtUp(+m[1]); $("lgDrops").textContent = m[2]; }
-    drawCamChart(camLogRows(txt));
+    var m;
+    m = txt.match(/uptime (\d+) s, wifi drops (\d+)/); if (m) { $("lgUp").textContent = fmtUp(+m[1]); }
+    var bm = txt.match(/BOOT:[^\n]*free heap (\d+) KB/); if (bm) bootHeapKB = +bm[1];
+    var hm = txt.match(/min free heap (\d+) KB/); if (hm) boardHeapMin = +hm[1];
+    var rows = camLogRows(txt);
+    if (rows.length && !isNaN(rows[rows.length - 1][7])) { boardHeapNow = rows[rows.length - 1][7]; renderHealth(); }
     var a = txt.indexOf("--- events"), b = txt.indexOf("--- samples");
     var ev = txt.slice(a, b).split("\n").slice(1).filter(Boolean);
-    $("camEvents").textContent = ev.length ? ev.slice().reverse().join("\n") : "No events yet.";
-  }).catch(function () { $("camEvents").textContent = "Cannot reach the camera board."; });
+    camEventsText = ev.length ? ev.slice().reverse().join("\n") : "No events yet.";
+    showCamText();
+    if (camLogMode === "full") {
+      fetch(camFullUrl + "?tail=128").then(function (r) { return r.text(); }).then(function (t) {
+        // The file is oldest-first; show the newest lines at the top like the events list.
+        camFullText = t.split("\n").filter(Boolean).reverse().join("\n") || "The log file is empty.";
+        showCamText();
+      }).catch(function () { camFullText = "Cannot read the log file."; showCamText(); });
+    }
+  }).catch(function () { camEventsText = "Cannot reach the camera board."; showCamText(); });
 }
-function openCamLog() {
-  $("camLogModal").className = "cam-modal show";
-  refreshCamLog();
-  camLogTimer = setInterval(refreshCamLog, 3000);
-}
-function closeCamLog() {
-  $("camLogModal").className = "cam-modal";
+function toggleCamLog() {
+  var open = $("camLogBody").hidden;
+  $("camLogBody").hidden = !open;
+  $("camLogBtn").setAttribute("aria-expanded", open ? "true" : "false");
   clearInterval(camLogTimer); camLogTimer = null;
+  if (open) { refreshCamLog(); camLogTimer = setInterval(refreshCamLog, 10000); }  // the log is heavy for the board: not every 3 s
 }
-$("camLogBtn").onclick = openCamLog;
-$("camLogClose").onclick = closeCamLog;
-$("camLogModal").onclick = function (e) { if (e.target === this) closeCamLog(); };
-document.addEventListener("keydown", function (e) { if (e.key === "Escape") closeCamLog(); });
+function setCamTab(mode) {
+  camLogMode = mode;
+  $("camTabHint").textContent = mode === "full" ? "Everything saved on the SD card. Newest first." : "Last ~64 messages (lost on restart).";
+  $("camTabEvents").className = mode === "events" ? "on" : "";
+  $("camTabFull").className = mode === "full" ? "on" : "";
+  showCamText();
+  refreshCamLog();
+}
+$("camTabEvents").onclick = function () { setCamTab("events"); };
+$("camTabFull").onclick = function () { setCamTab("full"); };
+$("camLogBtn").onclick = toggleCamLog;
 $("camLogCopy").onclick = function () {
   var btn = this, done = function () { btn.textContent = "Copied"; setTimeout(function () { btn.textContent = "Copy log"; }, 1500); };
-  if (navigator.clipboard) navigator.clipboard.writeText(camLogText).then(done, function () {});
+  if (navigator.clipboard) navigator.clipboard.writeText($("camEvents").textContent).then(done, function () {});
 };
 pollCamStatus();
 setInterval(pollCamStatus, 2000);
+pollBoardHealth();
+setInterval(pollBoardHealth, 2000);
 
 refreshStatus();
 connectWs();

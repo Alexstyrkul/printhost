@@ -69,6 +69,7 @@ public class PrinterService extends Service {
     private TempPollerThread tempPollerThread;
     private PlugPollerThread plugPollerThread;
     private CameraSyncThread cameraSyncThread;
+    private AutoConnectThread autoConnectThread;
     private ScheduledPrintPollerThread scheduledPrintPollerThread;
     private File uploadedFile;
     private SdFilenameMap sdFilenameMap;
@@ -119,6 +120,8 @@ public class PrinterService extends Service {
         plugPollerThread.start();
         cameraSyncThread = new CameraSyncThread();
         cameraSyncThread.start();
+        autoConnectThread = new AutoConnectThread();
+        autoConnectThread.start();
 
         scheduledPrintPollerThread = new ScheduledPrintPollerThread();
         scheduledPrintPollerThread.start();
@@ -149,6 +152,7 @@ public class PrinterService extends Service {
         stopTempPoller();
         if (plugPollerThread != null) plugPollerThread.requestStop();
         if (cameraSyncThread != null) cameraSyncThread.requestStop();
+        if (autoConnectThread != null) autoConnectThread.requestStop();
         if (scheduledPrintPollerThread != null) scheduledPrintPollerThread.requestStop();
         if (stateBroadcasterThread != null) stateBroadcasterThread.requestStop();
         if (httpServer != null) httpServer.shutdown();
@@ -1378,6 +1382,83 @@ public class PrinterService extends Service {
                     break;
                 } catch (Exception e) {
                     Log.w(TAG, "plug status poll failed (non-fatal)", e);
+                }
+            }
+        }
+    }
+
+    private static final long AUTO_CONNECT_WINDOW_MS = 120000;
+    private static final long AUTO_CONNECT_RETRY_MS = 6000;
+
+    /**
+     * When the printer's plug goes on, connect the ESP32 board to the printer by itself: the board is of no use
+     * without it. The printer needs a few seconds to boot and show up on the board's USB port, so it retries
+     * every few seconds for two minutes after the plug came on (or after this app started with the plug already
+     * on). It only ever acts while the phase is DISCONNECTED/ERROR, so it never touches a print in progress.
+     */
+    class AutoConnectThread extends Thread {
+        private volatile boolean stopRequested = false;
+        private boolean prevPlugOn = false;
+        private long windowEnd = 0, lastAttempt = 0;
+
+        AutoConnectThread() {
+            super("PrintHostAutoConnect");
+        }
+
+        void requestStop() {
+            stopRequested = true;
+            interrupt();
+        }
+
+        @Override
+        public void run() {
+            while (!stopRequested) {
+                try {
+                    Thread.sleep(2000);
+                    if (stopRequested) break;
+                    Boolean p = state.plugOn;
+                    boolean plug = p != null && p.booleanValue();
+                    long now = System.currentTimeMillis();
+                    if (plug && !prevPlugOn) {
+                        windowEnd = now + AUTO_CONNECT_WINDOW_MS;
+                        lastAttempt = 0;
+                    }
+                    prevPlugOn = plug;
+                    // The board restarted (or lost the printer) behind our back: we still think we are connected. Drop the
+                    // stale state and connect again. Only while idle - a print on the board is never touched.
+                    if (plug && state.phase == PrinterState.Phase.IDLE && printerConnection instanceof EspPrinterConnection) {
+                        String bs = ((EspPrinterConnection) printerConnection).boardState();
+                        if (bs.equals("NO_LINK") || bs.equals("DISCONNECTED") || bs.equals("ERROR")) {
+                            Log.w(TAG, "board reports " + bs + " while we show connected - reconnecting");
+                            disconnectPrinter();
+                            windowEnd = now + AUTO_CONNECT_WINDOW_MS;
+                            lastAttempt = 0;
+                        }
+                    }
+                    if (!plug || now > windowEnd) continue;
+                    PrinterState.Phase ph = state.phase;
+                    if (ph != PrinterState.Phase.DISCONNECTED && ph != PrinterState.Phase.ERROR) {
+                        if (ph != PrinterState.Phase.CONNECTING) windowEnd = 0;  // connected (or busy): nothing to do
+                        continue;
+                    }
+                    if (now - lastAttempt < AUTO_CONNECT_RETRY_MS) continue;
+                    lastAttempt = now;
+                    boolean ok = connectPrinter();
+                    if (ok) {
+                        windowEnd = 0;
+                    } else if (System.currentTimeMillis() < windowEnd) {
+                        // Still booting: keep the dashboard calm instead of flashing an error on every try.
+                        synchronized (commandLock) {
+                            if (state.phase == PrinterState.Phase.ERROR) {
+                                state.phase = PrinterState.Phase.DISCONNECTED;
+                                state.lastError = "";
+                            }
+                        }
+                    }
+                } catch (InterruptedException e) {
+                    break;
+                } catch (Exception e) {
+                    Log.w(TAG, "auto connect failed (non-fatal)", e);
                 }
             }
         }
