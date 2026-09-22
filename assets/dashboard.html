@@ -61,7 +61,6 @@
     body { padding: 8px; }
     .main-grid { grid-template-columns: 1fr; gap: 10px; }
     .card { padding: 12px; }
-    .cam-stats { grid-template-columns: repeat(2, 1fr); }
     .cam-modal { align-items: flex-end; padding: 0; }
     .cam-modal-card { max-width: none; border-radius: var(--radius) var(--radius) 0 0; max-height: 88vh; }
     .top-row { flex-wrap: wrap; row-gap: 8px; }
@@ -153,12 +152,13 @@
   .cam-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-faint); flex: none; }
   .cam-dot.ok { background: var(--accent); } .cam-dot.warn { background: var(--warn); } .cam-dot.bad { background: var(--danger); }
   .cam-menu-body { padding: 0 10px 10px; }
-  .cam-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 8px; }
-  .cam-stat { background: var(--panel); border-radius: var(--radius-sm); padding: 8px 6px; text-align: center; }
+  .cam-stats { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-bottom: 8px; }
+  .cam-stat { flex: 0 0 calc(25% - 6px); background: var(--panel); border-radius: var(--radius-sm); padding: 8px 6px; text-align: center; }
   .cam-stat b { display: block; font-size: 14px; font-weight: 700; font-variant-numeric: tabular-nums; }
   .cam-stat span { display: block; font-size: 10px; color: var(--text-faint); margin-top: 2px; text-transform: uppercase; letter-spacing: .04em; }
   .cam-stat.warn b { color: var(--warn); }
   .cam-stat.bad b { color: var(--danger); }
+  @media (max-width: 620px) { .cam-stat { flex-basis: calc(50% - 4px); } }
   .cam-menu-body .cam-menu-head.sub { background: var(--panel); border-radius: var(--radius-sm); }
   .cam-menu + .cam-menu { margin-top: 10px; }
   .switch input:disabled + .switch-slider { opacity: 0.55; cursor: not-allowed; }
@@ -182,8 +182,13 @@
   .cam-tabs { display: flex; gap: 6px; margin-top: 10px; }
   .cam-tabs button { flex: 1; padding: 8px 0; font-size: 12px; opacity: 0.55; }
   .cam-tabs button.on { opacity: 1; }
-  .cam-modal-actions { display: flex; gap: 8px; margin-top: 10px; }
-  .cam-modal-actions button { flex: 1; padding: 10px 0; }
+  .cam-modal-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .cam-modal-actions button { flex: 1; padding: 10px 0; min-width: 70px; }
+  .cam-log-file { display: flex; align-items: center; gap: 8px; padding: 9px 4px; font-size: 12px;
+                   color: var(--text-dim); cursor: pointer; border-radius: var(--radius-sm); }
+  .cam-log-file:active { background: var(--panel); }
+  .cam-log-file .grow { color: var(--text); font-weight: 600; }
+  .cam-log-file b { font-weight: 400; white-space: nowrap; }
 
   .footer { text-align: center; font-size: 10.5px; color: var(--text-faint); margin-top: 8px; }
 
@@ -493,6 +498,8 @@
           <div class="cam-stat" id="stPause" title="Board delay before each line. Yellow or red = slowing the print."><b>&ndash;</b><span>Board delay</span></div>
           <div class="cam-stat" id="stResend" title="Lines resent after the printer got them damaged."><b>&ndash;</b><span>Resends</span></div>
           <div class="cam-stat" id="stAck" title="How fast the printer answers each line. Long is normal."><b>&ndash;</b><span>Printer reply</span></div>
+          <div class="cam-stat" id="stEnvTemp" title="Room temperature from the DHT11 sensor."><b>&ndash;</b><span>Temp</span></div>
+          <div class="cam-stat" id="stEnvHum" title="Room humidity from the DHT11 sensor."><b>&ndash;</b><span>Humidity</span></div>
         </div>
         <button class="cam-menu-head sub" id="camLogBtn" aria-expanded="false">
           <span class="grow">Log</span>
@@ -500,10 +507,27 @@
         </button>
         <div id="camLogBody" hidden>
           <div class="cam-kv"><span>Uptime</span><b id="lgUp">&ndash;</b></div>
-          <div class="cam-tabs"><button id="camTabEvents" class="on">Events</button><button id="camTabFull">Full log (SD card)</button></div>
-          <div class="cam-hint" id="camTabHint">Last ~64 messages (lost on restart).</div>
-          <pre class="cam-events" id="camEvents">Loading&hellip;</pre>
-          <div class="cam-modal-actions"><button id="camLogCopy">Copy log</button></div>
+          <div class="cam-tabs"><button id="camTabEvents" class="on">Events</button><button id="camTabFiles">Files</button></div>
+          <div id="camLogEventsPane">
+            <div class="cam-hint">Recent important events (kept in RAM, lost on restart).</div>
+            <pre class="cam-events" id="camEventsText">Loading&hellip;</pre>
+            <div class="cam-modal-actions"><button id="camEventsCopy">Copy</button></div>
+          </div>
+          <div id="camLogFilesPane" hidden>
+            <div id="camLogList"></div>
+            <div id="camLogViewer" hidden>
+              <div class="cam-kv"><span id="camLogViewerName">&ndash;</span><b id="camLogViewerSize">&ndash;</b></div>
+              <div class="cam-hint" id="camLogViewerHint"></div>
+              <pre class="cam-events" id="camLogViewerText">Loading&hellip;</pre>
+              <div class="cam-modal-actions">
+                <button id="camLogBack">&larr; Files</button>
+                <button id="camLogEarlier">Earlier</button>
+                <button id="camLogJumpPrint">Last print</button>
+                <button id="camLogCopy">Copy</button>
+                <button id="camLogDownload">Download</button>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -1325,8 +1349,10 @@ var espBase = "http://" + ESP_CAM_HOST;
 var CAM_DIRECT = /[?&]direct=1/.test(location.search);
 var camStreamUrl = CAM_DIRECT ? espBase + ":81/stream" : "/camera/relay";
 var camStatusUrl = CAM_DIRECT ? espBase + "/status" : "/esp/status";
-var camLogUrl = CAM_DIRECT ? espBase + "/log" : "/esp/log";
 var camPrinterUrl = CAM_DIRECT ? espBase + "/printer/status" : "/esp/printer/status";
+var camLogUrl = CAM_DIRECT ? espBase + "/log" : "/esp/log";
+var camLogsUrl = CAM_DIRECT ? espBase + "/logs" : "/esp/logs";
+var camLogReadUrl = CAM_DIRECT ? espBase + "/logs/read" : "/esp/logs/read";
 var camStreamUp = false;
 var boardCamOn = null, phoneCamForce = false, phonePlugOn = false, camToggleHoldUntil = 0;
 // The toggle shows whether the camera is really on (from the board). It is greyed out while the camera is on only
@@ -1383,18 +1409,34 @@ function pollCamStatus() {
     // Average the last ~10 s: a single 2 s window jumps around with the scene.
     camFpsHist.push(s.fps); if (camFpsHist.length > 5) camFpsHist.shift();
     var fps = camFpsHist.reduce(function (a, b) { return a + b; }, 0) / camFpsHist.length;
-    if (s.freeHeapKB != null) { boardHeapNow = s.freeHeapKB; if (s.minHeapKB != null) boardHeapMin = s.minHeapKB; renderHealth(); }
+    if (s.freeHeapKB != null) {
+      boardHeapNow = s.freeHeapKB;
+      if (s.minHeapKB != null) boardHeapMin = s.minHeapKB;
+      if (s.totalHeapKB != null) bootHeapKB = s.totalHeapKB;
+      renderHealth();
+    }
+    if (s.uptime != null) $("lgUp").textContent = fmtUp(s.uptime);
     var cpu = Math.max(s.cpu0, s.cpu1);
+    // Chip temp: the sensor is only accurate to ~80 C and the board's ceiling is ~125 C, but a
+    // normal working temperature (idle or streaming) sits around 60-72 C - so warn well below
+    // where the sensor itself gets unreliable, and treat 90+ as a real problem.
     var lFps = fps < 8 ? "bad" : (fps < 12 ? "warn" : ""), lWifi = s.rssi < -75 ? "bad" : (s.rssi < -67 ? "warn" : ""),
-        lTemp = s.tempC > 75 ? "bad" : (s.tempC > 65 ? "warn" : ""), lCpu = cpu > 90 ? "bad" : "";
+        lTemp = s.tempC >= 90 ? "bad" : (s.tempC >= 80 ? "warn" : ""), lCpu = cpu > 90 ? "bad" : "";
     setCamStat("stFps", fps.toFixed(0), lFps);
     setCamStat("stWifi", s.rssi + " dBm", lWifi);
     setCamStat("stTemp", s.tempC.toFixed(0) + " \u00b0C", lTemp);
     setCamStat("stCpu", cpu + "%", lCpu);
+    if (s.envOk) {
+      setCamStat("stEnvTemp", s.envTempC.toFixed(1) + " \u00b0C", "");
+      setCamStat("stEnvHum", s.envHum.toFixed(0) + "%", "");
+    } else {
+      setCamStat("stEnvTemp", "\u2013");
+      setCamStat("stEnvHum", "\u2013");
+    }
     var worst = [lFps, lWifi, lTemp, lCpu].indexOf("bad") >= 0 ? "bad" : ([lFps, lWifi, lTemp, lCpu].indexOf("warn") >= 0 ? "warn" : "ok");
     $("camDot").className = "cam-dot " + worst;
   }).catch(function () {
-    ["stFps", "stWifi", "stTemp", "stCpu"].forEach(function (id) { setCamStat(id, "\u2013"); });
+    ["stFps", "stWifi", "stTemp", "stCpu", "stEnvTemp", "stEnvHum"].forEach(function (id) { setCamStat(id, "\u2013"); });
     $("camDot").className = "cam-dot";
   });
 }
@@ -1411,7 +1453,10 @@ function renderHealth() {
   } else setCamStat("stMem", "–");
   if (live) {
     lPause = p.gapMaxMs > 300 ? "bad" : (p.gapMaxMs > 100 ? "warn" : "");
-    lResend = p.resends >= 20 ? "bad" : (p.resends >= 1 ? "warn" : "");
+    // Resends scale with how much has printed, not with time - a handful in a 200k-line print is
+    // normal (this rate is what a first real print looked like: ~5 in 233k lines, healthy).
+    var resendRate = p.lines > 0 ? p.resends * 10000 / p.lines : 0;
+    lResend = resendRate > 10 ? "bad" : (resendRate >= 1 ? "warn" : "");
     setCamStat("stPause", Math.round(p.gapAvgMs) + " ms", lPause);  // shown: average; colour: worst case
     setCamStat("stResend", String(p.resends), lResend);
     setCamStat("stAck", Math.round(p.ackAvgMs) + " ms", "");
@@ -1426,60 +1471,229 @@ function pollBoardHealth() {
     .catch(function () { boardPrinter = null; renderHealth(); });
 }
 
-// ---- Camera board menu + log window
-var camLogText = "", camLogTimer = null, camLogMode = "events", camEventsText = "Loading\u2026", camFullText = "Loading\u2026";
-var camFullUrl = CAM_DIRECT ? espBase + "/log/sd" : "/esp/log/sd";
-function showCamText() { $("camEvents").textContent = camLogMode === "full" ? camFullText : camEventsText; }
-function camLogRows(txt) {
-  var i = txt.indexOf("--- samples");
-  return txt.slice(i).split("\n").slice(1).filter(Boolean).map(function (l) { return l.split(",").map(Number); })
-    .filter(function (r) { return r.length > 3 && !isNaN(r[1]); });
-}
+// ---- Camera board menu + log window: a list of files on the board's SD card, opened one at a
+// time into a viewer. The list itself is fetched once per open (no polling); the viewer follows
+// only the file currently being written, and only for as long as it stays open.
 function fmtUp(s) { var h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60); return h + "h " + m + "m"; }
-function refreshCamLog() {
-  fetch(camLogUrl).then(function (r) { return r.text(); }).then(function (txt) {
-    camLogText = txt;
-    var m;
-    m = txt.match(/uptime (\d+) s, wifi drops (\d+)/); if (m) { $("lgUp").textContent = fmtUp(+m[1]); }
-    var bm = txt.match(/BOOT:[^\n]*free heap (\d+) KB/); if (bm) bootHeapKB = +bm[1];
-    var hm = txt.match(/min free heap (\d+) KB/); if (hm) boardHeapMin = +hm[1];
-    var rows = camLogRows(txt);
-    if (rows.length && !isNaN(rows[rows.length - 1][7])) { boardHeapNow = rows[rows.length - 1][7]; renderHealth(); }
-    var a = txt.indexOf("--- events"), b = txt.indexOf("--- samples");
-    var ev = txt.slice(a, b).split("\n").slice(1).filter(Boolean);
-    camEventsText = ev.length ? ev.slice().reverse().join("\n") : "No events yet.";
-    showCamText();
-    if (camLogMode === "full") {
-      fetch(camFullUrl + "?tail=128").then(function (r) { return r.text(); }).then(function (t) {
-        // The file is oldest-first; show the newest lines at the top like the events list.
-        camFullText = t.split("\n").filter(Boolean).reverse().join("\n") || "The log file is empty.";
-        showCamText();
-      }).catch(function () { camFullText = "Cannot read the log file."; showCamText(); });
-    }
-  }).catch(function () { camEventsText = "Cannot reach the camera board."; showCamText(); });
+function fmtLogBytes(n) {
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + " MB";
+  if (n >= 1024) return Math.round(n / 1024) + " KB";
+  return n + " B";
 }
+var camLogFollowTimer = null, camLogView = null; // {name, size, current, from, next}
+
+var camLogTab = "events", camLogEventsTimer = null;
+
 function toggleCamLog() {
   var open = $("camLogBody").hidden;
   $("camLogBody").hidden = !open;
   $("camLogBtn").setAttribute("aria-expanded", open ? "true" : "false");
-  clearInterval(camLogTimer); camLogTimer = null;
-  if (open) { refreshCamLog(); camLogTimer = setInterval(refreshCamLog, 10000); }  // the log is heavy for the board: not every 3 s
+  if (open) setCamLogTab("events"); // real-time events first, the file manager is one tap away
+  else stopCamLogTabTimers();
 }
-function setCamTab(mode) {
-  camLogMode = mode;
-  $("camTabHint").textContent = mode === "full" ? "Everything saved on the SD card. Newest first." : "Last ~64 messages (lost on restart).";
-  $("camTabEvents").className = mode === "events" ? "on" : "";
-  $("camTabFull").className = mode === "full" ? "on" : "";
-  showCamText();
-  refreshCamLog();
+
+function stopCamLogTabTimers() {
+  clearInterval(camLogEventsTimer); camLogEventsTimer = null;
+  clearInterval(camLogFollowTimer); camLogFollowTimer = null;
 }
-$("camTabEvents").onclick = function () { setCamTab("events"); };
-$("camTabFull").onclick = function () { setCamTab("full"); };
+
+function setCamLogTab(tab) {
+  stopCamLogTabTimers();
+  camLogTab = tab;
+  $("camTabEvents").className = tab === "events" ? "on" : "";
+  $("camTabFiles").className = tab === "files" ? "on" : "";
+  $("camLogEventsPane").hidden = tab !== "events";
+  $("camLogFilesPane").hidden = tab !== "files";
+  if (tab === "events") {
+    refreshCamLogEvents();
+    camLogEventsTimer = setInterval(refreshCamLogEvents, 10000);  // the log is heavy for the board: not every 3 s
+  } else {
+    backToCamLogList();
+  }
+}
+
+function refreshCamLogEvents() {
+  fetch(camLogUrl).then(function (r) { return r.text(); }).then(function (txt) {
+    var a = txt.indexOf("--- events"), b = txt.indexOf("--- samples");
+    var section = a < 0 ? "" : txt.slice(a, b < 0 ? txt.length : b);
+    var ev = section.split("\n").slice(1).filter(Boolean);
+    $("camEventsText").textContent = ev.length ? ev.slice().reverse().join("\n") : "No events yet.";
+  }).catch(function () { $("camEventsText").textContent = "Cannot reach the camera board."; });
+}
+
+function refreshCamLogList() {
+  $("camLogList").innerHTML = '<div class="cam-hint">Loading\u2026</div>';
+  fetch(camLogsUrl).then(function (r) { return r.json(); }).then(function (j) {
+    var files = j.files || [];
+    if (!files.length) { $("camLogList").innerHTML = '<div class="cam-hint">No log files yet.</div>'; return; }
+    var html = "";
+    files.forEach(function (f, i) {
+      html += '<div class="cam-log-file" data-i="' + i + '">' +
+        '<span class="cam-dot ' + (f.current ? "ok" : "") + '"></span>' +
+        '<span class="grow">' + f.name + '</span>' +
+        '<b>' + fmtLogBytes(f.size) + (f.current ? " \u00b7 writing" : "") + '</b></div>';
+    });
+    $("camLogList").innerHTML = html;
+    Array.prototype.forEach.call($("camLogList").querySelectorAll(".cam-log-file"), function (el) {
+      el.onclick = function () { openCamLogFile(files[+el.getAttribute("data-i")]); };
+    });
+  }).catch(function () { $("camLogList").innerHTML = '<div class="cam-hint">Cannot reach the camera board.</div>'; });
+}
+
+function backToCamLogList() {
+  clearInterval(camLogFollowTimer); camLogFollowTimer = null;
+  camLogView = null;
+  $("camLogViewer").hidden = true;
+  $("camLogList").hidden = false;
+  refreshCamLogList();
+}
+
+function camLogReadHeaders(r) {
+  return { size: +r.headers.get("X-Log-Size"), from: +r.headers.get("X-Log-From"), next: +r.headers.get("X-Log-Next") };
+}
+
+function openCamLogFile(meta) {
+  clearInterval(camLogFollowTimer); camLogFollowTimer = null;
+  camLogView = { name: meta.name, size: meta.size, current: !!meta.current, from: null, next: null };
+  $("camLogList").hidden = true;
+  $("camLogViewer").hidden = false;
+  $("camLogViewerName").textContent = meta.name;
+  $("camLogViewerSize").textContent = fmtLogBytes(meta.size);
+  $("camLogViewerText").textContent = "Loading\u2026";
+  $("camLogViewerHint").textContent = "";
+  fetch(camLogReadUrl + "?name=" + encodeURIComponent(meta.name) + "&max=65536").then(function (r) {
+    var h = camLogReadHeaders(r);
+    return r.text().then(function (t) { return { t: t, h: h }; });
+  }).then(function (res) {
+    camLogView.from = res.h.from; camLogView.next = res.h.next; camLogView.size = res.h.size;
+    $("camLogViewerText").textContent = res.t || "(empty)";
+    $("camLogViewerText").scrollTop = $("camLogViewerText").scrollHeight;
+    $("camLogViewerHint").textContent = camLogView.from > 0 ? "Showing the end of the file." : "Showing the whole file.";
+    if (camLogView.current) camLogFollowTimer = setInterval(followCamLog, 2500);
+  }).catch(function () { $("camLogViewerText").textContent = "Cannot reach the camera board."; });
+}
+
+function followCamLog() {
+  if (!camLogView || camLogView.next == null) return;
+  fetch(camLogReadUrl + "?name=" + encodeURIComponent(camLogView.name) + "&from=" + camLogView.next + "&max=65536")
+    .then(function (r) {
+      var h = camLogReadHeaders(r);
+      return r.text().then(function (t) { return { t: t, h: h }; });
+    }).then(function (res) {
+      if (res.t) {
+        var el = $("camLogViewerText");
+        var atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+        el.textContent += res.t;
+        if (atBottom) el.scrollTop = el.scrollHeight;
+      }
+      camLogView.next = res.h.next; camLogView.size = res.h.size;
+      $("camLogViewerSize").textContent = fmtLogBytes(camLogView.size);
+    }).catch(function () {}); // transient - the next tick retries
+}
+
+function loadCamLogEarlier() {
+  if (!camLogView || !camLogView.from) return;
+  var wantFrom = Math.max(0, camLogView.from - 65536);
+  fetch(camLogReadUrl + "?name=" + encodeURIComponent(camLogView.name) + "&from=" + wantFrom + "&max=" + (camLogView.from - wantFrom))
+    .then(function (r) {
+      var h = camLogReadHeaders(r);
+      return r.text().then(function (t) { return { t: t, h: h }; });
+    }).then(function (res) {
+      var el = $("camLogViewerText"), prevHeight = el.scrollHeight;
+      el.textContent = res.t + el.textContent;
+      el.scrollTop = el.scrollHeight - prevHeight;
+      camLogView.from = res.h.from;
+      $("camLogViewerHint").textContent = camLogView.from > 0 ? "Showing the end of the file." : "Showing the whole file.";
+    }).catch(function () {});
+}
+
+// Searches backward from the end of the file for the last "print start" marker, a chunk at a
+// time, and jumps the viewer there - so a long log doesn't have to be paged through by hand.
+function jumpCamLogLastPrint() {
+  if (!camLogView) return;
+  var btn = $("camLogJumpPrint"), orig = btn.textContent;
+  btn.disabled = true; btn.textContent = "Searching\u2026";
+  var CHUNK = 65536, MAX_TRIES = 8, size = camLogView.size;
+  function tryChunk(triesDone) {
+    var end = size - triesDone * CHUNK;
+    if (end <= 0 || triesDone >= MAX_TRIES) return Promise.resolve(null);
+    var start = Math.max(0, end - CHUNK);
+    return fetch(camLogReadUrl + "?name=" + encodeURIComponent(camLogView.name) + "&from=" + start + "&max=" + (end - start))
+      .then(function (r) { return r.text(); }).then(function (t) {
+        var idx = t.lastIndexOf("printer: print start");
+        if (idx >= 0) return start + t.lastIndexOf("\n", idx) + 1;
+        return tryChunk(triesDone + 1);
+      });
+  }
+  tryChunk(0).then(function (foundFrom) {
+    btn.disabled = false; btn.textContent = orig;
+    if (foundFrom == null) { $("camLogViewerHint").textContent = "No print start found in the last " + (MAX_TRIES * CHUNK / 1024) + " KB."; return; }
+    clearInterval(camLogFollowTimer); camLogFollowTimer = null;
+    fetch(camLogReadUrl + "?name=" + encodeURIComponent(camLogView.name) + "&from=" + foundFrom + "&max=65536").then(function (r) {
+      var h = camLogReadHeaders(r);
+      return r.text().then(function (t) { return { t: t, h: h }; });
+    }).then(function (res) {
+      $("camLogViewerText").textContent = res.t;
+      $("camLogViewerText").scrollTop = 0;
+      camLogView.from = res.h.from; camLogView.next = res.h.next;
+      $("camLogViewerHint").textContent = "Showing from the last print start.";
+      if (camLogView.current) camLogFollowTimer = setInterval(followCamLog, 2500);
+    });
+  });
+}
+
+// Paced deliberately (a gap between chunks, not back-to-back requests): each chunk takes the
+// same SD-card lock the print engine uses to read gcode, and a multi-MB file is many chunks -
+// hammering the board for one is exactly the kind of load that used to risk a stall/reboot
+// mid-print. Safe to run during a print, but prefer downloading older (not currently-written)
+// files, or finished ones, when a print is running.
+var CAM_LOG_DOWNLOAD_GAP_MS = 150;
+
+function downloadCamLogFile() {
+  if (!camLogView) return;
+  var btn = $("camLogDownload"), orig = btn.textContent;
+  btn.disabled = true; btn.textContent = "Downloading\u2026";
+  var parts = [], pos = 0, size = camLogView.size;
+  function next() {
+    if (pos >= size) {
+      var blob = new Blob(parts, { type: "text/plain" });
+      var a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = camLogView.name;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(function () { URL.revokeObjectURL(a.href); }, 4000);
+      btn.disabled = false; btn.textContent = orig;
+      return;
+    }
+    btn.textContent = "Downloading\u2026 " + Math.round(pos * 100 / size) + "%";
+    fetch(camLogReadUrl + "?name=" + encodeURIComponent(camLogView.name) + "&from=" + pos + "&max=65536")
+      .then(function (r) {
+        var h = camLogReadHeaders(r);
+        return r.text().then(function (t) { return { t: t, h: h }; });
+      }).then(function (res) {
+        parts.push(res.t);
+        pos = res.h.next > pos ? res.h.next : size;
+        setTimeout(next, CAM_LOG_DOWNLOAD_GAP_MS);
+      }).catch(function () { btn.disabled = false; btn.textContent = "Download failed"; setTimeout(function () { btn.textContent = orig; }, 2000); });
+  }
+  next();
+}
+
 $("camLogBtn").onclick = toggleCamLog;
-$("camLogCopy").onclick = function () {
-  var btn = this, done = function () { btn.textContent = "Copied"; setTimeout(function () { btn.textContent = "Copy log"; }, 1500); };
-  if (navigator.clipboard) navigator.clipboard.writeText($("camEvents").textContent).then(done, function () {});
-};
+$("camTabEvents").onclick = function () { setCamLogTab("events"); };
+$("camTabFiles").onclick = function () { setCamLogTab("files"); };
+$("camLogBack").onclick = backToCamLogList;
+$("camLogEarlier").onclick = loadCamLogEarlier;
+$("camLogJumpPrint").onclick = jumpCamLogLastPrint;
+$("camLogDownload").onclick = downloadCamLogFile;
+function wireCopyButton(btnId, textId) {
+  $(btnId).onclick = function () {
+    var btn = this, done = function () { btn.textContent = "Copied"; setTimeout(function () { btn.textContent = "Copy"; }, 1500); };
+    if (navigator.clipboard) navigator.clipboard.writeText($(textId).textContent).then(done, function () {});
+  };
+}
+wireCopyButton("camLogCopy", "camLogViewerText");
+wireCopyButton("camEventsCopy", "camEventsText");
 pollCamStatus();
 setInterval(pollCamStatus, 2000);
 pollBoardHealth();

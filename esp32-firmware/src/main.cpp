@@ -7,6 +7,7 @@
 #include <SD_MMC.h>
 #include <WiFi.h>
 #include "common.h"
+#include "dht11.h"
 #include "esp_camera.h"
 #include "esp_http_server.h"
 #include <driver/temp_sensor.h>
@@ -1003,7 +1004,8 @@ static esp_err_t printerDisconnectHandler(httpd_req_t *req) {
 }
 static esp_err_t printerPrintHandler(httpd_req_t *req) {
   String err;
-  bool ok = printerStartPrint(queryValue(req, "file"), err, (uint32_t)queryValue(req, "dry").toInt());
+  bool ok = printerStartPrint(queryValue(req, "file"), err, (uint32_t)queryValue(req, "dry").toInt(),
+                               (uint32_t)queryValue(req, "skip").toInt(), (uint32_t)queryValue(req, "badEvery").toInt());
   return printerReply(req, ok, err);
 }
 static esp_err_t printerPauseHandler(httpd_req_t *req) {
@@ -1056,14 +1058,19 @@ static esp_err_t cameraPowerHandler(httpd_req_t *req) {
 }
 
 static esp_err_t statusHandler(httpd_req_t *req) {
-  char buf[1024];
+  float envTempC = 0, envHum = 0;
+  bool envOk = false;
+  dht11Snapshot(envTempC, envHum, envOk);
+  char buf[1100];
   snprintf(buf, sizeof(buf),
            "{\"fps\":%.2f,\"frameBytes\":%u,\"mode\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,"
-           "\"freePsram\":%u,\"sd\":\"%s\",\"uptime\":%lu,\"latencyMs\":%u,\"profile\":\"%s\",\"getMs\":%u,\"sendMs\":%u,\"wifiDrops\":%lu,\"reset\":\"%s\",\"tempC\":%.1f,\"cpu0\":%u,\"cpu1\":%u,\"cameraOn\":%s,\"quality\":%d,\"freeHeapKB\":%u,\"minHeapKB\":%u,\"totalHeapKB\":%u}",
+           "\"freePsram\":%u,\"sd\":\"%s\",\"uptime\":%lu,\"latencyMs\":%u,\"profile\":\"%s\",\"getMs\":%u,\"sendMs\":%u,\"wifiDrops\":%lu,\"reset\":\"%s\",\"tempC\":%.1f,\"cpu0\":%u,\"cpu1\":%u,\"cameraOn\":%s,\"quality\":%d,\"freeHeapKB\":%u,\"minHeapKB\":%u,\"totalHeapKB\":%u,"
+           "\"envOk\":%s,\"envTempC\":%.1f,\"envHum\":%.0f}",
            currentFps, (unsigned)lastFrameBytes, staMode ? "sta" : "ap", WiFi.SSID().c_str(),
            (staMode ? WiFi.localIP() : WiFi.softAPIP()).toString().c_str(), staMode ? WiFi.RSSI() : 0,
            (unsigned)ESP.getFreePsram(), sdStatus.c_str(), millis() / 1000, (unsigned)lastLatencyMs, PROFILES[curProfile].name, (unsigned)avgGetMs, (unsigned)avgSendMs, (unsigned long)wifiDrops, resetReasonText.c_str(), chipTempC, cpuLoad[0], cpuLoad[1], camEnabled ? "true" : "false", curQuality,
-           (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getMinFreeHeap() / 1024), (unsigned)(ESP.getHeapSize() / 1024));
+           (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getMinFreeHeap() / 1024), (unsigned)(ESP.getHeapSize() / 1024),
+           envOk ? "true" : "false", envTempC, envHum);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");  // the main dashboard reads this from the phone
   return httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
@@ -1166,7 +1173,12 @@ static void startNetwork() {
   WiFi.mode(WIFI_STA);
   int found = WiFi.scanNetworks();
   Serial.printf("WIFI: scan found %d networks:\n", found);
-  for (int i = 0; i < found; i++) Serial.printf("  '%s' ch%d %ddBm\n", WiFi.SSID(i).c_str(), WiFi.channel(i), WiFi.RSSI(i));
+  for (int i = 0; i < found; i++) {
+    Serial.printf("  '%s' ch%d %ddBm\n", WiFi.SSID(i).c_str(), WiFi.channel(i), WiFi.RSSI(i));
+    // Persisted (not just Serial) so a channel-congestion regression can be diagnosed after the
+    // fact from /logs alone, without needing USB serial plugged in at the time it happens.
+    logEvent("wifi scan: '%s' ch%d %ddBm", WiFi.SSID(i).c_str(), WiFi.channel(i), WiFi.RSSI(i));
+  }
   if (ssid.length()) {
     Serial.printf("WIFI: connecting to '%s'...\n", ssid.c_str());
     WiFi.mode(WIFI_STA);
@@ -1233,6 +1245,7 @@ void setup() {
   Serial.println("CAM: off until the plug turns on");
   fpsWindowStart = millis();
   printerBegin();  // starts the engine task only; the printer link stays unselected until a client asks
+  dht11Begin(21);  // room sensor on GPIO 21 (moved from 14) - see docs/HANDOFF_ESP32_BRIDGE.md
   startNetwork();
   startServers();
 }

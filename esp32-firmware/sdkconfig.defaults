@@ -2,6 +2,12 @@
 CONFIG_AUTOSTART_ARDUINO=y
 CONFIG_FREERTOS_HZ=1000
 
+# The Arduino-as-component build defaults this off (the prebuilt Arduino package ships it on),
+# which put digitalRead/digitalWrite/pinMode in flash instead of IRAM. DHT11's bit-bang read
+# calls those in a tight microsecond loop; a flash-cache stall from Wi-Fi/SD/camera traffic on
+# the other core stretches a pulse mid-read and breaks the checksum - on with it, off without.
+CONFIG_ARDUINO_ISR_IRAM=y
+
 # 16 MB flash, 8 MB octal PSRAM (N16R8)
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
