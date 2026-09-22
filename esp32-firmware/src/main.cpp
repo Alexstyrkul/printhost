@@ -12,6 +12,7 @@
 #include "esp_http_server.h"
 #include <driver/temp_sensor.h>
 #include <esp_crc.h>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_system.h>
 #include <esp_task_wdt.h>
@@ -1057,6 +1058,40 @@ static esp_err_t cameraPowerHandler(httpd_req_t *req) {
   return sendJsonStatus(req, "200 OK", String("{\"ok\":true,\"cameraOn\":") + (camEnabled ? "true" : "false") + "}");
 }
 
+// One-off diagnostic (not polled by the dashboard): a breakdown of where internal RAM actually
+// goes, since freeHeapKB alone doesn't say whether it's genuinely used or just fragmented, or
+// which task's stack is the big one.
+static esp_err_t debugHeapHandler(httpd_req_t *req) {
+  multi_heap_info_t info;
+  heap_caps_get_info(&info, MALLOC_CAP_INTERNAL);
+
+  UBaseType_t n = uxTaskGetNumberOfTasks();
+  auto *tasks = new TaskStatus_t[n];
+  n = uxTaskGetSystemState(tasks, n, nullptr);
+
+  String buf = "{\"internal\":{";
+  buf += "\"totalBytes\":" + String((unsigned)info.total_free_bytes + (unsigned)info.total_allocated_bytes);
+  buf += ",\"freeBytes\":" + String((unsigned)info.total_free_bytes);
+  buf += ",\"largestFreeBlock\":" + String((unsigned)info.largest_free_block);
+  buf += ",\"minEverFreeBytes\":" + String((unsigned)info.minimum_free_bytes);
+  buf += ",\"allocatedBlocks\":" + String((unsigned)info.allocated_blocks);
+  buf += ",\"freeBlocks\":" + String((unsigned)info.free_blocks);
+  buf += "},\"tasks\":[";
+  for (UBaseType_t i = 0; i < n; i++) {
+    if (i) buf += ",";
+    // stackHighWaterBytes: how close that task has ever come to overflowing its own stack -
+    // low here (a few hundred bytes) means its allocated stack size is basically the right size,
+    // not wasted, and isn't where free RAM would come from if trimmed.
+    buf += "{\"name\":\"" + String(tasks[i].pcTaskName) + "\",\"stackHighWaterBytes\":" +
+           String((unsigned)(tasks[i].usStackHighWaterMark * sizeof(StackType_t))) + "}";
+  }
+  buf += "]}";
+  delete[] tasks;
+
+  httpd_resp_set_type(req, "application/json");
+  return httpd_resp_send(req, buf.c_str(), HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t statusHandler(httpd_req_t *req) {
   float envTempC = 0, envHum = 0;
   bool envOk = false;
@@ -1112,7 +1147,7 @@ static esp_err_t wifiHandler(httpd_req_t *req) {
 static void startServers() {
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.server_port = 80;
-  cfg.max_uri_handlers = 28;
+  cfg.max_uri_handlers = 32;
   cfg.stack_size = 8192;  // file upload touches FATFS + Strings
   cfg.recv_wait_timeout = 10;
   cfg.send_wait_timeout = 10;
@@ -1123,6 +1158,7 @@ static void startServers() {
       {"/capture", HTTP_GET, captureHandler, nullptr},
       {"/control", HTTP_GET, controlHandler, nullptr},
       {"/status", HTTP_GET, statusHandler, nullptr},
+      {"/debug/heap", HTTP_GET, debugHeapHandler, nullptr},
       {"/log", HTTP_GET, logHandler, nullptr},
       {"/log/sd", HTTP_GET, logSdHandler, nullptr},
       {"/camera", HTTP_POST, cameraPowerHandler, nullptr},

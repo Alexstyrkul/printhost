@@ -30,8 +30,25 @@ const uint8_t LCR_ENABLE_RX = 0x80, LCR_ENABLE_TX = 0x40, LCR_CS8 = 0x03;
 bool hostInstalled = false;
 bool cdcInstalled = false;
 cdc_acm_dev_hdl_t dev = nullptr;
+// Guards `dev`: it's read/written from both our own task (open/close) and the USB host
+// library's own event context (onEvent, on a real disconnect) with no other synchronization.
+// Without this, a real unplug racing our own close() could call cdc_acm_host_close() on the
+// same handle twice - the second call hits an already-released interface deep inside the
+// vendored cdc_acm driver, which ESP_ERROR_CHECKs and panics the whole board.
+portMUX_TYPE devMux = portMUX_INITIALIZER_UNLOCKED;
 StreamBufferHandle_t rxBuf = nullptr;
 volatile bool devGone = false;
+
+// Atomically takes ownership of the current handle (clearing `dev`) so at most one caller ever
+// gets a non-null result for a given open device - callers only call cdc_acm_host_close() if
+// they get one back.
+cdc_acm_dev_hdl_t claimDevForClose() {
+  portENTER_CRITICAL(&devMux);
+  cdc_acm_dev_hdl_t d = dev;
+  dev = nullptr;
+  portEXIT_CRITICAL(&devMux);
+  return d;
+}
 
 void usbLibTask(void *) {
   for (;;) {
@@ -50,8 +67,8 @@ void onEvent(const cdc_acm_host_dev_event_data_t *ev, void *) {
   if (ev->type == CDC_ACM_HOST_DEVICE_DISCONNECTED) {
     devGone = true;
     logEvent("usb: printer device disconnected");
-    cdc_acm_host_close(ev->data.cdc_hdl);
-    dev = nullptr;
+    cdc_acm_dev_hdl_t d = claimDevForClose();
+    if (d) cdc_acm_host_close(d);
   } else if (ev->type == CDC_ACM_HOST_ERROR) {
     logEvent("usb: CDC error %d", ev->data.error);
   }
@@ -161,10 +178,8 @@ class UsbLink : public PrinterLink {
   }
 
   void close() override {
-    if (dev) {
-      cdc_acm_host_close(dev);
-      dev = nullptr;
-    }
+    cdc_acm_dev_hdl_t d = claimDevForClose();
+    if (d) cdc_acm_host_close(d);
   }
 
   bool isOpen() override { return dev != nullptr && !devGone; }
