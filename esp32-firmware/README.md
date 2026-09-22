@@ -1,7 +1,7 @@
 # PrintHost ESP32-S3 firmware
 
 Firmware for the ESP32-S3-WROOM-1 N16R8 + OV3660 board that drives the printer, streams the camera and stores gcode.
-Project state, findings and next steps: `../docs/HANDOFF_ESP32_BRIDGE.md`.
+Project state, findings and next steps: [`docs/HANDOFF_ESP32_BRIDGE.md`](docs/HANDOFF_ESP32_BRIDGE.md).
 
 ## Build
 
@@ -27,6 +27,7 @@ export PRINTHOST_OTA_PASS=<OTA_PASS>; uvx --from platformio pio run -e esp32s3_o
 | `src/printer.cpp/.h` | Print engine task, command mailbox, status JSON |
 | `src/link_sim.cpp` | Fake Marlin (line numbers, checksums, resend, temperatures) |
 | `src/link_usb.cpp` | CH340 over the IDF USB host, RX polling policy |
+| `src/dht11.cpp/.h` | Room temperature/humidity, read via RMT (not bit-banged - see the HANDOFF doc) |
 | `src/common.h` | Shared declarations |
 | `src/test_ui.h` | Debug page served at `/` |
 | `components/esp32-camera` | v2.0.4 (vendored) |

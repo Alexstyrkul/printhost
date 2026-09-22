@@ -1,10 +1,10 @@
-out/
-classes/
-gen/
-debug.keystore
-design/printhost-dashboard.html
+phone-app/out/
+phone-app/classes/
+phone-app/gen/
+phone-app/debug.keystore
+phone-app/design/printhost-dashboard.html
+phone-app/assets/tapo.properties
 .DS_Store
-assets/tapo.properties
 esp32-firmware/.pio/
 esp32-firmware/src/secrets.h
 esp32-firmware/sdkconfig.esp32s3_*
