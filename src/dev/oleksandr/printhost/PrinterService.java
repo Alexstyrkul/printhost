@@ -3,23 +3,16 @@ package dev.oleksandr.printhost;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
-import android.app.PendingIntent;
 import android.app.Service;
-import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.ServiceInfo;
-import android.hardware.usb.UsbDevice;
-import android.hardware.usb.UsbManager;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
 import android.net.wifi.WifiManager;
 import android.util.Log;
-
-import com.hoho.android.usbserial.driver.UsbSerialDriver;
-import com.hoho.android.usbserial.driver.UsbSerialProber;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -32,9 +25,6 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.Arrays;
 import java.util.Comparator;
-import java.util.List;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -45,7 +35,6 @@ public class PrinterService extends Service {
     private static final String CHANNEL_ID = "printhost_service";
     private static final int NOTIFICATION_ID = 1;
     static final int HTTP_PORT = 8899; // not 2525, so it can't be confused with 3D Fox
-    private static final String ACTION_USB_PERMISSION = "dev.oleksandr.printhost.USB_PERMISSION";
     private static final int POLL_INTERVAL_MS = 1500;
     private static final int IDLE_TEMP_POLL_INTERVAL_MS = 8000;
     private static final int MAX_CONSECUTIVE_POLL_FAILURES = 5;
@@ -59,12 +48,10 @@ public class PrinterService extends Service {
     private PrinterConnection printerConnection;
     /** Address of the ESP32 camera board, which doubles as the mock printer's "SD card". */
     private String espHost = "192.168.50.190";
-    private CameraController cameraController;
     private PrintHostHttpServer httpServer;
     private MacNotifier macNotifier;
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
-    private UsbManager usbManager;
     private PollerThread pollerThread;
     private TempPollerThread tempPollerThread;
     private PlugPollerThread plugPollerThread;
@@ -89,13 +76,11 @@ public class PrinterService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
-        usbManager = (UsbManager) getSystemService(Context.USB_SERVICE);
         android.content.SharedPreferences prefs = getSharedPreferences("printhost", MODE_PRIVATE);
         espHost = prefs.getString("esp_host", espHost);
         // The printer is always driven by the ESP32 board; this phone never opens USB.
         printerConnection = new EspPrinterConnection("http://" + espHost, "usb");
         state.cameraForce = prefs.getBoolean("camera_force", false);
-        cameraController = new CameraController(this);
         macNotifier = new MacNotifier(this);
         sdFilenameMap = new SdFilenameMap(new File(getFilesDir(), "sd_filename_map.json"));
         gcodeCacheSizeMap = new GcodeCacheSizeMap(new File(getFilesDir(), "gcode_cache_sizes.json"));
@@ -156,7 +141,6 @@ public class PrinterService extends Service {
         if (scheduledPrintPollerThread != null) scheduledPrintPollerThread.requestStop();
         if (stateBroadcasterThread != null) stateBroadcasterThread.requestStop();
         if (httpServer != null) httpServer.shutdown();
-        cameraController.stop();
         printerConnection.disconnect();
         if (wakeLock.isHeld()) wakeLock.release();
         if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
@@ -165,11 +149,7 @@ public class PrinterService extends Service {
 
     private void startForegroundCompat() {
         Notification notification = buildNotification("Idle");
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            startForeground(NOTIFICATION_ID, notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-                            | ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA);
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(NOTIFICATION_ID, notification,
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
         } else {
@@ -478,8 +458,7 @@ public class PrinterService extends Service {
             }
             state.phase = PrinterState.Phase.CONNECTING;
             try {
-                UsbDevice target = null;  // unused: the ESP32 board owns the USB link
-                printerConnection.connect(target);
+                printerConnection.connect();
                 state.firmwareInfo = firstLine(printerConnection.queryFirmwareInfo());
                 state.zOffset = parseZOffset(printerConnection.queryZOffset());
                 state.lastError = "";
@@ -599,52 +578,6 @@ public class PrinterService extends Service {
             state.currentLayer = null;
             state.totalLayers = null;
             updateNotification("Idle");
-        }
-    }
-
-    private UsbDevice findCandidateDevice() {
-        List<UsbSerialDriver> drivers = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager);
-        if (drivers.isEmpty()) return null;
-        return drivers.get(0).getDevice();
-    }
-
-    private boolean requestUsbPermissionAndWait(UsbDevice device) {
-        UsbPermissionReceiver receiver = new UsbPermissionReceiver();
-        IntentFilter filter = new IntentFilter(ACTION_USB_PERMISSION);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED);
-        } else {
-            registerReceiver(receiver, filter);
-        }
-        try {
-            int flags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
-                    ? PendingIntent.FLAG_MUTABLE : 0;
-            PendingIntent pi = PendingIntent.getBroadcast(
-                    this, 0, new Intent(ACTION_USB_PERMISSION).setPackage(getPackageName()), flags);
-            usbManager.requestPermission(device, pi);
-            try {
-                // usbtap's accessibility service auto-taps the system dialog almost immediately;
-                // 10s comfortably covers that round trip without hanging the HTTP request forever.
-                boolean signalled = receiver.latch.await(10, TimeUnit.SECONDS);
-                return signalled && receiver.granted;
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return false;
-            }
-        } finally {
-            unregisterReceiver(receiver);
-        }
-    }
-
-    class UsbPermissionReceiver extends BroadcastReceiver {
-        final CountDownLatch latch = new CountDownLatch(1);
-        volatile boolean granted = false;
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            if (ACTION_USB_PERMISSION.equals(intent.getAction())) {
-                granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false);
-                latch.countDown();
-            }
         }
     }
 
@@ -1807,67 +1740,4 @@ public class PrinterService extends Service {
         }
     }
 
-    // ---- camera / torch -----------------------------------------------------------------------
-
-    public boolean cameraStart() {
-        // OnePlus's own camera policy rejects CameraManager.openCamera() outright while the
-        // screen is off (confirmed live: CameraAccessException CAMERA_DISABLED "disabled by
-        // policy" only with the screen off, works fine the instant it's on) - there's no public
-        // API to opt out of that OEM check, so this briefly wakes the screen for the open and
-        // locks it straight back once the camera's actually running, instead of leaving it lit
-        // for the whole camera session.
-        //
-        // wakeScreen()'s wake lock acquire() returns immediately - it does NOT wait for the
-        // display to actually finish powering on (panel wake, brightness ramp, keyguard
-        // transition). Calling openCamera() right after was a race that mostly lost: confirmed
-        // live via logcat, "OpFodDimControl: disable: display power status: off" logged only
-        // moments before repeated CAMERA_DISABLED failures on this exact code path. Give the
-        // screen real wall-clock time to settle before trying to open.
-        wakeScreen();
-        try {
-            Thread.sleep(700);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-        boolean ok = cameraController.start();
-        synchronized (this) {
-            state.cameraOn = ok;
-        }
-        if (ok) {
-            new Thread(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        Thread.sleep(1500);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        return;
-                    }
-                    lockScreen();
-                }
-            }, "PrintHostCameraRelock").start();
-        }
-        return ok;
-    }
-
-    public void cameraStop() {
-        cameraController.stop();
-        synchronized (this) {
-            state.cameraOn = false;
-        }
-    }
-
-    public byte[] cameraLatestFrame() {
-        return cameraController.getLatestFrame();
-    }
-
-    public boolean torch(boolean on) {
-        boolean ok = cameraController.setTorch(on);
-        if (ok) {
-            synchronized (this) {
-                state.torchOn = on;
-            }
-        }
-        return ok;
-    }
 }

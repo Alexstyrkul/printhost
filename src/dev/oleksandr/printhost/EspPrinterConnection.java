@@ -1,7 +1,5 @@
 package dev.oleksandr.printhost;
 
-import android.hardware.usb.UsbDevice;
-
 import org.json.JSONObject;
 
 import java.io.IOException;
@@ -57,7 +55,7 @@ public class EspPrinterConnection extends EspStoreConnection {
 
     /** Selecting the link and connecting send no gcode; a USB connect only sets the serial speed. */
     @Override
-    public synchronized boolean connect(UsbDevice preferredDevice) throws IOException {
+    public synchronized boolean connect() throws IOException {
         JSONObject st = statusFresh();
         String state = st.optString("state");
         boolean busy = "PRINTING".equals(state) || "PAUSED".equals(state);
@@ -126,6 +124,15 @@ public class EspPrinterConnection extends EspStoreConnection {
         String state = st.optString("state");
         if ("ERROR".equals(state) && st.optLong("bytesTotal") > 0 && st.optLong("bytesDone") < st.optLong("bytesTotal")) {
             throw new IOException("Printer bridge error: " + st.optString("error"));
+        }
+        // A rehearsal (dry run, e.g. started by curl for testing) drives the board's engine and
+        // "finished" counter exactly like a real print, but nothing was actually printed - never
+        // let this phone start tracking one as if it were the job it uploaded. Without this, a
+        // reconnect landing mid-rehearsal (resumeActiveSdPrintIfAny()) could pick it up, and its
+        // end would then look like a real print just finished: 100% stuck on the dashboard next
+        // to a Start button, and auto-shutoff wrongly armed for a run that never heated anything.
+        if (st.optBoolean("dry")) {
+            return "Not SD printing\nok";
         }
         long finished = st.optLong("finished");
         if (finished != finishedSeen) {

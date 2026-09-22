@@ -29,8 +29,15 @@ String printerStatusJson();
 bool printerSelectLink(const String &kind, String &err);  // "sim" | "usb" | "none"
 bool printerConnect(String &err);
 bool printerDisconnect(String &err);
-// dryLines > 0: rehearsal - heater commands are skipped and the run ends after that many lines (no heating needed).
-bool printerStartPrint(const String &file, String &err, uint32_t dryLines = 0);
+// dryLines > 0: rehearsal - heater commands are skipped and the run stops once file line dryLines
+// has been read (no heating needed). skipLines > 0: jump straight to that file line instead of
+// running the whole file up to it - only the first G28 before the target is sent for real (for a
+// homed reference); see runPrint()'s comment. Both are the SAME coordinate (the original file's
+// own line numbers, 1-based) - e.g. skip=220000&dry=225000 sends only lines 220000-225000, not
+// "225000 lines after the skip". dryLines must be greater than skipLines or nothing gets sent.
+// badEvery > 0: resend-recovery test - deliberately corrupt every Nth sent line's checksum so real
+// Marlin asks for a resend, to validate the FIFO resync path against real firmware (dry runs only).
+bool printerStartPrint(const String &file, String &err, uint32_t dryLines = 0, uint32_t skipLines = 0, uint32_t badEvery = 0);
 bool printerPause(String &err);
 bool printerResume(String &err);
 bool printerStop(String &err);

@@ -26,7 +26,6 @@ public abstract class EspStoreConnection extends PrinterConnection {
     protected String selectedName = null;
 
     protected EspStoreConnection(String espBase) {
-        super(null);
         this.espBase = espBase;
     }
 

@@ -39,9 +39,6 @@ public class PrinterState {
     public volatile Integer currentLayer = null; // null = unknown / file has no layer markers
     public volatile Integer totalLayers = null;
 
-    public volatile boolean cameraOn = false;
-    public volatile boolean torchOn = false;
-
     public volatile int batteryPercent = -1; // -1 = unknown
     public volatile boolean batteryCharging = false;
     public volatile boolean screenOn = false;
@@ -78,8 +75,6 @@ public class PrinterState {
             o.put("fanSpeed", fanSpeed == null ? JSONObject.NULL : fanSpeed);
             o.put("currentLayer", currentLayer == null ? JSONObject.NULL : currentLayer);
             o.put("totalLayers", totalLayers == null ? JSONObject.NULL : totalLayers);
-            o.put("cameraOn", cameraOn);
-            o.put("torchOn", torchOn);
             o.put("batteryPercent", batteryPercent);
             o.put("batteryCharging", batteryCharging);
             o.put("screenOn", screenOn);

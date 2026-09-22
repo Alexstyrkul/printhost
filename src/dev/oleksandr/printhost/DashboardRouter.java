@@ -41,6 +41,7 @@ public class DashboardRouter implements RequestRouter {
         if (path.equals("/esp/log")) return "/log";
         if (path.equals("/esp/log/sd")) return "/log/sd";
         if (path.equals("/esp/printer/status")) return "/printer/status";
+        if (path.equals("/esp/logs")) return "/logs";
         return null;
     }
 
@@ -194,26 +195,14 @@ public class DashboardRouter implements RequestRouter {
         } else if (p.equals("/resume") && req.method.equals("POST")) {
             boolean ok = service.resumePrint();
             writeJson(out, ok ? 200 : 409, resultJson(ok, service.getStateJson()));
-        } else if (p.equals("/camera/start") && req.method.equals("POST")) {
-            boolean ok = service.cameraStart();
-            writeJson(out, ok ? 200 : 502, resultJson(ok, service.getStateJson()));
-        } else if (p.equals("/camera/stop") && req.method.equals("POST")) {
-            service.cameraStop();
-            writeJson(out, 200, resultJson(true, service.getStateJson()));
-        } else if (p.equals("/camera/stream") && req.method.equals("GET")) {
-            streamMjpeg(out);
         } else if (p.equals("/camera/relay") && req.method.equals("GET")) {
             relayMjpeg(out);
         } else if (p.equals("/camera/relay/stats") && req.method.equals("GET")) {
             writeText(out, 200, "application/json", relay.statsJson());
+        } else if (p.equals("/esp/logs/read") && req.method.equals("GET")) {
+            proxyEspLogsRead(out, req);
         } else if (espProxyTarget(p) != null && req.method.equals("GET")) {
             proxyEspGet(out, espProxyTarget(p), req);
-        } else if (p.equals("/torch/on") && req.method.equals("POST")) {
-            boolean ok = service.torch(true);
-            writeJson(out, ok ? 200 : 502, resultJson(ok, service.getStateJson()));
-        } else if (p.equals("/torch/off") && req.method.equals("POST")) {
-            boolean ok = service.torch(false);
-            writeJson(out, ok ? 200 : 502, resultJson(ok, service.getStateJson()));
         } else if (p.equals("/camera/force") && req.method.equals("POST")) {
             service.setCameraForce("1".equals(req.queryParam("on")));
             writeJson(out, 200, resultJson(true, service.getStateJson()));
@@ -236,34 +225,6 @@ public class DashboardRouter implements RequestRouter {
         } catch (Exception ignored) {
         }
         writeJson(out, outcome.success ? 200 : 422, json);
-    }
-
-    private void streamMjpeg(OutputStream out) throws IOException {
-        String head = "HTTP/1.1 200 OK\r\n"
-                + "Content-Type: multipart/x-mixed-replace; boundary=" + MJPEG_BOUNDARY + "\r\n"
-                + "Connection: close\r\n"
-                + "Cache-Control: no-cache\r\n\r\n";
-        out.write(head.getBytes(StandardCharsets.US_ASCII));
-        out.flush();
-
-        int noFrameWaitMs = 0;
-        while (noFrameWaitMs < 8000) {
-            byte[] frame = service.cameraLatestFrame();
-            if (frame == null) {
-                noFrameWaitMs += 150;
-                sleepQuiet(150);
-                continue;
-            }
-            noFrameWaitMs = 0;
-            String partHeader = "--" + MJPEG_BOUNDARY + "\r\n"
-                    + "Content-Type: image/jpeg\r\n"
-                    + "Content-Length: " + frame.length + "\r\n\r\n";
-            out.write(partHeader.getBytes(StandardCharsets.US_ASCII));
-            out.write(frame);
-            out.write("\r\n".getBytes(StandardCharsets.US_ASCII));
-            out.flush();
-            sleepQuiet(150); // ~6-7 fps, plenty for monitoring a print
-        }
     }
 
     /** Raw bytes of whatever's currently loaded (PrinterService.uploadedFile), for the
@@ -390,12 +351,56 @@ public class DashboardRouter implements RequestRouter {
         }
     }
 
-    private static void sleepQuiet(long ms) {
+    /** GET /esp/logs/read?name=&from=&max= -> the board's /logs/read, forwarding those params and
+     *  the X-Log-* headers the viewer needs to know where in the file it just read (see the
+     *  board's own logsReadHandler for what they mean). */
+    private void proxyEspLogsRead(OutputStream out, HttpRequest req) throws IOException {
+        StringBuilder query = new StringBuilder();
+        appendEspParam(query, req, "name");
+        appendEspParam(query, req, "from");
+        appendEspParam(query, req, "max");
+        java.net.HttpURLConnection c = null;
         try {
-            Thread.sleep(ms);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+            c = (java.net.HttpURLConnection) new java.net.URL(
+                    "http://" + service.getEspHost() + "/logs/read" + query).openConnection();
+            c.setConnectTimeout(2500);
+            c.setReadTimeout(8000);
+            int code = c.getResponseCode();
+            InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
+            String type = c.getContentType();
+            StringBuilder head = new StringBuilder("HTTP/1.1 " + code + " " + statusText(code) + "\r\n"
+                    + "Content-Type: " + (type == null ? "text/plain" : type) + "\r\n"
+                    + "Access-Control-Expose-Headers: X-Log-Size, X-Log-From, X-Log-Next\r\n"
+                    + "Cache-Control: no-cache\r\n");
+            appendEspHeader(head, c, "X-Log-Size");
+            appendEspHeader(head, c, "X-Log-From");
+            appendEspHeader(head, c, "X-Log-Next");
+            head.append("Connection: close\r\n\r\n");
+            out.write(head.toString().getBytes(StandardCharsets.US_ASCII));
+            if (in != null) {
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                in.close();
+            }
+            out.flush();
+        } catch (IOException e) {
+            writeJson(out, 502, errorJson("camera board unreachable"));
+        } finally {
+            if (c != null) c.disconnect();
         }
+    }
+
+    private static void appendEspParam(StringBuilder query, HttpRequest req, String name) throws IOException {
+        String v = req.queryParam(name);
+        if (v.length() == 0) return;
+        query.append(query.length() == 0 ? '?' : '&').append(name).append('=')
+                .append(java.net.URLEncoder.encode(v, "UTF-8"));
+    }
+
+    private static void appendEspHeader(StringBuilder head, java.net.HttpURLConnection c, String name) {
+        String v = c.getHeaderField(name);
+        if (v != null) head.append(name).append(": ").append(v).append("\r\n");
     }
 
     private void writeDashboard(OutputStream out) throws IOException {

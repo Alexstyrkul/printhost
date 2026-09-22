@@ -19,6 +19,8 @@ struct Cmd {
   CmdType type;
   String arg;
   uint32_t timeoutMs = 0;
+  uint32_t arg2 = 0;  // C_START only: rehearsal skip target (file line number)
+  uint32_t arg3 = 0;  // C_START only: rehearsal resend-recovery test - corrupt every Nth sent line
   String reply;
   String err;
   bool ok = false;
@@ -31,7 +33,6 @@ portMUX_TYPE cmdMux = portMUX_INITIALIZER_UNLOCKED;
 SemaphoreHandle_t stMtx = nullptr;
 
 bool g_idlePoll = true;  // periodic M105 while idle (diagnostic switch)
-int traceBudget = 0;  // >0: log the next N lines exchanged (armed by a Resend, for post-mortems)
 PrinterLink *link = nullptr;      // only touched by the engine task (created via SELECT)
 String pendingLinkKind;           // set by printerSelectLink, consumed by the engine
 
@@ -41,6 +42,7 @@ String gLinkName = "none", gFile, gErr, gFw;
 uint32_t gBytesDone = 0, gBytesTotal = 0, gLines = 0, gFinished = 0;
 uint32_t gStartMs = 0, gPausedAtMs = 0, gPausedTotalMs = 0, gEndMs = 0;
 float gHot = 0, gHotT = 0, gBed = 0, gBedT = 0;
+bool gDry = false;  // true while gFile/gState reflect a rehearsal (dry run), not a real print
 
 void lock() { xSemaphoreTake(stMtx, portMAX_DELAY); }
 void unlock() { xSemaphoreGive(stMtx); }
@@ -100,20 +102,17 @@ void parseTemps(const char *line) {
 
 // ---- I/O helpers -------------------------------------------------------------------------------
 bool sendRaw(const char *s) {
-  if (traceBudget > 0) {
-    traceBudget--;
-    String t = s;
-    t.trim();
-    logEvent("TX %s", t.c_str());
-  }
   return link && link->writeBytes((const uint8_t *)s, strlen(s));
 }
 
 // Marlin's line format: "N<number> <command>*<xor of everything before the '*'>"
-void buildNumbered(uint32_t n, const char *text, char *out, size_t cap) {
+// corrupt: deliberately flips the checksum so Marlin rejects the line and asks for a resend -
+// resend-recovery testing only (see sendLine's `corrupt` parameter), never used outside a rehearsal.
+void buildNumbered(uint32_t n, const char *text, char *out, size_t cap, bool corrupt = false) {
   int len = snprintf(out, cap, "N%u %s", (unsigned)n, text);
   uint8_t cs = 0;
   for (int i = 0; i < len; i++) cs ^= (uint8_t)out[i];
+  if (corrupt) cs ^= 0xff;
   snprintf(out + len, cap - len, "*%u\n", (unsigned)cs);
 }
 
@@ -212,10 +211,6 @@ bool execGcode(const String &cmd, uint32_t timeoutMs, String &reply, String &err
   while (millis() - t0 < timeoutMs) {
     int n = link->readLine(buf, sizeof(buf), 100);
     if (n < 0) continue;
-    if (traceBudget > 0 && !strstr(buf, "echo:busy") && !strstr(buf, "T:")) {
-      traceBudget--;
-      logEvent("RX %s", buf);
-    }
     parseTemps(buf);
     reply += buf;
     reply += "\n";
@@ -444,9 +439,12 @@ bool ackHead(PrintRun &r, bool viaProbe) {
 }
 
 // Sends one numbered line (or a re-send). Returns false if the write failed.
-bool sendLine(PrintRun &r, uint32_t no, const char *text, uint32_t after, bool fresh) {
+// corrupt: send this one transmission with a deliberately wrong checksum (resend-recovery testing
+// only - see buildNumbered). Only ever passed true for a fresh send, never for the resend itself,
+// so the line always lands correctly on the retry.
+bool sendLine(PrintRun &r, uint32_t no, const char *text, uint32_t after, bool fresh, bool corrupt = false) {
   char out[256];
-  buildNumbered(no, text, out, sizeof(out));
+  buildNumbered(no, text, out, sizeof(out), corrupt);
   if (!sendRaw(out)) return false;
   Slot s;
   s.type = S_PRINT;
@@ -457,7 +455,7 @@ bool sendLine(PrintRun &r, uint32_t no, const char *text, uint32_t after, bool f
   s.sentMs = millis();
   // Log every command that is not a plain move (M*, G28, G29, G92...) and the first 40 lines, with its ack.
   s.traced = no <= 40 || !isMoveCmd(text);
-  if (s.traced) logEvent("TX N%u %s%s", (unsigned)no, text, fresh ? "" : " (resend)");
+  if (s.traced) logEvent("TX N%u %s%s%s", (unsigned)no, text, fresh ? "" : " (resend)", corrupt ? " (CORRUPTED for test)" : "");
   fifoPush(r, s);
   noteSend(r, s.len);
   return true;
@@ -477,7 +475,7 @@ bool sendPoll(PrintRun &r) {
   return true;
 }
 
-void runPrint(const String &path, uint32_t dryLines) {
+void runPrint(const String &path, uint32_t dryLines, uint32_t skipLines, uint32_t badEvery) {
   static PrintRun *rp = nullptr;
   if (!rp) rp = new PrintRun();
   PrintRun &r = *rp;
@@ -508,6 +506,56 @@ void runPrint(const String &path, uint32_t dryLines) {
 
   char rx[300];
   bool finished = false;
+  // Counts every line READ from the file, in both the skip scan below and the main loop further
+  // down - i.e. always the same file-line coordinate `dryLines` and `skipLines` are both given
+  // in, unlike r.lineNo (Marlin's own N-numbering, which only counts lines actually SENT and
+  // restarts at 1 after a skip - conflating the two once cost a rehearsal running ~200000 lines
+  // longer than intended, because "dry" was compared against r.lineNo instead of this).
+  uint32_t fileLineNo = 0;
+
+  if (dryLines > 0 && skipLines > 0 && dryLines <= skipLines) {
+    setError("dry must be greater than skip - nothing would be sent");
+    goto done;
+  }
+
+  // Rehearsal-only: jump straight to file line `skipLines` instead of reading/discarding the
+  // whole run-up in real time (a dry run otherwise runs at real Marlin ack speed - reaching line
+  // 200000+ this way can take the better part of an hour). Every line before the target is read
+  // and thrown away WITHOUT sending it, except the first G28 found, which is sent for real and
+  // waited on synchronously (execGcode) - so the machine has an actual homed reference position
+  // before the big positioning jump that follows. If no G28 turns up before the target, refuse:
+  // jumping into arbitrary coordinates from an unknown physical position is not safe to guess at.
+  if (skipLines > 0) {
+    logEvent("printer: rehearsal skip - scanning to file line %u", (unsigned)skipLines);
+    char scan[256];
+    uint32_t after = 0;
+    bool homed = false;
+    while (fileLineNo < skipLines) {
+      int got = r.rd.next(scan, sizeof(scan), after);
+      if (got == 0) break;             // file shorter than the skip target
+      if (got == -1) { delay(5); continue; }  // SD busy, retry
+      if (got == -2) { fileLineNo++; continue; }  // line too long to buffer - ignore during scan
+      fileLineNo++;
+      if (!homed && !strncmp(scan, "G28", 3)) {
+        String reply, gerr;
+        logEvent("printer: rehearsal skip - homing ('%s')", scan);
+        if (!execGcode(String(scan), 30000, reply, gerr)) {
+          setError("rehearsal skip: homing failed - " + gerr);
+          goto done;
+        }
+        homed = true;
+      }
+    }
+    lock();
+    gBytesDone = after;
+    unlock();
+    if (!homed) {
+      setError("rehearsal skip: no G28 found before line " + String(skipLines) + " - refusing to jump unhomed");
+      goto done;
+    }
+    logEvent("printer: rehearsal skip done at file line %u (%u bytes)", (unsigned)fileLineNo, (unsigned)after);
+  }
+
   link->flushInput();
   r.lastRx = millis();
   r.nextPoll = millis() + 2000;
@@ -575,10 +623,6 @@ void runPrint(const String &path, uint32_t dryLines) {
       r.lastRx = now;
       r.wRx += (uint32_t)n + 1;
       if (r.resync) r.resyncUntil = now + 250;  // still noisy: keep waiting
-      if (traceBudget > 0 && !strstr(rx, "echo:busy") && !strstr(rx, "T:")) {
-        traceBudget--;
-        logEvent("RX %s", rx);
-      }
       parseTemps(rx);
       if (strncmp(rx, "ok", 2) == 0) {
         if (r.resync) {
@@ -619,7 +663,6 @@ void runPrint(const String &path, uint32_t dryLines) {
         if (!r.resync) {
           r.resync = true;
           r.resends++;
-          traceBudget = 6;
           logEvent("printer: %s - pausing to resynchronise (%d in flight)", rx, r.fn);
         }
         r.resyncUntil = now + 250;
@@ -652,6 +695,12 @@ void runPrint(const String &path, uint32_t dryLines) {
             break;
           }
       }
+      // If the M400 end-of-file marker was in flight, fifoClear() just wiped the only thing that
+      // would ever have matched its "ok" - without this, a resync landing right at the end of a
+      // print (rare, but real: reproduced with badEvery testing) leaves the engine waiting
+      // forever for a completion that already happened on the wire. Letting `r.eof && !finishSent`
+      // fire again below resends M400 and re-tracks it properly. Sending M400 twice is harmless.
+      if (r.finishSent) r.finishSent = false;
       fifoClear(r);
       r.resync = false;
       r.lastGood = 0;
@@ -715,13 +764,14 @@ void runPrint(const String &path, uint32_t dryLines) {
 
       // the next gcode line (read once, kept until it can be sent)
       if (!r.pendValid && !r.eof) {
-        if (dryLines && r.lineNo >= dryLines) {
+        if (dryLines && fileLineNo >= dryLines) {
           r.eof = true;  // rehearsal length reached
-          logEvent("printer: rehearsal - %u lines sent, finishing", (unsigned)r.lineNo);
+          logEvent("printer: rehearsal - reached file line %u, finishing", (unsigned)fileLineNo);
         } else {
           uint32_t after = 0;
           int got = r.rd.next(r.pend, sizeof(r.pend), after);
           if (got == 1) {
+            fileLineNo++;
             if (dryLines && isHeatCmd(r.pend)) {
               logEvent("rehearsal: skipped %s", r.pend);  // not sent, not numbered
               lock();
@@ -751,7 +801,11 @@ void runPrint(const String &path, uint32_t dryLines) {
         h.after = r.pendAfter;
         strlcpy(h.text, r.pend, sizeof(h.text));
         r.pendValid = false;
-        if (!sendLine(r, h.n, h.text, h.after, true)) {
+        // Resend-recovery test only (dry runs, badEvery>0): deliberately corrupt every Nth fresh
+        // line's checksum so real Marlin rejects it and asks for a resend - proves the FIFO resync
+        // path against real firmware, not just the simulator.
+        bool corruptThis = dryLines && badEvery && (r.lineNo % badEvery == 0);
+        if (!sendLine(r, h.n, h.text, h.after, true, corruptThis)) {
           safeShutdown();
           setError("write to printer failed");
           goto done;
@@ -916,7 +970,6 @@ void handleCmd(Cmd *c) {
         c->err = "that command is blocked for safety";
         break;
       }
-      traceBudget = 20;  // log the exchange verbatim (TX/RX) while diagnosing
       c->ok = execGcode(c->arg, c->timeoutMs, c->reply, c->err);
       if (c->ok && c->arg.startsWith("M115")) {
         int i = c->reply.indexOf("FIRMWARE_NAME");
@@ -947,11 +1000,14 @@ void handleCmd(Cmd *c) {
       lock();
       gFile = c->arg;
       gState = PS_PRINTING;
+      gDry = c->timeoutMs > 0;
       unlock();
       c->ok = true;
       uint32_t dry = c->timeoutMs;  // rehearsal length, read before the command is released
+      uint32_t skip = c->arg2;      // rehearsal skip target, same
+      uint32_t badEvery = c->arg3;  // rehearsal resend-recovery test, same
       finishCmd(c);  // answer the HTTP request now; the print itself runs below
-      runPrint(path, dry);
+      runPrint(path, dry, skip, badEvery);
       return;
     }
     default:
@@ -971,11 +1027,14 @@ void engineTask(void *) {
 }
 
 // Posts a command and waits for the engine's answer.
-bool post(CmdType type, const String &arg, uint32_t timeoutMs, String *reply, String &err, uint32_t waitMs) {
+bool post(CmdType type, const String &arg, uint32_t timeoutMs, String *reply, String &err, uint32_t waitMs, uint32_t arg2 = 0,
+          uint32_t arg3 = 0) {
   Cmd *c = new Cmd();
   c->type = type;
   c->arg = arg;
   c->timeoutMs = timeoutMs;
+  c->arg2 = arg2;
+  c->arg3 = arg3;
   c->done = xSemaphoreCreateBinary();
   if (xQueueSend(cmdQ, &c, pdMS_TO_TICKS(1000)) != pdTRUE) {
     vSemaphoreDelete(c->done);
@@ -1012,12 +1071,12 @@ void printerBegin() {
 bool printerSelectLink(const String &kind, String &err) { return post(C_SELECT, kind, 0, nullptr, err, 5000); }
 bool printerConnect(String &err) { return post(C_CONNECT, "", 0, nullptr, err, 20000); }
 bool printerDisconnect(String &err) { return post(C_DISCONNECT, "", 0, nullptr, err, 5000); }
-bool printerStartPrint(const String &file, String &err, uint32_t dryLines) {
+bool printerStartPrint(const String &file, String &err, uint32_t dryLines, uint32_t skipLines, uint32_t badEvery) {
   if (!fileNameOk(file)) {
     err = "bad file name";
     return false;
   }
-  return post(C_START, file, dryLines, nullptr, err, 8000);
+  return post(C_START, file, dryLines, nullptr, err, 8000, skipLines, badEvery);
 }
 bool printerPause(String &err) { return post(C_PAUSE, "", 0, nullptr, err, 5000); }
 bool printerResume(String &err) { return post(C_RESUME, "", 0, nullptr, err, 5000); }
@@ -1073,7 +1132,7 @@ String printerStatusJson() {
            (int)g_window, gDepth, gLps, gRttAvgUs / 1000.0f, gRttMaxUs / 1000.0f, gGapAvgUs / 1000.0f, gGapMaxUs / 1000.0f, (unsigned)gTxBps, (unsigned)gRxBps,
            (unsigned)gResendsTotal);
   out += st;
-  out += ",\"fw\":\"" + fw + "\",\"error\":\"" + err + "\"}";
+  out += ",\"fw\":\"" + fw + "\",\"error\":\"" + err + "\",\"dry\":" + (gDry ? "true" : "false") + "}";
   unlock();
   return out;
 }

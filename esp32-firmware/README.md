@@ -34,10 +34,13 @@ export PRINTHOST_OTA_PASS=<OTA_PASS>; uvx --from platformio pio run -e esp32s3_o
 
 ## HTTP API (port 80 unless noted)
 
-- `GET /status` `GET /log` `GET /capture` `GET :81/stream` (one viewer at a time)
+- `GET /status` `GET /log` (RAM ring, streamed) `GET /log/sd` (alias: tail of the newest log file) `GET /capture` `GET :81/stream` (one viewer at a time)
+- `GET /logs` (list of `/logs/log-NNNN.txt` files: name, size, current) `GET /logs/read?name=&from=&max=` (a piece of one file; without `from` it is the tail, headers `X-Log-Size`/`X-Log-From`/`X-Log-Next`)
 - `POST /camera?on=1|0` power the camera; `GET /control?var=profile&val=fast|balanced|sharp|xga|sxga`
 - `POST /files?name=<n>` (raw body, streamed, returns bytes + crc32), `GET /files`, `POST /files/delete?name=<n>`
-- `GET /printer/status`; `POST /printer/{link?kind=usb|sim|none, connect, disconnect, print?file=, pause, resume, stop, gcode?cmd=&timeout=, sim?speed=&resendEvery=, usbtune?...}`
+- `GET /printer/status` (includes `dry`: true while the active/last run was a rehearsal); `POST /printer/{link?kind=usb|sim|none, connect, disconnect, print?file=&dry=N&skip=M&badEvery=K, pause, resume, stop, gcode?cmd=&timeout=, sim?speed=&resendEvery=&latency=, window?n=}`
+  - `skip=M` (rehearsal only, needs `dry`): jump straight to file line M instead of reading up to it in real time. Only the first `G28` before M is sent for real (for a homed reference) - refuses to run if none is found. `dry` and `skip` are the SAME coordinate (the file's own line numbers) - `skip=220000&dry=225000` sends lines 220000-225000, not "225000 more lines after the skip"; `dry` must be greater than `skip`.
+  - `badEvery=K` (rehearsal only, needs `dry`): deliberately corrupts every Kth sent line's checksum so real Marlin rejects it and asks for a resend - for validating the FIFO resync path against real firmware.
 - `POST /wifi` (form ssid/pass) - used by the setup AP page. OTA: ArduinoOTA, host `printhost-cam`.
 
 Safety: nothing is sent to the printer until a client selects the `usb` link and connects; connect only performs USB control transfers, then the app reads `M115`/`M851`/`M105`. DTR/RTS are never touched.
