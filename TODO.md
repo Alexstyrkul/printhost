@@ -69,6 +69,10 @@ Tasks:
 - [x] The phone attaches whenever the board is IDLE/PRINTING/PAUSED and the phone is detached (checked every 4 s), without re-opening the link.
 - Verified: after a board reboot it connected at 4 s and the phone attached by itself; phone Disconnect stayed off; Connect worked. **Not yet verified: switching the printer off/on by hand** (needs the user).
 
+## Upload speed check (after the current print)
+- [ ] File upload to the board measured ~200 KB/s from the Mac (earlier phone->board ~270 KB/s). Suspect DYNAMIC_RX 32->20 (uploads are RX, and only TX was A/B-tested) or evening congestion. Interleaved A/B of DYNAMIC_RX 20 vs 32 measuring upload speed AND the heap minimum; never during a print.
+- [ ] Board reset reason POWERON during an upload on 2026-09-24 (power loss, not a crash): ask/confirm whether the board is powered from the printer's smart plug.
+
 ## Finding the phone without a fixed IP
 - [x] `http://OnePlus-6T:8899/` (the ASUS resolves the phone's DHCP name) and `http://printhost-cam.local/app` (the board redirects to the phone's last-seen IP, learned from its Dalvik requests). Both verified from the Mac.
 
