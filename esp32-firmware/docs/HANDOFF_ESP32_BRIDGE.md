@@ -175,3 +175,59 @@ The failure loop this produced was self-obscuring: a connect attempt would actua
 **Fix:** `dev` is now only ever read-and-cleared atomically (`claimDevForClose()`, a `portENTER_CRITICAL`-guarded compare-and-take), so at most one of the two contexts ever gets a non-null handle to close - the other sees it already gone and does nothing. Verified with 4 back-to-back connect/disconnect cycles against the real printer (previously guaranteed to crash within 1-2 cycles): all 4 succeeded cleanly, zero reboots, real temperatures read back on one of them.
 
 **Lesson for next time:** when a USB/hardware "can't connect" symptom doesn't match what the user reports about the physical setup, get live UART serial before spending more time on the HTTP/SD-log API - ESP-IDF's own component-level panics (this one from a vendored driver, not our code) never make it into the app's own SD log, only onto serial right before the reboot.
+
+---
+# UPDATE 2026-09-24 - Wi-Fi "deaf" incidents, resilience, fps work (supersedes the addresses and Wi-Fi notes above)
+
+**Open work now lives in `/TODO.md`** (repo root). The deferred framework upgrade is planned in `docs/IDF5_MIGRATION.md`.
+
+**Addresses:**
+- The phone moved to **5 GHz (`Vasiliy_Pro_5G`) and is now `192.168.50.37`** (on the 2.4 GHz SSID it uses another random MAC and gets `.85`). adb: `192.168.50.37:5555`.
+- IPs are not reserved in the router (the user skipped router-side work). Open the dashboard by name instead:
+  - `http://OnePlus-6T:8899/` - the ASUS resolves DHCP names;
+  - `http://printhost-cam.local/app` - the board redirects to the phone's last-seen IP.
+- Router: ASUS TUF-AX3000 V2, 2.4 GHz fixed on **channel 1 / 20 MHz**, auto-channel off. Upstream is the ISP gateway CGA2121 (192.168.0.1, no admin access, its own Wi-Fi on ch1). Signal at the board: -51..-60 dBm (the old "-65..-71" note is stale).
+- Changing the router channel restarts both bands. The phone then may fall back to the 2.4 GHz SSID; the user will turn off auto-join for it.
+
+**Two "deaf while associated" incidents (analysed from the SD log, `~/Downloads/printhost_log_2026-09-24_print2.txt`):**
+- What happened: RX died while the board stayed associated. ARP to it failed everywhere and the router listed it with 0 traffic.
+  - Once for ~1 h, until `wifi: DISCONNECTED reason 16` (group-key timeout, because EAPOL was not received either).
+  - Once until a power cycle.
+- Not heap. Both happened during a phone-relay stream on the congested ch1. It matches esp-idf #13212 (S3, IDF 4.4).
+- The print (USB, SD) was never affected.
+
+**Firmware changes (main.cpp):**
+- **No reboot on Wi-Fi loss any more** (user decision).
+- One reconnect owner (Arduino auto-reconnect off): an all-channel scan, 10/20/30 s backoff, a started attempt is never cut short. The old 5 s `WiFi.reconnect()` loop could not follow a router channel change.
+- **RX watchdog.** The gateway is pinged every 5 s. Also counted as proof of RX: a new incoming TCP connection (httpd `open_fn`) and a sent stream frame. If nothing proves RX for 45 s, the board disconnects and rejoins. Tests: `POST /debug/wifi?test=deaf` (rejoined after 45 s, back in 6-8 s) and `?test=setup`.
+- If the router is unreachable at boot, the board runs AP+STA and retries the router every 30 s. Before, it stayed in setup-AP mode forever.
+- **Own MJPEG server task on :81** replaces esp_http_server for the stream:
+  - a new viewer replaces the old one (a stale tab or dead relay no longer blocks);
+  - TCP keepalive ~15 s, 5 s send timeout;
+  - sending pauses below 20 KB free internal RAM and resumes above 32 KB.
+- Log reads: `/logs/read` is capped at 32 KB, answers 503 + Retry-After below 36 KB free internal RAM, and uses PSRAM buffers. The dashboard retries on 503.
+- Camera: ON at boot. Default profile **VGA "fast"**, saved in NVS `cam/profile`, switchable on the fly. XCLK stays **20 MHz**: 24 MHz gave corrupted frames; 20 MHz's harmonic at 2420 MHz is inside ch1, but ch1 is still the best of 1/6/11 for it.
+- Diagnostics:
+  - every SD sample line has `gw=ok/lost rtt=avg/max`;
+  - `/status` has `channel`;
+  - `GET /debug/wifi` (counters);
+  - `GET /debug/tx?sec=N` (raw upload test);
+  - `GET /debug/survey?ms=1000` (async per-channel air time; the board leaves the router for ~13 x ms; refused while printing), result via `?result=1`;
+  - `/control?var=xclk|tos|fpscap`.
+- **sdkconfig:** the Wi-Fi options had IDF 5 names and were silently ignored on IDF 4.4. `sdkconfig.defaults` now uses `CONFIG_ESP32_WIFI_*`; values are STATIC_RX 16, DYNAMIC_RX 20, RX_BA_WIN 16, TX_BA_WIN 16. The A/B test gave raw upload +40%.
+
+**Phone app / dashboard:**
+- PollerThread no longer gives up on a network gap. It keeps PRINTING and shows "Board not reachable...", while a "Printer bridge error" is still an error.
+- AutoConnectThread re-attaches whenever the board reports PRINTING/PAUSED. The first auto-connect after the plug goes on waits 20 s, and failures are quiet for 2 min.
+- Start is hidden while the board prints.
+- Camera switch via `POST /camera/set`; it no longer follows the plug. "Printer" connect switch restored.
+- Sidebar "Camera quality": VGA (smooth) / XGA (sharp), via `POST /camera/quality`.
+
+**Fps findings:**
+- On ch1 in the evening: VGA ~20-23 fps (was avg 8-10 with drops to 1).
+- ch11 was far worse (0.1-3 fps). The router's receive side hears a 40 MHz network overlapping ch6-11, which the board cannot hear. Survey both ends and confirm with real throughput.
+- Video priority (IP_TOS AC_VI) showed no consistent gain (off).
+- VGA gives ~1.5x the fps of XGA.
+
+**Verified:** watchdog, rejoin, setup fallback, viewer replacement, the phone re-attaching to a simulator print and surviving a 30 s board outage, log reads under stream load.
+**Not yet verified:** all of the above during a real print.
