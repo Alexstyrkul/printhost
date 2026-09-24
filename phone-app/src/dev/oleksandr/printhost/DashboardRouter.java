@@ -203,9 +203,13 @@ public class DashboardRouter implements RequestRouter {
             proxyEspLogsRead(out, req);
         } else if (espProxyTarget(p) != null && req.method.equals("GET")) {
             proxyEspGet(out, espProxyTarget(p), req);
-        } else if (p.equals("/camera/force") && req.method.equals("POST")) {
-            service.setCameraForce("1".equals(req.queryParam("on")));
-            writeJson(out, 200, resultJson(true, service.getStateJson()));
+        } else if (p.equals("/camera/quality") && req.method.equals("POST")) {
+            boolean ok = service.setCameraQuality(req.queryParam("profile"));
+            writeJson(out, 200, resultJson(ok, service.getStateJson()));
+        } else if ((p.equals("/camera/set") || p.equals("/camera/force")) && req.method.equals("POST")) {
+            // /camera/force: the old name, kept so a dashboard still open from before the update works
+            boolean ok = service.setCamera("1".equals(req.queryParam("on")));
+            writeJson(out, 200, resultJson(ok, service.getStateJson()));
         } else if (p.equals("/gcode/current") && req.method.equals("GET")) {
             writeUploadedGcode(out);
         } else if (p.equals("/gcode/cached") && req.method.equals("GET")) {

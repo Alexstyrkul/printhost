@@ -55,7 +55,6 @@ public class PrinterService extends Service {
     private PollerThread pollerThread;
     private TempPollerThread tempPollerThread;
     private PlugPollerThread plugPollerThread;
-    private CameraSyncThread cameraSyncThread;
     private AutoConnectThread autoConnectThread;
     private ScheduledPrintPollerThread scheduledPrintPollerThread;
     private File uploadedFile;
@@ -80,7 +79,6 @@ public class PrinterService extends Service {
         espHost = prefs.getString("esp_host", espHost);
         // The printer is always driven by the ESP32 board; this phone never opens USB.
         printerConnection = new EspPrinterConnection("http://" + espHost, "usb");
-        state.cameraForce = prefs.getBoolean("camera_force", false);
         macNotifier = new MacNotifier(this);
         sdFilenameMap = new SdFilenameMap(new File(getFilesDir(), "sd_filename_map.json"));
         gcodeCacheSizeMap = new GcodeCacheSizeMap(new File(getFilesDir(), "gcode_cache_sizes.json"));
@@ -103,8 +101,6 @@ public class PrinterService extends Service {
 
         plugPollerThread = new PlugPollerThread();
         plugPollerThread.start();
-        cameraSyncThread = new CameraSyncThread();
-        cameraSyncThread.start();
         autoConnectThread = new AutoConnectThread();
         autoConnectThread.start();
 
@@ -136,7 +132,6 @@ public class PrinterService extends Service {
         stopPoller();
         stopTempPoller();
         if (plugPollerThread != null) plugPollerThread.requestStop();
-        if (cameraSyncThread != null) cameraSyncThread.requestStop();
         if (autoConnectThread != null) autoConnectThread.requestStop();
         if (scheduledPrintPollerThread != null) scheduledPrintPollerThread.requestStop();
         if (stateBroadcasterThread != null) stateBroadcasterThread.requestStop();
@@ -452,6 +447,11 @@ public class PrinterService extends Service {
      * is actually trying to recover from DISCONNECTED or ERROR.
      */
     public boolean connectPrinter() {
+        return connectPrinter(false);
+    }
+
+    /** quiet: an automatic attempt while the printer may still be booting - a failure is not shown as an error. */
+    private boolean connectPrinter(boolean quiet) {
         synchronized (commandLock) {
             if (printerConnection.isOpen()) {
                 printerConnection.disconnect();
@@ -478,9 +478,15 @@ public class PrinterService extends Service {
                 }
                 return true;
             } catch (IOException | TimeoutException e) {
-                Log.e(TAG, "connectPrinter failed", e);
-                state.phase = PrinterState.Phase.ERROR;
-                state.lastError = String.valueOf(e.getMessage());
+                if (quiet) {
+                    Log.i(TAG, "auto connect not yet: " + e.getMessage());
+                    state.phase = PrinterState.Phase.DISCONNECTED;
+                    state.lastError = "";
+                } else {
+                    Log.e(TAG, "connectPrinter failed", e);
+                    state.phase = PrinterState.Phase.ERROR;
+                    state.lastError = String.valueOf(e.getMessage());
+                }
                 printerConnection.disconnect();
                 return false;
             }
@@ -543,11 +549,44 @@ public class PrinterService extends Service {
         return name.isEmpty() ? null : name;
     }
 
-    /** Testing switch: keep the camera on even when the printer's plug is off. */
-    public void setCameraForce(boolean on) {
-        state.cameraForce = on;
-        getSharedPreferences("printhost", MODE_PRIVATE).edit().putBoolean("camera_force", on).apply();
-        if (cameraSyncThread != null) cameraSyncThread.wakeNow();
+    /**
+     * Switches the board's camera on or off. The board powers the camera up on its own at boot; after that
+     * only the user changes it (the camera no longer follows the printer plug), at any time, printing or not.
+     */
+    public boolean setCamera(boolean on) {
+        try {
+            java.net.HttpURLConnection c = (java.net.HttpURLConnection)
+                    new java.net.URL("http://" + espHost + "/camera?on=" + (on ? 1 : 0)).openConnection();
+            c.setRequestMethod("POST");
+            c.setConnectTimeout(3000);
+            c.setReadTimeout(8000);  // powering the camera up re-initialises the sensor: a second or two
+            c.setFixedLengthStreamingMode(0);
+            c.setDoOutput(true);
+            c.getOutputStream().close();
+            int code = c.getResponseCode();
+            c.disconnect();
+            return code == 200;
+        } catch (IOException e) {
+            Log.w(TAG, "camera switch failed", e);
+            return false;
+        }
+    }
+
+    /** Camera quality on the board: "fast" (VGA) or "xga"; the board saves it and switches on the fly. */
+    public boolean setCameraQuality(String profile) {
+        if (profile == null || !profile.matches("fast|xga")) return false;
+        try {
+            java.net.HttpURLConnection c = (java.net.HttpURLConnection)
+                    new java.net.URL("http://" + espHost + "/control?var=profile&val=" + profile).openConnection();
+            c.setConnectTimeout(3000);
+            c.setReadTimeout(10000);  // re-initialising the camera takes a second or two
+            int code = c.getResponseCode();
+            c.disconnect();
+            return code == 200;
+        } catch (IOException e) {
+            Log.w(TAG, "camera quality change failed", e);
+            return false;
+        }
     }
 
     /** Address of the ESP32 board that drives the printer and stores the gcode files. */
@@ -1322,17 +1361,14 @@ public class PrinterService extends Service {
 
     private static final long AUTO_CONNECT_WINDOW_MS = 120000;
     private static final long AUTO_CONNECT_RETRY_MS = 6000;
+    /** After the plug goes on the printer's mainboard and its USB chip need a moment to boot: don't knock before. */
+    private static final long AUTO_CONNECT_FIRST_DELAY_MS = 20000;
+    private static final long REATTACH_CHECK_MS = 10000;
 
-    /**
-     * When the printer's plug goes on, connect the ESP32 board to the printer by itself: the board is of no use
-     * without it. The printer needs a few seconds to boot and show up on the board's USB port, so it retries
-     * every few seconds for two minutes after the plug came on (or after this app started with the plug already
-     * on). It only ever acts while the phase is DISCONNECTED/ERROR, so it never touches a print in progress.
-     */
     class AutoConnectThread extends Thread {
         private volatile boolean stopRequested = false;
         private boolean prevPlugOn = false;
-        private long windowEnd = 0, lastAttempt = 0;
+        private long windowEnd = 0, lastAttempt = 0, lastReattachCheck = 0;
 
         AutoConnectThread() {
             super("PrintHostAutoConnect");
@@ -1354,12 +1390,25 @@ public class PrinterService extends Service {
                     long now = System.currentTimeMillis();
                     if (plug && !prevPlugOn) {
                         windowEnd = now + AUTO_CONNECT_WINDOW_MS;
-                        lastAttempt = 0;
+                        lastAttempt = now - AUTO_CONNECT_RETRY_MS + AUTO_CONNECT_FIRST_DELAY_MS;  // first try after the delay
                     }
                     prevPlugOn = plug;
+                    PrinterState.Phase ph = state.phase;
+                    boolean detached = ph == PrinterState.Phase.DISCONNECTED || ph == PrinterState.Phase.ERROR;
+                    // The board is running a print but this phone is not watching it (a Wi-Fi gap, an app restart):
+                    // attach to it again. Independent of the plug; connecting sends the printer nothing while it prints.
+                    if (detached && printerConnection instanceof EspPrinterConnection && now - lastReattachCheck >= REATTACH_CHECK_MS) {
+                        lastReattachCheck = now;
+                        String bs = ((EspPrinterConnection) printerConnection).boardState();
+                        if (bs.equals("PRINTING") || bs.equals("PAUSED")) {
+                            Log.i(TAG, "the board is " + bs + " - re-attaching");
+                            connectPrinter(true);
+                            continue;
+                        }
+                    }
                     // The board restarted (or lost the printer) behind our back: we still think we are connected. Drop the
                     // stale state and connect again. Only while idle - a print on the board is never touched.
-                    if (plug && state.phase == PrinterState.Phase.IDLE && printerConnection instanceof EspPrinterConnection) {
+                    if (plug && ph == PrinterState.Phase.IDLE && printerConnection instanceof EspPrinterConnection) {
                         String bs = ((EspPrinterConnection) printerConnection).boardState();
                         if (bs.equals("NO_LINK") || bs.equals("DISCONNECTED") || bs.equals("ERROR")) {
                             Log.w(TAG, "board reports " + bs + " while we show connected - reconnecting");
@@ -1368,99 +1417,26 @@ public class PrinterService extends Service {
                             lastAttempt = 0;
                         }
                     }
-                    if (!plug || now > windowEnd) continue;
-                    PrinterState.Phase ph = state.phase;
+                    if (!plug || windowEnd == 0) continue;
+                    ph = state.phase;
                     if (ph != PrinterState.Phase.DISCONNECTED && ph != PrinterState.Phase.ERROR) {
                         if (ph != PrinterState.Phase.CONNECTING) windowEnd = 0;  // connected (or busy): nothing to do
                         continue;
                     }
                     if (now - lastAttempt < AUTO_CONNECT_RETRY_MS) continue;
                     lastAttempt = now;
-                    boolean ok = connectPrinter();
-                    if (ok) {
+                    // Quiet while the printer may still be booting: no error flashes on the dashboard.
+                    if (connectPrinter(true)) {
                         windowEnd = 0;
-                    } else if (System.currentTimeMillis() < windowEnd) {
-                        // Still booting: keep the dashboard calm instead of flashing an error on every try.
-                        synchronized (commandLock) {
-                            if (state.phase == PrinterState.Phase.ERROR) {
-                                state.phase = PrinterState.Phase.DISCONNECTED;
-                                state.lastError = "";
-                            }
-                        }
+                    } else if (now + AUTO_CONNECT_RETRY_MS > windowEnd) {
+                        windowEnd = 0;
+                        state.lastError = "The printer did not answer within 2 minutes after the plug turned on - press Connect to try again";
                     }
                 } catch (InterruptedException e) {
                     break;
                 } catch (Exception e) {
                     Log.w(TAG, "auto connect failed (non-fatal)", e);
                 }
-            }
-        }
-    }
-
-    /**
-     * The camera on the ESP32 board is powered only while the printer's smart plug is on (the board itself
-     * always runs). The phone owns the plug, so it tells the board: every few seconds it pushes the desired
-     * camera state, which also re-syncs a board that rebooted and forgot. Unknown plug state (Tapo
-     * unreachable) leaves the camera as it is.
-     */
-    class CameraSyncThread extends Thread {
-        private volatile boolean stopRequested = false;
-        private Boolean lastSent = null;
-        private long lastSentAt = 0;
-
-        CameraSyncThread() {
-            super("PrintHostCameraSync");
-        }
-
-        void requestStop() {
-            stopRequested = true;
-            interrupt();
-        }
-
-        void wakeNow() {
-            interrupt();
-        }
-
-        @Override
-        public void run() {
-            while (!stopRequested) {
-                try {
-                    try {
-                        Thread.sleep(3000);
-                    } catch (InterruptedException e) {
-                        if (stopRequested) break;  // otherwise: woken early to apply a change right away
-                    }
-                    // Forced on (testing) wins; otherwise the camera follows the printer's plug.
-                    Boolean want = state.cameraForce ? Boolean.TRUE : state.plugOn;
-                    if (want == null) continue;
-                    long now = System.currentTimeMillis();
-                    if (lastSent == null || lastSent.booleanValue() != want.booleanValue() || now - lastSentAt > 30000) {
-                        if (postCamera(want.booleanValue())) {
-                            lastSent = want;
-                            lastSentAt = now;
-                        }
-                    }
-                } catch (Exception e) {
-                    Log.w(TAG, "camera sync failed (non-fatal)", e);
-                }
-            }
-        }
-
-        private boolean postCamera(boolean on) {
-            try {
-                java.net.HttpURLConnection c = (java.net.HttpURLConnection)
-                        new java.net.URL("http://" + espHost + "/camera?on=" + (on ? 1 : 0)).openConnection();
-                c.setRequestMethod("POST");
-                c.setConnectTimeout(2000);
-                c.setReadTimeout(4000);
-                c.setFixedLengthStreamingMode(0);
-                c.setDoOutput(true);
-                c.getOutputStream().close();
-                int code = c.getResponseCode();
-                c.disconnect();
-                return code == 200;
-            } catch (java.io.IOException e) {
-                return false;  // board unreachable right now; the next round tries again
             }
         }
     }
@@ -1532,15 +1508,33 @@ public class PrinterService extends Service {
                     break;
                 } catch (Exception e) {
                     consecutiveFailures++;
-                    Log.w(TAG, "poll failed (" + consecutiveFailures + ")", e);
-                    if (consecutiveFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
+                    String msg = String.valueOf(e.getMessage());
+                    if (consecutiveFailures <= MAX_CONSECUTIVE_POLL_FAILURES || consecutiveFailures % 40 == 0) {
+                        Log.w(TAG, "poll failed (" + consecutiveFailures + ")", e);
+                    }
+                    if (msg.startsWith("Printer bridge error")) {
+                        // The board itself reports the print failed: that is a real error.
                         synchronized (PrinterService.this) {
                             state.phase = PrinterState.Phase.ERROR;
-                            state.lastError = "Printer stopped responding";
+                            state.lastError = msg;
                         }
                         macNotifier.notifyAsync("error");
-                        updateNotification("Printer not responding");
+                        updateNotification("Print error");
                         break;
+                    }
+                    if (consecutiveFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
+                        // The board is out of reach (Wi-Fi gap, router restart...). The print runs on the board
+                        // from its own SD card and does not need this phone, so never give up on it: keep the
+                        // phase, say what is going on, and keep asking until the board answers again.
+                        synchronized (PrinterService.this) {
+                            state.lastError = "Board not reachable - the print keeps running on the board; reconnecting...";
+                        }
+                        if (consecutiveFailures == MAX_CONSECUTIVE_POLL_FAILURES) updateNotification("Board not reachable - retrying");
+                        try {
+                            Thread.sleep(3000);  // no need to hammer an unreachable board every 1.5 s
+                        } catch (InterruptedException ie) {
+                            break;
+                        }
                     }
                 }
             }

@@ -224,6 +224,17 @@
   .section-label { font-size: 10.5px; font-weight: 700; color: var(--text-faint); text-transform: uppercase;
                      letter-spacing: 0.5px; margin: 6px 2px 0; }
 
+  .quality-list { display: flex; flex-direction: column; gap: 6px; }
+  .quality-row { width: 100%; display: flex; align-items: center; gap: 10px; font-family: inherit; text-align: left;
+                 background: var(--panel-2); border: 1px solid var(--panel-border); border-radius: var(--radius-sm);
+                 padding: 10px 13px; cursor: pointer; color: var(--text); }
+  .quality-row .q-name { flex: 1; font-size: 12.5px; font-weight: 700; }
+  .quality-row .q-note { font-size: 11px; color: var(--text-faint); }
+  .quality-row .q-dot { flex: none; width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--panel-border); }
+  .quality-row.active { border-color: var(--accent-dim); }
+  .quality-row.active .q-dot { border-color: var(--accent); background: var(--accent); box-shadow: inset 0 0 0 2px var(--panel-2); }
+  .quality-row:disabled { opacity: 0.55; cursor: default; }
+
   .icon-toggle { flex: none; width: 30px; height: 30px; display: flex; align-items: center; justify-content: center;
                  background: var(--panel); border: 1px solid var(--panel-border); border-radius: 7px;
                  color: var(--text-dim); cursor: pointer; }
@@ -351,6 +362,10 @@
       <label class="switch-item" title="Turn the Tapo smart plug on or off">
         <span class="switch-label">Plug</span>
         <span class="switch"><input type="checkbox" id="plugToggle"><span class="switch-slider"></span></span>
+      </label>
+      <label class="switch-item" title="Connect or disconnect the printer (after switching it off and on by hand)">
+        <span class="switch-label">Printer</span>
+        <span class="switch"><input type="checkbox" id="connectToggle"><span class="switch-slider"></span></span>
       </label>
     </div>
   </div>
@@ -482,7 +497,7 @@
           <div class="cam-stat" id="stCpu"><b>&ndash;</b><span>CPU</span></div>
         </div>
         <label class="cam-menu-head sub" style="cursor:pointer">
-          <span class="grow">Turn on camera</span>
+          <span class="grow">Camera</span>
           <span class="switch"><input type="checkbox" id="camForceToggle"><span class="switch-slider"></span></span>
         </label>
       </div>
@@ -587,6 +602,12 @@
     <div class="grid-panel" id="gridPanel">
       <table class="grid-table" id="gridTable"><tr><td class="grid-empty">-</td></tr></table>
       <div class="grid-caption"><span class="grid-caption-badge">CREALITY</span></div>
+    </div>
+
+    <div class="section-label">Camera quality</div>
+    <div class="quality-list" id="qualityList">
+      <button class="quality-row" data-profile="fast"><span class="q-dot"></span><span class="q-name">VGA 640&times;480</span><span class="q-note">smooth</span></button>
+      <button class="quality-row" data-profile="xga"><span class="q-dot"></span><span class="q-name">XGA 1024&times;768</span><span class="q-note">sharp</span></button>
     </div>
   </div>
 </div>
@@ -1074,6 +1095,8 @@ function renderStatus(s) {
   // serial connection itself is closed, but showing "Disconnect" as if everything's fine while
   // something just failed is misleading - offer "Connect" (safe no-op if still open) instead.
   var showAsConnected = live && s.phase !== "ERROR";
+  $("connectToggle").checked = showAsConnected;
+  $("connectToggle").disabled = s.phase === "CONNECTING";
   $("hotendTemp").textContent = live ? Math.round(s.hotendTemp) : "-";
   $("hotendTarget").textContent = live ? Math.round(s.hotendTarget) : "-";
   $("bedTemp").textContent = live ? Math.round(s.bedTemp) : "-";
@@ -1123,7 +1146,7 @@ function renderStatus(s) {
     $("plugToggle").checked = s.plugOn;
   }
   $("autoShutoffToggle").checked = !!s.autoShutoffEnabled;
-  phoneCamForce = !!s.cameraForce; phonePlugOn = s.plugOn === true; syncCamToggle();
+  syncCamToggle();
 
   renderControls(s.phase, !!s.fileReady, !!s.scheduledFile);
 
@@ -1153,7 +1176,9 @@ function renderStatus(s) {
 function renderControls(phase, fileReady, scheduled) {
   // A chosen file can be started once the printer is on; while it is off the button stays visible and says why.
   var idleish = phase === "UPLOAD_VERIFIED" || phase === "IDLE" || phase === "DISCONNECTED" || phase === "ERROR";
-  $("startBtn").style.display = (fileReady && idleish && !scheduled) ? "" : "none";
+  // Never offer Start while the board is actually printing (the phone may just not be watching it right now).
+  var boardBusy = typeof boardPrinter !== "undefined" && boardPrinter && (boardPrinter.state === "PRINTING" || boardPrinter.state === "PAUSED");
+  $("startBtn").style.display = (fileReady && idleish && !scheduled && !boardBusy) ? "" : "none";
   $("pauseBtn").style.display = phase === "PRINTING" ? "" : "none";
   $("resumeBtn").style.display = phase === "PAUSED" ? "" : "none";
   $("stopBtn").style.display = (phase === "PRINTING" || phase === "PAUSED") ? "" : "none";
@@ -1175,13 +1200,31 @@ $("plugToggle").onchange = function () {
     }
   });
 };
+$("connectToggle").onchange = function () {
+  var wantConnected = this.checked;
+  var printing = lastPhase === "PRINTING" || lastPhase === "PAUSED";
+  if (!wantConnected && !confirm(printing
+      ? "Stop watching the printer? The print keeps running on the ESP32 board."
+      : "Disconnect the printer?")) {
+    this.checked = true;
+    return;
+  }
+  post(wantConnected ? "/connect" : "/disconnect").then(function (r) { renderStatus(r.state); });
+};
 $("camForceToggle").onchange = function () {
   var on = this.checked;
   camToggleHoldUntil = Date.now() + 5000;  // the camera needs a few seconds to follow; do not flip the switch back meanwhile
   var self = this;
-  post("/camera/force?on=" + (on ? 1 : 0)).then(function (r) {
+  post("/camera/set?on=" + (on ? 1 : 0)).then(function (r) {
     if (r.state) renderStatus(r.state);
-    showToast("success", on ? "Camera forced on" : "Camera follows the printer power again");
+    if (r.success === false) {
+      camToggleHoldUntil = 0;
+      self.checked = !on;
+      showToast("error", "The camera board did not answer");
+      return;
+    }
+    boardCamOn = on;
+    showToast("success", on ? "Camera on" : "Camera off");
   }).catch(function () { camToggleHoldUntil = 0; self.checked = !on; });
 };
 
@@ -1353,15 +1396,48 @@ var camPrinterUrl = CAM_DIRECT ? espBase + "/printer/status" : "/esp/printer/sta
 var camLogUrl = CAM_DIRECT ? espBase + "/log" : "/esp/log";
 var camLogsUrl = CAM_DIRECT ? espBase + "/logs" : "/esp/logs";
 var camLogReadUrl = CAM_DIRECT ? espBase + "/logs/read" : "/esp/logs/read";
+// The board answers 503 when it is short of memory for a moment (a bulk read would starve its Wi-Fi):
+// wait and ask again instead of treating that answer as log text. Pieces are at most 32 KB (the board's cap).
+function logFetch(url) {
+  var tries = 0;
+  function go() {
+    return fetch(url).then(function (r) {
+      if (r.status === 503 && tries++ < 10) return new Promise(function (res) { setTimeout(res, 1500); }).then(go);
+      if (!r.ok) throw new Error("log read failed: HTTP " + r.status);
+      return r;
+    });
+  }
+  return go();
+}
 var camStreamUp = false;
-var boardCamOn = null, phoneCamForce = false, phonePlugOn = false, camToggleHoldUntil = 0;
-// The toggle shows whether the camera is really on (from the board). It is greyed out while the camera is on only
-// because the printer is powered - that one cannot be switched off from here.
+var boardCamOn = null, camToggleHoldUntil = 0;
+// Camera quality (resolution) - saved on the board, switched on the fly (the camera restarts for about a second).
+var qualityHoldUntil = 0;
+function renderQuality(profile) {
+  var rows = document.querySelectorAll("#qualityList .quality-row");
+  for (var i = 0; i < rows.length; i++) rows[i].classList.toggle("active", rows[i].getAttribute("data-profile") === profile);
+}
+(function () {
+  var rows = document.querySelectorAll("#qualityList .quality-row");
+  for (var i = 0; i < rows.length; i++) rows[i].onclick = function () {
+    var btn = this, profile = btn.getAttribute("data-profile");
+    var all = document.querySelectorAll("#qualityList .quality-row");
+    for (var j = 0; j < all.length; j++) all[j].disabled = true;
+    qualityHoldUntil = Date.now() + 6000;  // the board needs a moment; do not flip the mark back meanwhile
+    renderQuality(profile);
+    post("/camera/quality?profile=" + encodeURIComponent(profile)).then(function (r) {
+      if (r.success === false) { qualityHoldUntil = 0; showToast("error", "The camera board did not accept the change"); }
+      else showToast("success", "Camera quality: " + btn.querySelector(".q-name").textContent);
+    }).catch(function () { qualityHoldUntil = 0; }).then(function () {
+      for (var j = 0; j < all.length; j++) all[j].disabled = false;
+    });
+  };
+})();
+// The toggle shows whether the camera is really on (from the board). The board turns it on at power-up; the user
+// can switch it off and on at any time, also during a print.
 function syncCamToggle() {
   if (boardCamOn === null || Date.now() < camToggleHoldUntil) return;
-  var t = $("camForceToggle");
-  t.checked = boardCamOn;
-  t.disabled = boardCamOn && !phoneCamForce && phonePlugOn;
+  $("camForceToggle").checked = boardCamOn;
 }
 
 function setCamStat(id, text, level) {
@@ -1399,6 +1475,7 @@ var camFpsHist = [];
 function pollCamStatus() {
   fetch(camStatusUrl).then(function (r) { return r.json(); }).then(function (s) {
     boardCamOn = s.cameraOn !== false; syncCamToggle();
+    if (s.profile && Date.now() >= qualityHoldUntil) renderQuality(s.profile);
     // The camera runs only while the printer's smart plug is on; the board itself always runs.
     if (s.cameraOn === false) {
       if (camWanted || camStreamUp) stopCamStream();
@@ -1561,7 +1638,7 @@ function openCamLogFile(meta) {
   $("camLogViewerSize").textContent = fmtLogBytes(meta.size);
   $("camLogViewerText").textContent = "Loading\u2026";
   $("camLogViewerHint").textContent = "";
-  fetch(camLogReadUrl + "?name=" + encodeURIComponent(meta.name) + "&max=65536").then(function (r) {
+  logFetch(camLogReadUrl + "?name=" + encodeURIComponent(meta.name) + "&max=32768").then(function (r) {
     var h = camLogReadHeaders(r);
     return r.text().then(function (t) { return { t: t, h: h }; });
   }).then(function (res) {
@@ -1575,7 +1652,7 @@ function openCamLogFile(meta) {
 
 function followCamLog() {
   if (!camLogView || camLogView.next == null) return;
-  fetch(camLogReadUrl + "?name=" + encodeURIComponent(camLogView.name) + "&from=" + camLogView.next + "&max=65536")
+  logFetch(camLogReadUrl + "?name=" + encodeURIComponent(camLogView.name) + "&from=" + camLogView.next + "&max=32768")
     .then(function (r) {
       var h = camLogReadHeaders(r);
       return r.text().then(function (t) { return { t: t, h: h }; });
@@ -1593,8 +1670,8 @@ function followCamLog() {
 
 function loadCamLogEarlier() {
   if (!camLogView || !camLogView.from) return;
-  var wantFrom = Math.max(0, camLogView.from - 65536);
-  fetch(camLogReadUrl + "?name=" + encodeURIComponent(camLogView.name) + "&from=" + wantFrom + "&max=" + (camLogView.from - wantFrom))
+  var wantFrom = Math.max(0, camLogView.from - 32768);
+  logFetch(camLogReadUrl + "?name=" + encodeURIComponent(camLogView.name) + "&from=" + wantFrom + "&max=" + (camLogView.from - wantFrom))
     .then(function (r) {
       var h = camLogReadHeaders(r);
       return r.text().then(function (t) { return { t: t, h: h }; });
@@ -1613,12 +1690,12 @@ function jumpCamLogLastPrint() {
   if (!camLogView) return;
   var btn = $("camLogJumpPrint"), orig = btn.textContent;
   btn.disabled = true; btn.textContent = "Searching\u2026";
-  var CHUNK = 65536, MAX_TRIES = 8, size = camLogView.size;
+  var CHUNK = 32768, MAX_TRIES = 8, size = camLogView.size;
   function tryChunk(triesDone) {
     var end = size - triesDone * CHUNK;
     if (end <= 0 || triesDone >= MAX_TRIES) return Promise.resolve(null);
     var start = Math.max(0, end - CHUNK);
-    return fetch(camLogReadUrl + "?name=" + encodeURIComponent(camLogView.name) + "&from=" + start + "&max=" + (end - start))
+    return logFetch(camLogReadUrl + "?name=" + encodeURIComponent(camLogView.name) + "&from=" + start + "&max=" + (end - start))
       .then(function (r) { return r.text(); }).then(function (t) {
         var idx = t.lastIndexOf("printer: print start");
         if (idx >= 0) return start + t.lastIndexOf("\n", idx) + 1;
@@ -1629,7 +1706,7 @@ function jumpCamLogLastPrint() {
     btn.disabled = false; btn.textContent = orig;
     if (foundFrom == null) { $("camLogViewerHint").textContent = "No print start found in the last " + (MAX_TRIES * CHUNK / 1024) + " KB."; return; }
     clearInterval(camLogFollowTimer); camLogFollowTimer = null;
-    fetch(camLogReadUrl + "?name=" + encodeURIComponent(camLogView.name) + "&from=" + foundFrom + "&max=65536").then(function (r) {
+    logFetch(camLogReadUrl + "?name=" + encodeURIComponent(camLogView.name) + "&from=" + foundFrom + "&max=32768").then(function (r) {
       var h = camLogReadHeaders(r);
       return r.text().then(function (t) { return { t: t, h: h }; });
     }).then(function (res) {
@@ -1666,7 +1743,7 @@ function downloadCamLogFile() {
       return;
     }
     btn.textContent = "Downloading\u2026 " + Math.round(pos * 100 / size) + "%";
-    fetch(camLogReadUrl + "?name=" + encodeURIComponent(camLogView.name) + "&from=" + pos + "&max=65536")
+    logFetch(camLogReadUrl + "?name=" + encodeURIComponent(camLogView.name) + "&from=" + pos + "&max=32768")
       .then(function (r) {
         var h = camLogReadHeaders(r);
         return r.text().then(function (t) { return { t: t, h: h }; });
