@@ -1363,7 +1363,7 @@ public class PrinterService extends Service {
     private static final long AUTO_CONNECT_RETRY_MS = 6000;
     /** After the plug goes on the printer's mainboard and its USB chip need a moment to boot: don't knock before. */
     private static final long AUTO_CONNECT_FIRST_DELAY_MS = 20000;
-    private static final long REATTACH_CHECK_MS = 10000;
+    private static final long REATTACH_CHECK_MS = 4000;
 
     class AutoConnectThread extends Thread {
         private volatile boolean stopRequested = false;
@@ -1395,13 +1395,14 @@ public class PrinterService extends Service {
                     prevPlugOn = plug;
                     PrinterState.Phase ph = state.phase;
                     boolean detached = ph == PrinterState.Phase.DISCONNECTED || ph == PrinterState.Phase.ERROR;
-                    // The board is running a print but this phone is not watching it (a Wi-Fi gap, an app restart):
-                    // attach to it again. Independent of the plug; connecting sends the printer nothing while it prints.
+                    // The board is connected to the printer (it connects by itself when the printer appears on USB) or
+                    // is running a print, but this phone is not following it (the printer was just switched on, a Wi-Fi
+                    // gap, an app restart): attach. Independent of the plug; nothing is (re)opened on the board.
                     if (detached && printerConnection instanceof EspPrinterConnection && now - lastReattachCheck >= REATTACH_CHECK_MS) {
                         lastReattachCheck = now;
                         String bs = ((EspPrinterConnection) printerConnection).boardState();
-                        if (bs.equals("PRINTING") || bs.equals("PAUSED")) {
-                            Log.i(TAG, "the board is " + bs + " - re-attaching");
+                        if (bs.equals("PRINTING") || bs.equals("PAUSED") || bs.equals("IDLE")) {
+                            Log.i(TAG, "the board is " + bs + " - attaching");
                             connectPrinter(true);
                             continue;
                         }

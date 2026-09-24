@@ -59,7 +59,9 @@ public class EspPrinterConnection extends EspStoreConnection {
         JSONObject st = statusFresh();
         String state = st.optString("state");
         boolean busy = "PRINTING".equals(state) || "PAUSED".equals(state);
-        if (!busy) {
+        // The board connects to the printer by itself when it appears on USB: then there is nothing to (re)open.
+        boolean alreadyUp = "IDLE".equals(state) && linkKind.equals(st.optString("link"));
+        if (!busy && !alreadyUp) {
             call("/printer/link?kind=" + linkKind, 8000);
             call("/printer/connect", CONNECT_TIMEOUT_MS);
         }

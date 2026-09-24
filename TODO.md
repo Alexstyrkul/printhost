@@ -64,6 +64,11 @@ Tasks:
 - [ ] If dips remain: UDP from the board to the phone (frame id + chunks, skip incomplete frames, optional FEC); the phone re-serves MJPEG.
 - Deferred: direct board-phone link (Android 11 has no STA+STA; Wi-Fi Direct is possible without root but shares one radio); external antenna; a 5 GHz board (ESP32-P4 + C5).
 
+## Automatic printer connection (user request 2026-09-24 evening)
+- [x] The board selects the USB link at boot and connects by itself whenever the printer appears on USB (smart plug, the printer's own switch, a replugged cable); every 2 s it checks `usb_host_device_addr_list_fill`, and opening only sets the baud rate. It goes DISCONNECTED when the USB device disappears. After a deliberate Disconnect it stays off until Connect. A failed Connect (printer not on yet) no longer blocks it.
+- [x] The phone attaches whenever the board is IDLE/PRINTING/PAUSED and the phone is detached (checked every 4 s), without re-opening the link.
+- Verified: after a board reboot it connected at 4 s and the phone attached by itself; phone Disconnect stayed off; Connect worked. **Not yet verified: switching the printer off/on by hand** (needs the user).
+
 ## Finding the phone without a fixed IP
 - [x] `http://OnePlus-6T:8899/` (the ASUS resolves the phone's DHCP name) and `http://printhost-cam.local/app` (the board redirects to the phone's last-seen IP, learned from its Dalvik requests). Both verified from the Mac.
 
