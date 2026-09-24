@@ -105,8 +105,8 @@ class UsbLink : public PrinterLink {
  public:
   const char *name() override { return "usb"; }
 
-  bool open(String &err) override {
-    if (!rxBuf) rxBuf = xStreamBufferCreate(4096, 1);
+  // Starts the USB host stack once (idempotent). Needed before a device can even be seen.
+  bool ensureHost(String &err) {
     if (!hostInstalled) {
       usb_host_config_t cfg = {};
       cfg.skip_phy_setup = false;
@@ -127,6 +127,21 @@ class UsbLink : public PrinterLink {
       }
       cdcInstalled = true;
     }
+    return true;
+  }
+
+  bool devicePresent() override {
+    String err;
+    if (!ensureHost(err)) return false;
+    uint8_t addrs[4];
+    int n = 0;
+    if (usb_host_device_addr_list_fill(sizeof(addrs), addrs, &n) != ESP_OK) return false;
+    return n > 0;  // something is enumerated on the OTG port (only the printer is ever plugged in there)
+  }
+
+  bool open(String &err) override {
+    if (!rxBuf) rxBuf = xStreamBufferCreate(4096, 1);
+    if (!ensureHost(err)) return false;
     devGone = false;
     xStreamBufferReset(rxBuf);
     cdc_acm_host_device_config_t dc = {};

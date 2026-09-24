@@ -868,6 +868,51 @@ done:
 }
 
 // ---- idle tick ---------------------------------------------------------------------------------
+// ---- automatic connection ------------------------------------------------------------------------------
+// The printer appears on USB whenever it is powered (smart plug, its own switch, a replugged cable): open the link
+// then, without anyone pressing Connect. Opening only sets the serial speed - no gcode, DTR/RTS untouched - exactly what
+// the Connect button does. After the user disconnects on purpose it stays disconnected until Connect is used again.
+bool userDisconnected = false;
+bool connectFailed = false;  // the last ERROR came from a failed Connect (printer not on yet), not from a print
+void autoConnectTick() {
+  static uint32_t next = 0;
+  static bool failLogged = false;
+  if (!link || strcmp(link->name(), "usb") != 0) return;
+  if ((int32_t)(millis() - next) < 0) return;
+  next = millis() + 2000;
+  PrinterState st;
+  lock();
+  st = gState;
+  unlock();
+  if (st == PS_IDLE && !link->isOpen()) {  // the printer was switched off (or unplugged) while connected
+    link->close();
+    lock();
+    gState = PS_DISCONNECTED;
+    unlock();
+    logEvent("printer: USB device gone - disconnected");
+    return;
+  }
+  if (userDisconnected) return;
+  if (st != PS_DISCONNECTED && !(st == PS_ERROR && connectFailed)) return;
+  if (!link->devicePresent()) {
+    failLogged = false;
+    return;
+  }
+  String err;
+  if (link->open(err)) {
+    lock();
+    gErr = "";
+    gState = PS_IDLE;
+    unlock();
+    failLogged = false;
+    connectFailed = false;
+    logEvent("printer: connected via usb automatically (printer appeared on USB)");
+  } else if (!failLogged) {
+    failLogged = true;  // a device is there but will not open (yet): say so once, keep trying quietly
+    logEvent("printer: auto-connect not yet: %s", err.c_str());
+  }
+}
+
 void idleTick() {
   static uint32_t nextPoll = 0;
   if (!link || !link->isOpen()) return;
@@ -926,6 +971,7 @@ void handleCmd(Cmd *c) {
       }
       applyLinkChoice(c->arg, c->err);
       c->ok = c->err.length() == 0;
+      userDisconnected = false;
       break;
     }
     case C_CONNECT: {
@@ -937,10 +983,13 @@ void handleCmd(Cmd *c) {
         c->ok = true;  // already connected and busy
         break;
       }
+      userDisconnected = false;
       if (!link->isOpen() && !link->open(c->err)) {
         setError(c->err);
+        connectFailed = true;  // auto-connect keeps trying: the printer may simply not be powered yet
         break;
       }
+      connectFailed = false;
       lock();
       gErr = "";
       gState = PS_IDLE;
@@ -954,6 +1003,9 @@ void handleCmd(Cmd *c) {
         c->err = "printer is printing; stop the print first";
         break;
       }
+      // Only a disconnect of a live link is the user's choice; a client tidying up after the link was already lost
+      // must not switch off the automatic reconnect.
+      if (link && link->isOpen() && st == PS_IDLE) userDisconnected = true;
       if (link) link->close();
       lock();
       gState = link ? PS_DISCONNECTED : PS_NO_LINK;
@@ -1018,11 +1070,16 @@ void handleCmd(Cmd *c) {
 }
 
 void engineTask(void *) {
+  {
+    String err;
+    applyLinkChoice("usb", err);  // the printer is always on USB: be ready to connect as soon as it appears
+  }
   for (;;) {
     Cmd *c;
     if (xQueueReceive(cmdQ, &c, pdMS_TO_TICKS(100)) == pdTRUE) handleCmd(c);
     if (link) link->tick();
     idleTick();
+    autoConnectTick();
   }
 }
 

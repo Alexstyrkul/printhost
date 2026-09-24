@@ -1899,7 +1899,7 @@ void setup() {
   }
   logEvent("BOOT: %s, OTA-verified build %s %s, free heap %u KB, SD %s", resetReasonText.c_str(), __DATE__, __TIME__, (unsigned)(ESP.getFreeHeap() / 1024), sdStatus.c_str());
   fpsWindowStart = millis();
-  printerBegin();  // starts the engine task only; the printer link stays unselected until a client asks
+  printerBegin();  // engine task; selects the USB link and connects by itself once the printer appears on USB
   dht11Begin(21);  // room sensor on GPIO 21 (moved from 14) - see docs/HANDOFF_ESP32_BRIDGE.md
   startNetwork();
   startServers();

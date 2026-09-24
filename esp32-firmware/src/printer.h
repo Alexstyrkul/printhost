@@ -22,6 +22,9 @@ struct PrinterLink {
   virtual int readLine(char *buf, size_t cap, uint32_t timeoutMs) = 0;
   virtual void flushInput() = 0;
   virtual void tick() {}  // called regularly by the engine; lets the link manage its own polling
+  // Cheap check whether the printer's USB device is plugged in and powered (no traffic to it). The simulator is
+  // always "present".
+  virtual bool devicePresent() { return true; }
 };
 
 void printerBegin();                                   // starts the engine task; touches no hardware
