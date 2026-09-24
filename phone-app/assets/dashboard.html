@@ -510,7 +510,7 @@
       <div class="cam-menu-body">
         <div class="cam-stats">
           <div class="cam-stat" id="stMem" title="Free working memory of the board."><b>&ndash;</b><span>Free RAM</span></div>
-          <div class="cam-stat" id="stPause" title="Board delay before each line. Yellow or red = slowing the print."><b>&ndash;</b><span>Board delay</span></div>
+          <div class="cam-stat" id="stPause" title="Time the board takes between the printer's ok and the next line. Yellow from 20 ms, red from 100 ms on average."><b>&ndash;</b><span>Board delay</span></div>
           <div class="cam-stat" id="stResend" title="Lines resent after the printer got them damaged."><b>&ndash;</b><span>Resends</span></div>
           <div class="cam-stat" id="stAck" title="How fast the printer answers each line. Long is normal."><b>&ndash;</b><span>Printer reply</span></div>
           <div class="cam-stat" id="stEnvTemp" title="Room temperature from the DHT11 sensor."><b>&ndash;</b><span>Temp</span></div>
@@ -1529,12 +1529,16 @@ function renderHealth() {
     $("stMem").title = "Free working memory. Lowest so far: " + (boardHeapMin != null ? boardHeapMin : "\u2013") + " KB.";
   } else setCamStat("stMem", "–");
   if (live) {
-    lPause = p.gapMaxMs > 300 ? "bad" : (p.gapMaxMs > 100 ? "warn" : "");
+    // Colour by the AVERAGE board delay: a single slow line now and then (an SD read, a Wi-Fi burst) is absorbed by the
+    // printer's own command buffer; what would slow a print is the board being slow on every line.
+    lPause = p.gapAvgMs >= 100 ? "bad" : (p.gapAvgMs >= 20 ? "warn" : "");
     // Resends scale with how much has printed, not with time - a handful in a 200k-line print is
     // normal (this rate is what a first real print looked like: ~5 in 233k lines, healthy).
     var resendRate = p.lines > 0 ? p.resends * 10000 / p.lines : 0;
     lResend = resendRate > 10 ? "bad" : (resendRate >= 1 ? "warn" : "");
-    setCamStat("stPause", Math.round(p.gapAvgMs) + " ms", lPause);  // shown: average; colour: worst case
+    setCamStat("stPause", Math.round(p.gapAvgMs) + " ms", lPause);
+    $("stPause").title = "Time the board takes between the printer's ok and the next line. Average " + Math.round(p.gapAvgMs) +
+        " ms, longest " + Math.round(p.gapMaxMs) + " ms (last ~10 s). Normal: under 20 ms on average; single spikes are harmless.";
     setCamStat("stResend", String(p.resends), lResend);
     setCamStat("stAck", Math.round(p.ackAvgMs) + " ms", "");
   } else {
