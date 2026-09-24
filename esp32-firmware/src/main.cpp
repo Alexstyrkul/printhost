@@ -21,6 +21,7 @@
 #include <esp_wifi.h>
 #include <lwip/sockets.h>
 #include <netinet/tcp.h>
+#include "ping/ping_sock.h"
 #include "printer.h"
 #include "test_ui.h"
 #if __has_include("secrets.h")
@@ -52,15 +53,22 @@ static const uint32_t STA_TIMEOUT_MS = 15000;
 
 static Preferences prefs;
 static httpd_handle_t mainServer = nullptr;
-static httpd_handle_t streamServer = nullptr;
 static String sdStatus = "not tested";
 static bool staMode = false;
+static String staSsid, staPass;     // saved router credentials (empty: setup network only)
+static bool staServicesUp = false;  // mDNS + OTA started (once, on the first router connection)
 
 static volatile uint32_t framesServed = 0;
 static volatile size_t lastFrameBytes = 0;
 static float currentFps = 0;
 static uint32_t fpsWindowStart = 0;
 static uint32_t fpsWindowFrames = 0;
+// Camera master clock: 20 MHz. 24 MHz was tried (its harmonics avoid Wi-Fi channel 1, where the 20 MHz one at
+// 2420 MHz lands) but the OV3660 then delivered corrupted frames (colour bands, half-garbage pictures) - the capture
+// cannot keep up. 10 MHz halves the frame rate. /control?var=xclk&val=<MHz> to experiment.
+static uint32_t camXclkHz = 20000000;
+static volatile int streamTos = 0;          // 1: stream packets use the Wi-Fi "video" queue (IP precedence 4 -> AC_VI)
+static volatile int streamFpsCap = 0;       // >0: send at most this many frames per second
 
 static bool initCameraWith(uint32_t xclk, framesize_t initSize, int quality, int fbCount, camera_grab_mode_t mode) {
   camera_config_t c = {};
@@ -110,7 +118,7 @@ static const Profile PROFILES[] = {
 };
 
 static SemaphoreHandle_t camMutex = nullptr;
-static int curProfile = 3;  // xga (1024x768, 4:3): full field of view and the best fps of the tested profiles
+static int curProfile = 0;  // "fast" (VGA 640x480) unless the saved choice says otherwise (loadProfileChoice)
 // Physical mounting: set these once to match how the camera is installed (0/1).
 #define CAM_VFLIP 1    // camera is mounted upside down: vflip + hmirror = 180 degree rotation
 #define CAM_HMIRROR 1
@@ -120,7 +128,7 @@ static uint8_t cpuLoad[2] = {0, 0};  // percent per core
 static volatile uint32_t lastLatencyMs = 0;
 static volatile uint32_t avgGetMs = 0, avgSendMs = 0;
 static volatile bool streamActive = false;
-static volatile bool camEnabled = false;  // the camera is only powered while the phone says the printer plug is on
+static volatile bool camEnabled = false;  // powered on at boot; the dashboard can switch it off and on at any time
 static int curQuality = 8;                // live JPEG quality; the stream nudges it to hold the frame-size budget
 static float emaFrameBytes = 0;
 SemaphoreHandle_t sdMutex = nullptr;  // one user of the SD card at a time (log writer vs. file upload)
@@ -144,19 +152,37 @@ static bool applyProfile(int idx) {
   xSemaphoreTake(camMutex, portMAX_DELAY);
   esp_camera_deinit();
   const Profile &p = PROFILES[idx];
-  bool ok = initCameraWith(20000000, p.size, p.quality, 2, CAMERA_GRAB_LATEST);
+  bool ok = initCameraWith(camXclkHz, p.size, p.quality, 2, CAMERA_GRAB_LATEST);
   if (ok) {
     curProfile = idx;
     curQuality = p.quality;
     emaFrameBytes = 0;
     applySensorTuning();
   }
-  logEvent("camera: profile %s %s", p.name, ok ? "ok" : "FAILED");
+  logEvent("camera: profile %s xclk %u MHz %s", p.name, (unsigned)(camXclkHz / 1000000), ok ? "ok" : "FAILED");
   xSemaphoreGive(camMutex);
   return ok;
 }
 
 static bool initCamera() { return applyProfile(curProfile); }
+
+// The chosen quality profile survives a reboot (NVS "cam"/"profile"); VGA ("fast") by default - the user's pick:
+// on this congested 2.4 GHz link it gave ~1.5x the frame rate of XGA with fewer dips.
+static void saveProfileChoice(int idx) {
+  Preferences p;
+  p.begin("cam", false);
+  p.putString("profile", PROFILES[idx].name);
+  p.end();
+}
+
+static void loadProfileChoice() {
+  Preferences p;
+  p.begin("cam", true);
+  String name = p.getString("profile", "fast");
+  p.end();
+  for (int i = 0; i < (int)(sizeof(PROFILES) / sizeof(PROFILES[0])); i++)
+    if (name == PROFILES[i].name) curProfile = i;
+}
 
 // Powers the camera up or down (sensor clock, DMA, JPEG). The board itself keeps running.
 static void setCameraEnabled(bool on) {
@@ -230,6 +256,17 @@ static uint32_t sampleCount = 0;
 static char events[EVENT_N][120];
 static uint32_t eventCount = 0, eventsFlushed = 0;
 static uint32_t wifiDrops = 0;
+static volatile bool gatewayPingRestartDue = false;
+// Last time anything proved that packets reach us: a gateway ping reply, a new incoming TCP connection, or a
+// stream frame the viewer acknowledged. The router may drop pings to itself on a busy channel, so the ping
+// alone is not enough to call the link deaf.
+static volatile uint32_t lastRxProofMs = 0;
+static volatile uint32_t wdPingOnlyUntilMs = 0;  // /debug/wifi?test=deaf: only the (black-holed) ping counts
+static inline void rxProof() {
+  if ((int32_t)(millis() - wdPingOnlyUntilMs) >= 0) lastRxProofMs = millis();
+}
+// Gateway ping statistics per SD log line (the watchdog ping doubles as a link-quality probe).
+static volatile uint32_t gwOkWin = 0, gwLostWin = 0, gwRttSumWin = 0, gwRttMaxWin = 0;
 static String resetReasonText = "?";
 static portMUX_TYPE logMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -264,7 +301,10 @@ static const char *resetReasonName(esp_reset_reason_t r) {
 static void wifiEvent(arduino_event_id_t ev, arduino_event_info_t info) {
   switch (ev) {
     case ARDUINO_EVENT_WIFI_STA_CONNECTED: logEvent("wifi: associated ch%d", info.wifi_sta_connected.channel); break;
-    case ARDUINO_EVENT_WIFI_STA_GOT_IP: logEvent("wifi: got IP %s", WiFi.localIP().toString().c_str()); break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      logEvent("wifi: got IP %s", WiFi.localIP().toString().c_str());
+      gatewayPingRestartDue = true;  // loop() (re)starts the watchdog ping towards the (new) gateway
+      break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
       wifiDrops++;
       logEvent("wifi: DISCONNECTED reason %d (drop #%lu)", info.wifi_sta_disconnected.reason, (unsigned long)wifiDrops);
@@ -439,6 +479,11 @@ static void logTick(uint32_t nowMs) {
   f.printf("[%lus] fps=%.1f rssi=%d temp=%dC cpu=%u/%u%% get=%u send=%u delay=%u frame=%uB heap=%u minheap=%u psram=%u prof=%s", (unsigned long)s.t, s.fps,
            s.rssi, s.tempC, s.cpu0, s.cpu1, s.getMs, s.sendMs, s.delayMs, (unsigned)s.frameB, (unsigned)s.heap, (unsigned)ESP.getMinFreeHeap(),
            (unsigned)s.psram, PROFILES[s.prof].name);
+  {  // gateway ping since the previous line: replies/lost, round trip avg/max
+    uint32_t ok = gwOkWin, lost = gwLostWin, sum = gwRttSumWin, mx = gwRttMaxWin;
+    gwOkWin = gwLostWin = gwRttSumWin = gwRttMaxWin = 0;
+    f.printf(" gw=%u/%u rtt=%u/%ums", (unsigned)ok, (unsigned)lost, (unsigned)(ok ? sum / ok : 0), (unsigned)mx);
+  }
   if (ps.state >= PS_IDLE)
     f.printf(" prn=%s line=%u/%uB lps=%.1f ack=%u/%ums gap=%u/%ums tx=%uB/s rx=%uB/s resends=%u hot=%.1f/%.1f bed=%.1f/%.1f", PRN_STATE[ps.state],
              (unsigned)ps.line, (unsigned)ps.bytesDone, ps.lps, (unsigned)(ps.ackAvgUs / 1000), (unsigned)(ps.ackMaxUs / 1000),
@@ -497,63 +542,207 @@ static String peerIp(httpd_req_t *req) {
   return String(b);
 }
 
-static esp_err_t streamHandler(httpd_req_t *req) {
-  if (!camEnabled) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "camera is off");
-  int one = 1;
-  setsockopt(httpd_req_to_sockfd(req), IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-  httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=frame");
-  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  esp_err_t res = ESP_OK;
-  int misses = 0;
-  streamActive = true;
-  logEvent("stream: viewer %s connected (%s)", peerIp(req).c_str(), PROFILES[curProfile].name);
-  // No task watchdog here: a stalled Wi-Fi client must end its own stream (the HTTP send timeout does that),
-  // never reboot the board - a reboot would abort a print in progress.
-  int adaptCount = 0;
-  while (res == ESP_OK) {
-    if (!camEnabled) {
-      res = ESP_FAIL;  // the camera was powered down: end the stream cleanly
-      break;
+// ---- MJPEG stream on port 81: one viewer at a time, served by its own small task ----------------
+// Not esp_http_server: its handler never returns while streaming, so a dead or stale viewer (a
+// forgotten browser tab, the phone's relay after a network drop) held the only slot until the send
+// timed out, and a new viewer could not even be accepted. Here a new viewer simply replaces the old
+// one, TCP keepalive notices a vanished peer within ~15 s, and a stalled send gives up after 5 s.
+static const int STREAM_PORT = 81;
+static const uint32_t STREAM_HEAP_LOW = 20 * 1024;   // pause sending below this much free internal RAM...
+static const uint32_t STREAM_HEAP_OK = 32 * 1024;    // ...and resume above this (Wi-Fi needs internal RAM to live)
+static volatile uint32_t streamHeapPauses = 0;
+
+static void ipToText(const struct sockaddr_storage &a, char *out, size_t n) {
+  struct in_addr v4;
+  if (a.ss_family == AF_INET6) memcpy(&v4, (uint8_t *)&((struct sockaddr_in6 *)&a)->sin6_addr + 12, 4);
+  else v4 = ((struct sockaddr_in *)&a)->sin_addr;
+  inet_ntop(AF_INET, &v4, out, n);
+}
+
+// Reads the request head (up to the blank line, 2 s max). True for "GET /stream".
+static bool readStreamRequest(int s) {
+  char buf[512];
+  size_t len = 0;
+  uint32_t t0 = millis();
+  while (len < sizeof(buf) - 1 && millis() - t0 < 2000) {
+    int n = recv(s, buf + len, sizeof(buf) - 1 - len, 0);
+    if (n <= 0) {
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+      return false;
     }
+    len += n;
+    buf[len] = 0;
+    if (strstr(buf, "\r\n\r\n")) break;
+  }
+  buf[len] = 0;
+  return strncmp(buf, "GET /stream", 11) == 0;
+}
+
+static bool sendAll(int s, const void *data, size_t n) {
+  const uint8_t *p = (const uint8_t *)data;
+  while (n > 0) {
+    int w = send(s, p, n, 0);
+    if (w <= 0) return false;  // includes the 5 s SO_SNDTIMEO: the viewer stopped taking data
+    p += w;
+    n -= w;
+  }
+  return true;
+}
+
+static void configureViewer(int s) {
+  int one = 1;
+  setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+  setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+  int idle = 5, intvl = 2, cnt = 5;  // a silent peer is declared dead after ~15 s
+  setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+  setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+  setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+  struct timeval rt = {0, 200000}, st = {5, 0};
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &rt, sizeof(rt));
+  setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &st, sizeof(st));
+}
+
+static void streamTask(void *) {
+  int ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  int one = 1;
+  setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  struct sockaddr_in addr = {};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(STREAM_PORT);
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  if (ls < 0 || bind(ls, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(ls, 2) != 0) {
+    logEvent("stream: cannot listen on :%d", STREAM_PORT);
+    vTaskDelete(nullptr);
+    return;
+  }
+  int viewer = -1;
+  char viewerIp[20] = "";
+  bool heapPaused = false;
+  int adaptCount = 0, misses = 0, tosApplied = -1;
+  int64_t lastFrameUs = 0;
+  for (;;) {
+    // A new viewer? Check without waiting while someone is watching, wait a little while nobody is.
+    fd_set rf;
+    FD_ZERO(&rf);
+    FD_SET(ls, &rf);
+    struct timeval tv = {0, viewer < 0 ? 500000 : 0};
+    if (select(ls + 1, &rf, nullptr, nullptr, &tv) > 0) {
+      struct sockaddr_storage peer;
+      socklen_t pl = sizeof(peer);
+      int c = accept(ls, (struct sockaddr *)&peer, &pl);
+      if (c >= 0) {
+        configureViewer(c);
+        char ip[20];
+        ipToText(peer, ip, sizeof(ip));
+        static const char HEAD[] =
+            "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace;boundary=frame\r\n"
+            "Access-Control-Allow-Origin: *\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+        if (!readStreamRequest(c)) {
+          static const char NF[] = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+          sendAll(c, NF, sizeof(NF) - 1);
+          close(c);
+        } else if (!camEnabled) {
+          static const char OFF[] = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\ncamera is off";
+          sendAll(c, OFF, sizeof(OFF) - 1);
+          close(c);
+        } else if (!sendAll(c, HEAD, sizeof(HEAD) - 1)) {
+          close(c);
+        } else {
+          if (viewer >= 0) {
+            logEvent("stream: viewer %s replaced by %s", viewerIp, ip);
+            close(viewer);
+          }
+          viewer = c;
+          tosApplied = -1;
+          strlcpy(viewerIp, ip, sizeof(viewerIp));
+          streamActive = true;
+          misses = 0;
+          logEvent("stream: viewer %s connected (%s)", viewerIp, PROFILES[curProfile].name);
+        }
+      }
+    }
+    if (viewer < 0) continue;
+
+    auto dropViewer = [&](const char *why) {
+      logEvent("stream: viewer %s left (%s)", viewerIp, why);
+      close(viewer);
+      viewer = -1;
+      streamActive = false;
+    };
+    if (!camEnabled) {
+      dropViewer("camera switched off");
+      continue;
+    }
+    // Wi-Fi copies every outgoing packet into internal RAM; when that runs low the whole network stack
+    // starves. Let it drain instead of pushing more frames.
+    uint32_t freeInt = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    if (heapPaused ? freeInt < STREAM_HEAP_OK : freeInt < STREAM_HEAP_LOW) {
+      if (!heapPaused) {
+        heapPaused = true;
+        streamHeapPauses++;
+        logEvent("stream: pausing, only %u KB internal RAM free", (unsigned)(freeInt / 1024));
+      }
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+    if (heapPaused) {
+      heapPaused = false;
+      logEvent("stream: resuming (%u KB free)", (unsigned)(freeInt / 1024));
+    }
+    if (tosApplied != streamTos) {
+      int tos = streamTos ? (4 << 5) : 0;  // IP precedence 4 = the Wi-Fi video queue (AC_VI, still aggregated)
+      setsockopt(viewer, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+      tosApplied = streamTos;
+    }
+    if (streamFpsCap > 0) {  // pacing: the sensor keeps the latest frame, so waiting simply skips frames
+      int64_t due = lastFrameUs + 1000000LL / streamFpsCap, nowUs = esp_timer_get_time();
+      if (nowUs < due) {
+        vTaskDelay(pdMS_TO_TICKS((due - nowUs) / 1000 + 1));
+        continue;
+      }
+    }
+
     xSemaphoreTake(camMutex, portMAX_DELAY);
     int64_t tGet0 = esp_timer_get_time();
-    camera_fb_t *fb = esp_camera_fb_get();
+    camera_fb_t *fb = camEnabled ? esp_camera_fb_get() : nullptr;
     int64_t tGet1 = esp_timer_get_time();
     if (!fb) {
       xSemaphoreGive(camMutex);
       if (++misses > 20) {
-        streamActive = false;
-        logEvent("stream: camera returned no frames, closing");
-        return ESP_FAIL;
+        misses = 0;
+        dropViewer("camera returned no frames");
+      } else {
+        vTaskDelay(pdMS_TO_TICKS(50));
       }
-      delay(50);
       continue;
     }
     misses = 0;
     char part[96];
     size_t hlen = snprintf(part, sizeof(part), "\r\n--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", (unsigned)fb->len);
-    res = httpd_resp_send_chunk(req, part, hlen);
-    if (res == ESP_OK) res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
+    bool ok = sendAll(viewer, part, hlen) && sendAll(viewer, fb->buf, fb->len);
     int64_t tSend1 = esp_timer_get_time();
     size_t len = fb->len;
     int64_t capturedUs = (int64_t)fb->timestamp.tv_sec * 1000000LL + fb->timestamp.tv_usec;
     esp_camera_fb_return(fb);
     xSemaphoreGive(camMutex);
-    if (res == ESP_OK) {
-      countFrame(len);
-      emaFrameBytes = emaFrameBytes == 0 ? (float)len : emaFrameBytes * 0.9f + len * 0.1f;
-      if (++adaptCount >= 10) {
-        adaptCount = 0;
-        adaptQuality();
-      }
-      lastLatencyMs = (uint32_t)((esp_timer_get_time() - capturedUs) / 1000);
-      avgGetMs = (avgGetMs * 7 + (uint32_t)((tGet1 - tGet0) / 1000)) / 8;
-      avgSendMs = (avgSendMs * 7 + (uint32_t)((tSend1 - tGet1) / 1000)) / 8;
+    if (!ok) {
+      char why[32];
+      snprintf(why, sizeof(why), "send failed, errno %d", errno);
+      dropViewer(why);
+      continue;
     }
+    lastFrameUs = tGet0;
+    rxProof();  // a whole frame went out: the viewer's ACKs are arriving
+    countFrame(len);
+    emaFrameBytes = emaFrameBytes == 0 ? (float)len : emaFrameBytes * 0.9f + len * 0.1f;
+    if (++adaptCount >= 10) {
+      adaptCount = 0;
+      adaptQuality();
+    }
+    lastLatencyMs = (uint32_t)((esp_timer_get_time() - capturedUs) / 1000);
+    avgGetMs = (avgGetMs * 7 + (uint32_t)((tGet1 - tGet0) / 1000)) / 8;
+    avgSendMs = (avgSendMs * 7 + (uint32_t)((tSend1 - tGet1) / 1000)) / 8;
   }
-  streamActive = false;
-  logEvent("stream: viewer left (err 0x%x)", res);
-  return res;
 }
 
 static bool queryParam(httpd_req_t *req, const char *key, char *out, size_t n) {
@@ -568,9 +757,32 @@ static esp_err_t controlHandler(httpd_req_t *req) {
   int v = atoi(val);
   if (!strcmp(var, "profile")) {
     for (int i = 0; i < (int)(sizeof(PROFILES) / sizeof(PROFILES[0])); i++) {
-      if (!strcmp(val, PROFILES[i].name)) return applyProfile(i) ? httpd_resp_send(req, "ok", 2) : httpd_resp_send_500(req);
+      if (!strcmp(val, PROFILES[i].name)) {
+        saveProfileChoice(i);
+        if (!camEnabled) {  // applied the next time the camera powers up
+          curProfile = i;
+          return httpd_resp_send(req, "ok", 2);
+        }
+        return applyProfile(i) ? httpd_resp_send(req, "ok", 2) : httpd_resp_send_500(req);
+      }
     }
     return httpd_resp_send_404(req);
+  }
+  if (!strcmp(var, "xclk")) {
+    if (v != 8 && v != 10 && v != 16 && v != 20 && v != 24) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "xclk: 8, 10, 16, 20 or 24 (MHz)");
+    camXclkHz = (uint32_t)v * 1000000;
+    if (!camEnabled) return httpd_resp_send(req, "ok (camera is off)", HTTPD_RESP_USE_STRLEN);
+    return applyProfile(curProfile) ? httpd_resp_send(req, "ok", 2) : httpd_resp_send_500(req);
+  }
+  if (!strcmp(var, "tos")) {
+    streamTos = v ? 1 : 0;
+    logEvent("stream: video priority %s", streamTos ? "on" : "off");
+    return httpd_resp_send(req, "ok", 2);
+  }
+  if (!strcmp(var, "fpscap")) {
+    streamFpsCap = v < 0 ? 0 : (v > 30 ? 30 : v);
+    logEvent("stream: fps cap %d", streamFpsCap);
+    return httpd_resp_send(req, "ok", 2);
   }
   int r = -1;
   xSemaphoreTake(camMutex, portMAX_DELAY);
@@ -585,12 +797,26 @@ static esp_err_t controlHandler(httpd_req_t *req) {
 
 
 
+// Bulk replies (log reads) make Wi-Fi copy every outgoing packet into internal RAM. Refuse to start one when
+// that RAM is already short, and let the network drain between pieces instead of piling more on.
+static const uint32_t BULK_HEAP_MIN = 36 * 1024;
+static bool bulkHeapOk() { return heap_caps_get_free_size(MALLOC_CAP_INTERNAL) >= BULK_HEAP_MIN; }
+static void bulkHeapWait() {
+  for (int i = 0; i < 50 && heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < STREAM_HEAP_OK; i++) vTaskDelay(pdMS_TO_TICKS(20));
+}
+static esp_err_t sendBusy(httpd_req_t *req) {
+  httpd_resp_set_status(req, "503 Service Unavailable");
+  httpd_resp_set_hdr(req, "Retry-After", "2");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, "board is short of memory right now - try again in a moment", HTTPD_RESP_USE_STRLEN);
+}
+
 // GET /log: the RAM ring (events + one sample per second), streamed in small pieces so a request never needs a big buffer.
 static esp_err_t logHandler(httpd_req_t *req) {
   httpd_resp_set_type(req, "text/plain");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   const size_t CAP = 2048;
-  char *b = (char *)malloc(CAP);
+  char *b = (char *)heap_caps_malloc(CAP, MALLOC_CAP_SPIRAM);
   if (!b) return httpd_resp_send_500(req);
   size_t len = 0;
   esp_err_t res = ESP_OK;
@@ -685,8 +911,9 @@ static esp_err_t logsReadHandler(httpd_req_t *req) {
   if (queryParam(req, "from", v, sizeof(v))) from = atol(v);
   if (queryParam(req, "max", v, sizeof(v))) maxb = atol(v);
   if (maxb < 1) maxb = 1;
-  if (maxb > 65536) maxb = 65536;
-  uint8_t *buf = (uint8_t *)malloc(4096);
+  if (maxb > 32768) maxb = 32768;  // bigger pieces starved Wi-Fi of internal RAM (min free fell to 4 KB)
+  if (!bulkHeapOk()) return sendBusy(req);
+  uint8_t *buf = (uint8_t *)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);  // PSRAM: internal RAM is what Wi-Fi lives on
   if (!buf) return httpd_resp_send_500(req);
   String path = String(LOG_DIR) + "/" + nm;
   File f;
@@ -727,6 +954,7 @@ static esp_err_t logsReadHandler(httpd_req_t *req) {
   size_t left = toSend;
   while (res == ESP_OK && left > 0) {
     int want = left > 4096 ? 4096 : (int)left, got = 0;
+    bulkHeapWait();
     if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1500)) != pdTRUE) break;
     got = f.read(buf, want);
     xSemaphoreGive(sdMutex);
@@ -749,9 +977,10 @@ static esp_err_t logSdHandler(httpd_req_t *req) {
   char v[12];
   long kb = 64;
   if (queryParam(req, "tail", v, sizeof(v))) kb = atol(v);
+  if (!bulkHeapOk()) return sendBusy(req);
   httpd_resp_set_type(req, "text/plain");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  uint8_t *buf = (uint8_t *)malloc(4096);
+  uint8_t *buf = (uint8_t *)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);  // PSRAM: internal RAM is what Wi-Fi lives on
   if (!buf) return httpd_resp_send_500(req);
   File f;
   size_t size = 0, pos = 0;
@@ -772,6 +1001,7 @@ static esp_err_t logSdHandler(httpd_req_t *req) {
   esp_err_t res = ESP_OK;
   while (res == ESP_OK) {
     int n = 0;
+    bulkHeapWait();
     if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1500)) != pdTRUE) break;
     n = f.read(buf, 4096);
     xSemaphoreGive(sdMutex);
@@ -986,7 +1216,11 @@ static esp_err_t printerReply(httpd_req_t *req, bool ok, const String &err, cons
   return sendJsonStatus(req, ok ? "200 OK" : "409 Conflict", out);
 }
 
-static esp_err_t printerStatusHandler(httpd_req_t *req) { return sendJsonStatus(req, "200 OK", printerStatusJson()); }
+static void notePhone(httpd_req_t *req);
+static esp_err_t printerStatusHandler(httpd_req_t *req) {
+  notePhone(req);
+  return sendJsonStatus(req, "200 OK", printerStatusJson());
+}
 
 static esp_err_t printerLinkHandler(httpd_req_t *req) {
   String err;
@@ -1049,8 +1283,34 @@ static esp_err_t printerSimHandler(httpd_req_t *req) {
 }
 
 
-// POST /camera?on=1|0 - the phone (which owns the printer's smart plug) switches the camera with the plug.
+// POST /camera?on=1|0 - switch the camera (on by default after boot; the dashboard toggle calls this via the phone).
+// The phone's address as last seen by the board (the phone polls /printer/status and switches the camera), so
+// GET /app can send a browser to the dashboard even after the phone's IP changed: bookmark
+// http://printhost-cam.local/app instead of the phone's IP.
+static char phoneIp[20] = "";
+static void notePhone(httpd_req_t *req) {
+  char ua[24] = "";
+  if (httpd_req_get_hdr_value_str(req, "User-Agent", ua, sizeof(ua)) != ESP_OK && ua[0] == 0) return;
+  if (strncmp(ua, "Dalvik", 6) != 0) return;  // Android's HttpURLConnection: that is our phone
+  String ip = peerIp(req);
+  strlcpy(phoneIp, ip.c_str(), sizeof(phoneIp));
+}
+
+static esp_err_t appRedirectHandler(httpd_req_t *req) {
+  if (!phoneIp[0]) {
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_send(req, "The phone has not contacted the board yet - try again in a few seconds.", HTTPD_RESP_USE_STRLEN);
+  }
+  static char loc[64];
+  snprintf(loc, sizeof(loc), "http://%s:8899/", phoneIp);
+  httpd_resp_set_status(req, "302 Found");
+  httpd_resp_set_hdr(req, "Location", loc);
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  return httpd_resp_send(req, nullptr, 0);
+}
+
 static esp_err_t cameraPowerHandler(httpd_req_t *req) {
+  notePhone(req);
   String v = queryValue(req, "on");
   if (v != "0" && v != "1") return sendJsonStatus(req, "400 Bad Request", "{\"ok\":false,\"error\":\"use on=1 or on=0\"}");
   logEvent("camera: %s requested by %s", v == "1" ? "ON" : "OFF", peerIp(req).c_str());
@@ -1096,16 +1356,19 @@ static esp_err_t statusHandler(httpd_req_t *req) {
   float envTempC = 0, envHum = 0;
   bool envOk = false;
   dht11Snapshot(envTempC, envHum, envOk);
-  char buf[1100];
+  uint8_t wch = 0;
+  wifi_second_chan_t wsec;
+  esp_wifi_get_channel(&wch, &wsec);
+  char buf[1150];
   snprintf(buf, sizeof(buf),
            "{\"fps\":%.2f,\"frameBytes\":%u,\"mode\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,"
            "\"freePsram\":%u,\"sd\":\"%s\",\"uptime\":%lu,\"latencyMs\":%u,\"profile\":\"%s\",\"getMs\":%u,\"sendMs\":%u,\"wifiDrops\":%lu,\"reset\":\"%s\",\"tempC\":%.1f,\"cpu0\":%u,\"cpu1\":%u,\"cameraOn\":%s,\"quality\":%d,\"freeHeapKB\":%u,\"minHeapKB\":%u,\"totalHeapKB\":%u,"
-           "\"envOk\":%s,\"envTempC\":%.1f,\"envHum\":%.0f}",
+           "\"envOk\":%s,\"envTempC\":%.1f,\"envHum\":%.0f,\"channel\":%u}",
            currentFps, (unsigned)lastFrameBytes, staMode ? "sta" : "ap", WiFi.SSID().c_str(),
            (staMode ? WiFi.localIP() : WiFi.softAPIP()).toString().c_str(), staMode ? WiFi.RSSI() : 0,
            (unsigned)ESP.getFreePsram(), sdStatus.c_str(), millis() / 1000, (unsigned)lastLatencyMs, PROFILES[curProfile].name, (unsigned)avgGetMs, (unsigned)avgSendMs, (unsigned long)wifiDrops, resetReasonText.c_str(), chipTempC, cpuLoad[0], cpuLoad[1], camEnabled ? "true" : "false", curQuality,
            (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getMinFreeHeap() / 1024), (unsigned)(ESP.getHeapSize() / 1024),
-           envOk ? "true" : "false", envTempC, envHum);
+           envOk ? "true" : "false", envTempC, envHum, (unsigned)wch);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");  // the main dashboard reads this from the phone
   return httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
@@ -1144,21 +1407,216 @@ static esp_err_t wifiHandler(httpd_req_t *req) {
   return ESP_OK;
 }
 
+// ---- Channel survey: how busy is each 2.4 GHz channel, and who is talking there -----------------
+// GET /debug/survey?ms=400: listens on channels 1-13 in turn (promiscuous) and adds up the air time of
+// every frame it can decode (length / PHY rate + preamble). A lower bound - ACKs' gaps, backoff and
+// non-Wi-Fi noise are not counted - but good for comparing channels. The board leaves its own channel
+// for the whole survey (~13 x ms), so the stream stalls meanwhile; refused while printing.
+struct SvTalker {
+  uint8_t mac[6];
+  uint32_t airUs, frames;
+  int8_t rssi;
+};
+static const int SV_TALKERS = 32;
+static SvTalker svTalk[SV_TALKERS];
+static volatile int svTalkN = 0;
+static volatile uint32_t svFrames = 0, svBytes = 0, svAirUs = 0, svBad = 0;
+static volatile bool surveyActive = false;  // wifiKeepAlive() leaves the radio alone meanwhile
+static portMUX_TYPE svMux = portMUX_INITIALIZER_UNLOCKED;
+
+static float legacyMbps(unsigned rate) {
+  switch (rate) {
+    case 0: return 1; case 1: case 5: return 2; case 2: case 6: return 5.5f; case 3: case 7: return 11;
+    case 11: return 6; case 15: return 9; case 10: return 12; case 14: return 18;
+    case 9: return 24; case 13: return 36; case 8: return 48; case 12: return 54;
+    default: return 0;
+  }
+}
+
+static void svPacket(void *buf, wifi_promiscuous_pkt_type_t type) {
+  const wifi_promiscuous_pkt_t *p = (const wifi_promiscuous_pkt_t *)buf;
+  const wifi_pkt_rx_ctrl_t &rc = p->rx_ctrl;
+  uint32_t len = rc.sig_len;
+  float mbps;
+  uint32_t preUs;
+  if (rc.sig_mode == 0) {
+    mbps = legacyMbps(rc.rate);
+    preUs = mbps <= 11 ? 192 : 20;  // DSSS long preamble vs OFDM
+  } else {
+    static const float HT20[8] = {6.5f, 13, 19.5f, 26, 39, 52, 58.5f, 65};
+    mbps = HT20[rc.mcs & 7] * (rc.mcs >= 8 ? 2 : 1) * (rc.cwb ? 2.08f : 1) * (rc.sgi ? 1.11f : 1);
+    preUs = 36;
+  }
+  if (mbps <= 0) {
+    svBad++;
+    return;
+  }
+  uint32_t air = preUs + (uint32_t)(len * 8 / mbps);
+  portENTER_CRITICAL(&svMux);
+  svFrames++;
+  svBytes += len;
+  svAirUs += air;
+  if (type != WIFI_PKT_CTRL && len >= 16) {  // management/data: the transmitter is address 2
+    const uint8_t *ta = p->payload + 10;
+    int i = 0;
+    for (; i < svTalkN; i++)
+      if (!memcmp(svTalk[i].mac, ta, 6)) break;
+    if (i == svTalkN && svTalkN < SV_TALKERS) {
+      memcpy(svTalk[i].mac, ta, 6);
+      svTalk[i].airUs = svTalk[i].frames = 0;
+      svTalkN++;
+    }
+    if (i < svTalkN) {
+      svTalk[i].airUs += air;
+      svTalk[i].frames++;
+      svTalk[i].rssi = rc.rssi;
+    }
+  }
+  portEXIT_CRITICAL(&svMux);
+}
+
+static String surveyResult = "{\"ok\":false,\"error\":\"no survey yet\"}";
+static volatile int surveyDwellMs = 400;
+
+static void surveyTask(void *) {
+  int dwell = surveyDwellMs;
+  uint8_t home = 1;
+  wifi_second_chan_t sec = WIFI_SECOND_CHAN_NONE;
+  esp_wifi_get_channel(&home, &sec);
+  logEvent("survey: start, %d ms per channel (home ch%u)", dwell, (unsigned)home);
+  // The driver will not leave the home channel while associated: drop the router for the survey (~13 x dwell)
+  // and rejoin afterwards.
+  delay(500);  // let the "started" reply leave first
+  bool wasConnected = WiFi.status() == WL_CONNECTED;
+  if (wasConnected) {
+    esp_wifi_disconnect();
+    delay(300);
+  }
+  wifi_promiscuous_filter_t flt = {WIFI_PROMIS_FILTER_MASK_ALL};
+  esp_wifi_set_promiscuous_filter(&flt);
+  wifi_promiscuous_filter_t cflt = {WIFI_PROMIS_CTRL_FILTER_MASK_ALL};
+  esp_wifi_set_promiscuous_ctrl_filter(&cflt);
+  esp_wifi_set_promiscuous_rx_cb(svPacket);
+  esp_wifi_set_promiscuous(true);
+  String out = "{\"ok\":true,\"homeChannel\":" + String(home) + ",\"ms\":" + String(dwell) + ",\"channels\":[";
+  for (int ch = 1; ch <= 13; ch++) {
+    esp_err_t ce = esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+    if (ce != ESP_OK) logEvent("survey: set channel %d failed 0x%x", ch, ce);
+    portENTER_CRITICAL(&svMux);
+    svFrames = svBytes = svAirUs = svBad = 0;
+    svTalkN = 0;
+    portEXIT_CRITICAL(&svMux);
+    delay(dwell);
+    portENTER_CRITICAL(&svMux);
+    uint32_t fr = svFrames, by = svBytes, air = svAirUs, bad = svBad;
+    int tn = svTalkN;
+    SvTalker top[3] = {};
+    for (int k = 0; k < 3; k++) {  // three biggest talkers by air time
+      int best = -1;
+      for (int i = 0; i < tn; i++) {
+        bool used = false;
+        for (int j = 0; j < k; j++)
+          if (!memcmp(top[j].mac, svTalk[i].mac, 6)) used = true;
+        if (!used && (best < 0 || svTalk[i].airUs > svTalk[best].airUs)) best = i;
+      }
+      if (best >= 0) top[k] = svTalk[best];
+    }
+    portEXIT_CRITICAL(&svMux);
+    char row[360];
+    int n = snprintf(row, sizeof(row), "%s{\"ch\":%d,\"frames\":%u,\"kB\":%u,\"airPct\":%.1f,\"undecoded\":%u,\"talkers\":%d,\"top\":[", ch > 1 ? "," : "", ch,
+                     (unsigned)fr, (unsigned)(by / 1024), air * 100.0f / (dwell * 1000.0f), (unsigned)bad, tn);
+    for (int k = 0; k < 3 && top[k].frames; k++)
+      n += snprintf(row + n, sizeof(row) - n, "%s{\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"airPct\":%.1f,\"frames\":%u,\"rssi\":%d}", k ? "," : "",
+                    top[k].mac[0], top[k].mac[1], top[k].mac[2], top[k].mac[3], top[k].mac[4], top[k].mac[5], top[k].airUs * 100.0f / (dwell * 1000.0f),
+                    (unsigned)top[k].frames, top[k].rssi);
+    snprintf(row + n, sizeof(row) - n, "]}");
+    out += row;
+    logEvent("survey: ch%d air %.1f%% frames %u talkers %d", ch, air * 100.0f / (dwell * 1000.0f), (unsigned)fr, tn);
+  }
+  esp_wifi_set_promiscuous(false);
+  esp_wifi_set_channel(home, sec);
+  surveyActive = false;
+  if (wasConnected) WiFi.reconnect();
+  out += "]}";
+  surveyResult = out;
+  logEvent("survey: done, back on ch%u", (unsigned)home);
+  vTaskDelete(nullptr);
+}
+
+// GET /debug/survey?ms=400 starts a survey in the background (the board drops off the network for ~13 x ms);
+// GET /debug/survey?result=1 returns the last result once the board is back.
+static esp_err_t debugSurveyHandler(httpd_req_t *req) {
+  if (queryValue(req, "result") == "1") return sendJsonStatus(req, "200 OK", surveyActive ? "{\"ok\":false,\"error\":\"running\"}" : surveyResult);
+  if (surveyActive) return sendJsonStatus(req, "409 Conflict", "{\"ok\":false,\"error\":\"a survey is already running\"}");
+  PrinterSnap ps;
+  printerSnapshot(ps);
+  if ((ps.state == PS_PRINTING || ps.state == PS_PAUSED) && queryValue(req, "force") != "1")
+    return sendJsonStatus(req, "409 Conflict", "{\"ok\":false,\"error\":\"printing - the survey takes the radio off its channel\"}");
+  int dwell = queryValue(req, "ms").toInt();
+  if (dwell < 100) dwell = 400;
+  if (dwell > 2000) dwell = 2000;
+  surveyDwellMs = dwell;
+  surveyActive = true;  // set here so a second request cannot slip in before the task starts
+  sendJsonStatus(req, "202 Accepted", String("{\"ok\":true,\"started\":true,\"seconds\":") + String((13 * dwell) / 1000 + 3) + "}");
+  xTaskCreate(surveyTask, "survey", 6144, nullptr, 4, nullptr);
+  return ESP_OK;
+}
+
+// GET /debug/tx?sec=10: raw upload speed test - the board sends filler bytes for that long (no camera involved),
+// the client measures the rate. Blocks the main HTTP server meanwhile, so keep it short.
+static esp_err_t debugTxHandler(httpd_req_t *req) {
+  int sec = queryValue(req, "sec").toInt();
+  if (sec < 1) sec = 10;
+  if (sec > 30) sec = 30;
+  const size_t CH = 4096;
+  char *b = (char *)heap_caps_malloc(CH, MALLOC_CAP_SPIRAM);
+  if (!b) return httpd_resp_send_500(req);
+  memset(b, 'x', CH);
+  httpd_resp_set_type(req, "application/octet-stream");
+  uint32_t t0 = millis();
+  size_t sent = 0;
+  esp_err_t res = ESP_OK;
+  while (res == ESP_OK && millis() - t0 < (uint32_t)sec * 1000) {
+    if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < STREAM_HEAP_LOW) {
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+    res = httpd_resp_send_chunk(req, b, CH);
+    if (res == ESP_OK) sent += CH;
+  }
+  free(b);
+  logEvent("tx test: %u KB in %us = %u KB/s", (unsigned)(sent / 1024), (unsigned)((millis() - t0) / 1000),
+           (unsigned)(sent / 1024 * 1000 / (millis() - t0 + 1)));
+  if (res != ESP_OK) return res;
+  return httpd_resp_send_chunk(req, nullptr, 0);
+}
+
+static esp_err_t debugWifiHandler(httpd_req_t *req);
+
 static void startServers() {
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.server_port = 80;
-  cfg.max_uri_handlers = 32;
+  cfg.max_uri_handlers = 40;
   cfg.stack_size = 8192;  // file upload touches FATFS + Strings
   cfg.recv_wait_timeout = 10;
   cfg.send_wait_timeout = 10;
   cfg.max_open_sockets = 5;
   cfg.lru_purge_enable = true;  // drop the oldest idle browser connection instead of refusing new ones
+  cfg.open_fn = [](httpd_handle_t, int) -> esp_err_t {
+    rxProof();  // an incoming connection: packets reach us
+    return ESP_OK;
+  };
   httpd_uri_t uris[] = {
       {"/", HTTP_GET, indexHandler, nullptr},
       {"/capture", HTTP_GET, captureHandler, nullptr},
       {"/control", HTTP_GET, controlHandler, nullptr},
       {"/status", HTTP_GET, statusHandler, nullptr},
+      {"/app", HTTP_GET, appRedirectHandler, nullptr},
       {"/debug/heap", HTTP_GET, debugHeapHandler, nullptr},
+      {"/debug/wifi", HTTP_GET, debugWifiHandler, nullptr},
+      {"/debug/wifi", HTTP_POST, debugWifiHandler, nullptr},
+      {"/debug/survey", HTTP_GET, debugSurveyHandler, nullptr},
+      {"/debug/tx", HTTP_GET, debugTxHandler, nullptr},
       {"/log", HTTP_GET, logHandler, nullptr},
       {"/log/sd", HTTP_GET, logSdHandler, nullptr},
       {"/camera", HTTP_POST, cameraPowerHandler, nullptr},
@@ -1185,26 +1643,111 @@ static void startServers() {
   if (httpd_start(&mainServer, &cfg) == ESP_OK) {
     for (auto &u : uris) httpd_register_uri_handler(mainServer, &u);
   }
-  httpd_config_t scfg = HTTPD_DEFAULT_CONFIG();
-  scfg.server_port = 81;
-  scfg.max_open_sockets = 3;
-  scfg.lru_purge_enable = false;  // a second viewer must never cut off the first
-  scfg.ctrl_port += 1;
-  httpd_uri_t streamUri = {"/stream", HTTP_GET, streamHandler, nullptr};
-  if (httpd_start(&streamServer, &scfg) == ESP_OK) httpd_register_uri_handler(streamServer, &streamUri);
+  xTaskCreate(streamTask, "stream", 6144, nullptr, 5, nullptr);  // same priority/affinity as the old httpd stream task
+}
+
+// ---- Wi-Fi: join the router, keep rejoining forever, never reboot because of the network ----------
+// The network only carries telemetry and the camera; a print runs from the SD card over USB and must
+// never stop because Wi-Fi or the router went away. So there is no "reboot after N minutes offline".
+//
+// RX watchdog: twice on 2026-09-24 the board went deaf while still associated (nothing received, ARP
+// to it failed, the router listed it as connected with no traffic) - once for an hour until the router
+// dropped it with reason 16, once until a power cycle. Pinging the gateway catches that: if it has
+// not answered for WD_SILENCE_MS while we believe we are connected, leave and rejoin.
+static const uint32_t WD_PING_MS = 5000;
+static const uint32_t WD_SILENCE_MS = 45000;
+static const uint32_t STA_RETRY_MS = 30000;  // setup-network mode: try the router again this often
+static esp_ping_handle_t pingHandle = nullptr;
+static volatile uint32_t lastGatewayReplyMs = 0;
+static volatile uint32_t gatewayPingOk = 0, gatewayPingLost = 0;
+static uint32_t wdRejoins = 0;
+static volatile bool setupTestDue = false;  // /debug/wifi?test=setup
+
+static void onPingOk(esp_ping_handle_t h, void *) {
+  lastGatewayReplyMs = millis();
+  lastRxProofMs = lastGatewayReplyMs;
+  gatewayPingOk++;
+  uint32_t rtt = 0;
+  esp_ping_get_profile(h, ESP_PING_PROF_TIMEGAP, &rtt, sizeof(rtt));
+  gwOkWin++;
+  gwRttSumWin += rtt;
+  if (rtt > gwRttMaxWin) gwRttMaxWin = rtt;
+}
+static void onPingLost(esp_ping_handle_t, void *) {
+  gatewayPingLost++;
+  gwLostWin++;
+}
+
+// (Re)starts the endless gateway ping. Called when an IP is obtained (the gateway may change).
+static void startGatewayPing(IPAddress target) {
+  if (pingHandle) {
+    esp_ping_stop(pingHandle);
+    esp_ping_delete_session(pingHandle);
+    pingHandle = nullptr;
+  }
+  esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
+  cfg.count = ESP_PING_COUNT_INFINITE;
+  cfg.interval_ms = WD_PING_MS;
+  cfg.timeout_ms = 2000;
+  cfg.data_size = 16;
+  ip_addr_t a = {};
+  IP_ADDR4(&a, target[0], target[1], target[2], target[3]);
+  cfg.target_addr = a;
+  esp_ping_callbacks_t cbs = {};
+  cbs.on_ping_success = onPingOk;
+  cbs.on_ping_timeout = onPingLost;
+  lastGatewayReplyMs = lastRxProofMs = millis();  // a fresh start gets a full grace period
+  if (esp_ping_new_session(&cfg, &cbs, &pingHandle) == ESP_OK) esp_ping_start(pingHandle);
+  else logEvent("wifi: watchdog ping could not start");
+}
+
+static void applyStaTuning() {
+  WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+}
+
+// First time the router is reached (at boot or later from setup-network mode): the services that
+// only make sense on the home network.
+static void onRouterJoined() {
+  staMode = true;
+  WiFi.setAutoReconnect(false);  // wifiKeepAlive() is the only one that reconnects (two owners fought each other)
+  applyStaTuning();
+  if (!staServicesUp) {
+    staServicesUp = true;
+    MDNS.begin(HOSTNAME);
+    ArduinoOTA.setHostname(HOSTNAME);
+    ArduinoOTA.setPassword(OTA_PASS);
+    ArduinoOTA.onStart([]() { logEvent("ota: update starting"); });
+    ArduinoOTA.onEnd([]() { logEvent("ota: update finished, rebooting"); });
+    ArduinoOTA.onError([](ota_error_t e) { logEvent("ota: ERROR %d", (int)e); });
+    ArduinoOTA.begin();
+  }
+  Serial.printf("WIFI: connected, IP %s, open http://%s/ or http://%s.local/\n", WiFi.localIP().toString().c_str(),
+                WiFi.localIP().toString().c_str(), HOSTNAME);
+}
+
+static void startSetupNetwork() {
+  // AP+STA: the setup page stays reachable, and the router is retried in the background (it may
+  // simply have been off when the board booted).
+  WiFi.mode(staSsid.length() ? WIFI_AP_STA : WIFI_AP);
+  WiFi.softAP(AP_SSID);
+  logEvent("wifi: router not reachable - setup network '%s' up, retrying the router every %us", AP_SSID, (unsigned)(STA_RETRY_MS / 1000));
+  Serial.printf("WIFI: setup network '%s' (open), page at http://%s/\n", AP_SSID, WiFi.softAPIP().toString().c_str());
 }
 
 static void startNetwork() {
   prefs.begin("wifi", false);
-  String ssid = prefs.getString("ssid", "");
-  String pass = prefs.getString("pass", "");
+  staSsid = prefs.getString("ssid", "");
+  staPass = prefs.getString("pass", "");
 #ifdef WIFI_SSID
-  if (ssid.length() == 0) {
-    ssid = WIFI_SSID;
-    pass = WIFI_PASS;
+  if (staSsid.length() == 0) {
+    staSsid = WIFI_SSID;
+    staPass = WIFI_PASS;
   }
 #endif
   WiFi.setHostname(HOSTNAME);
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);  // always look on every channel: the router's channel may have changed
   WiFi.onEvent(wifiEvent);
   WiFi.mode(WIFI_STA);
   int found = WiFi.scanNetworks();
@@ -1215,36 +1758,114 @@ static void startNetwork() {
     // fact from /logs alone, without needing USB serial plugged in at the time it happens.
     logEvent("wifi scan: '%s' ch%d %ddBm", WiFi.SSID(i).c_str(), WiFi.channel(i), WiFi.RSSI(i));
   }
-  if (ssid.length()) {
-    Serial.printf("WIFI: connecting to '%s'...\n", ssid.c_str());
-    WiFi.mode(WIFI_STA);
+  WiFi.scanDelete();
+  if (staSsid.length()) {
+    Serial.printf("WIFI: connecting to '%s'...\n", staSsid.c_str());
     esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
     esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
-    WiFi.begin(ssid.c_str(), pass.c_str());
+    WiFi.begin(staSsid.c_str(), staPass.c_str());
     uint32_t t0 = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - t0 < STA_TIMEOUT_MS) delay(250);
     if (WiFi.status() == WL_CONNECTED) {
-      staMode = true;
-      WiFi.setAutoReconnect(true);
-      WiFi.setSleep(false);
-      esp_wifi_set_ps(WIFI_PS_NONE);
-      WiFi.setTxPower(WIFI_POWER_19_5dBm);
-      MDNS.begin(HOSTNAME);
-      ArduinoOTA.setHostname(HOSTNAME);
-      ArduinoOTA.setPassword(OTA_PASS);
-      ArduinoOTA.onStart([]() { logEvent("ota: update starting"); });
-      ArduinoOTA.onEnd([]() { logEvent("ota: update finished, rebooting"); });
-      ArduinoOTA.onError([](ota_error_t e) { logEvent("ota: ERROR %d", (int)e); });
-      ArduinoOTA.begin();
-      Serial.printf("WIFI: connected, IP %s, open http://%s/ or http://%s.local/\n", WiFi.localIP().toString().c_str(),
-                    WiFi.localIP().toString().c_str(), HOSTNAME);
+      onRouterJoined();
       return;
     }
     Serial.println("WIFI: connect failed, falling back to setup network");
   }
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID);
-  Serial.printf("WIFI: setup network '%s' (open), page at http://%s/\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+  startSetupNetwork();
+}
+
+// Called from loop(): keeps the router connection alive, in every mode.
+static void wifiKeepAlive(uint32_t now) {
+  static uint32_t downSince = 0, lastRetry = 0, lastRejoin = 0;
+  if (!staSsid.length()) return;  // no router configured: setup network only
+  if (surveyActive) return;       // a channel survey has the radio
+  if (setupTestDue && staMode) {
+    setupTestDue = false;
+    logEvent("wifi: TEST setup - dropping to the setup network");
+    staMode = false;
+    WiFi.disconnect(false, false);
+    startSetupNetwork();
+    lastRetry = now;  // the first retry comes after the full STA_RETRY_MS, as it would after a failed boot
+    return;
+  }
+  if (!staMode) {
+    // Setup-network mode: keep trying the router; once it answers, switch to normal operation.
+    if (WiFi.status() == WL_CONNECTED) {
+      logEvent("wifi: router reachable again - leaving setup network");
+      WiFi.softAPdisconnect(true);
+      WiFi.mode(WIFI_STA);
+      onRouterJoined();
+    } else if (now - lastRetry >= STA_RETRY_MS) {
+      lastRetry = now;
+      WiFi.begin(staSsid.c_str(), staPass.c_str());
+    }
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    // One owner for reconnecting (Arduino's own auto-reconnect is off, see onRouterJoined): a fresh join with a
+    // scan of ALL channels (the router may have moved to another channel), and a started attempt is never cut
+    // short - scan + authentication can take several seconds on a busy band. No giving up, no reboot.
+    static uint32_t attempt = 0;
+    if (downSince == 0) {
+      downSince = now;
+      attempt = 0;
+      lastRetry = now - 9000;  // first attempt ~1 s after the drop
+    }
+    uint32_t wait = attempt < 1 ? 10000 : (attempt < 3 ? 20000 : 30000);
+    if (now - lastRetry >= wait) {
+      lastRetry = now;
+      attempt++;
+      if (attempt <= 5 || attempt % 10 == 0)
+        logEvent("wifi: rejoin attempt %u after %us offline (status %d)", (unsigned)attempt, (unsigned)((now - downSince) / 1000), (int)WiFi.status());
+      WiFi.disconnect(false, false);
+      WiFi.begin(staSsid.c_str(), staPass.c_str());
+    }
+    return;
+  }
+  if (downSince) {
+    logEvent("wifi: back after %us offline", (unsigned)((now - downSince) / 1000));
+    downSince = 0;
+  }
+  if (gatewayPingRestartDue) {
+    gatewayPingRestartDue = false;
+    startGatewayPing(WiFi.gatewayIP());
+  }
+  // Connected as far as the driver knows. Deaf? (see the comment above)
+  if (!pingHandle) return;
+  uint32_t last = lastRxProofMs;  // written by other tasks: it can be a few ms newer than "now"
+  uint32_t silent = (int32_t)(now - last) > 0 ? now - last : 0;
+  if (silent > WD_SILENCE_MS && now - lastRejoin > WD_SILENCE_MS) {
+    lastRejoin = now;
+    wdRejoins++;
+    logEvent("wifi: WATCHDOG nothing received for %us (ping ok %u lost %u), rssi %d, heap %u KB - rejoining (#%u)", (unsigned)(silent / 1000),
+             (unsigned)gatewayPingOk, (unsigned)gatewayPingLost, WiFi.RSSI(), (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)wdRejoins);
+    lastGatewayReplyMs = lastRxProofMs = now;  // grace period for the rejoin itself
+    esp_wifi_disconnect();     // the reconnect branch above takes it from here
+  }
+}
+
+// POST /debug/wifi?test=deaf|setup - exercises the recovery paths on purpose.
+//   deaf:  ping an address that never answers, so the watchdog must fire and rejoin (~45 s) - as long as nothing
+//          else proves the link meanwhile (no new HTTP connections, no stream viewer).
+//   setup: drop to setup-network mode as if the router had been unreachable at boot (~30 s back).
+static esp_err_t debugWifiHandler(httpd_req_t *req) {
+  String t = queryValue(req, "test");
+  if (t == "deaf") {
+    wdPingOnlyUntilMs = millis() + 90000;
+    startGatewayPing(IPAddress(192, 0, 2, 1));  // TEST-NET-1: nothing ever answers there
+    logEvent("wifi: TEST deaf - pinging a black hole, watchdog should rejoin in ~%us", (unsigned)(WD_SILENCE_MS / 1000));
+    return sendJsonStatus(req, "200 OK", "{\"ok\":true,\"test\":\"deaf\"}");
+  }
+  if (t == "setup") {
+    setupTestDue = true;  // done by loop(), so it cannot race wifiKeepAlive()
+    return sendJsonStatus(req, "200 OK", "{\"ok\":true,\"test\":\"setup\"}");
+  }
+  char buf[200];
+  snprintf(buf, sizeof(buf), "{\"ok\":true,\"sta\":%s,\"gatewaySilentMs\":%u,\"pingOk\":%u,\"pingLost\":%u,\"watchdogRejoins\":%u,\"streamHeapPauses\":%u}",
+           staMode ? "true" : "false", (unsigned)(millis() - lastGatewayReplyMs), (unsigned)gatewayPingOk, (unsigned)gatewayPingLost,
+           (unsigned)wdRejoins, (unsigned)streamHeapPauses);
+  return sendJsonStatus(req, "200 OK", buf);
 }
 
 void setup() {
@@ -1277,40 +1898,24 @@ void setup() {
     logCleanupDue = true;  // no print can be running yet: the first log tick tidies up
   }
   logEvent("BOOT: %s, OTA-verified build %s %s, free heap %u KB, SD %s", resetReasonText.c_str(), __DATE__, __TIME__, (unsigned)(ESP.getFreeHeap() / 1024), sdStatus.c_str());
-  // The camera stays powered down until the phone reports the printer plug is on (POST /camera?on=1).
-  Serial.println("CAM: off until the plug turns on");
   fpsWindowStart = millis();
   printerBegin();  // starts the engine task only; the printer link stays unselected until a client asks
   dht11Begin(21);  // room sensor on GPIO 21 (moved from 14) - see docs/HANDOFF_ESP32_BRIDGE.md
   startNetwork();
   startServers();
+  loadProfileChoice();
+  setCameraEnabled(true);  // on by default; POST /camera?on=0|1 switches it at any time
 }
 
-// Rejoin the router on its own (it may reboot or change channel), and reboot if that keeps failing.
 void loop() {
-  static uint32_t downSince = 0;
-  if (staMode) {
-    if (WiFi.status() == WL_CONNECTED) {
-      downSince = 0;
-    } else {
-      if (downSince == 0) downSince = millis();
-      uint32_t down = millis() - downSince;
-      if (down > 5000 && (down / 5000) != ((down - 1000) / 5000)) {
-        Serial.println("WIFI: link down, reconnecting");
-        WiFi.reconnect();
-      }
-      if (down > 120000) {
-        logEvent("wifi: down >120s, rebooting");
-        ESP.restart();
-      }
-    }
-  }
+  uint32_t now = millis();
+  wifiKeepAlive(now);
   static uint32_t lastTick = 0;
-  if (millis() - lastTick >= 1000) {
-    lastTick = millis();
+  if (now - lastTick >= 1000) {
+    lastTick = now;
     sampleVitals();
     logTick(lastTick);
   }
-  if (staMode) ArduinoOTA.handle();
+  if (staServicesUp) ArduinoOTA.handle();
   delay(20);
 }

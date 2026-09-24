@@ -23,13 +23,21 @@ CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240=y
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
 CONFIG_LWIP_TCP_WND_DEFAULT=32768
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=64
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=16
-CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
-CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
-CONFIG_ESP_WIFI_RX_BA_WIN=32
-CONFIG_ESP_WIFI_IRAM_OPT=y
-CONFIG_ESP_WIFI_RX_IRAM_OPT=y
 CONFIG_LWIP_IRAM_OPTIMIZATION=y
+# Wi-Fi options: this build is ESP-IDF 4.4, whose names are CONFIG_ESP32_WIFI_* - the CONFIG_ESP_WIFI_* (IDF 5)
+# names used here before were silently ignored (see docs/IDF5_MIGRATION.md). With PSRAM the TX buffers are
+# always static (16). Values below are what was measured on 2026-09-24:
+#  - TX_BA_WIN 6 -> 16: raw upload 658/648 vs 490/436 KB/s in an interleaved A/B test (the stream is the
+#    board's main traffic, so uplink aggregation matters); must stay <= the 16 static TX buffers.
+#  - DYNAMIC_RX 32 -> 20: caps how much internal RAM received frames can hold (they must be DMA-capable
+#    internal memory); stream + log reads pushed free internal RAM down to 12 KB with 32.
+#  - RX_BA_WIN 16: must not exceed the dynamic RX buffers.
+CONFIG_ESP32_WIFI_STATIC_RX_BUFFER_NUM=16
+CONFIG_ESP32_WIFI_DYNAMIC_RX_BUFFER_NUM=20
+CONFIG_ESP32_WIFI_RX_BA_WIN=16
+CONFIG_ESP32_WIFI_TX_BA_WIN=16
+CONFIG_ESP32_WIFI_IRAM_OPT=y
+CONFIG_ESP32_WIFI_RX_IRAM_OPT=y
 
 # Reboot instead of freezing when a task hangs (reason shows up in /log after the restart)
 CONFIG_ESP_TASK_WDT=y
