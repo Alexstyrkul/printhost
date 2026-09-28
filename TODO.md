@@ -76,6 +76,30 @@ Tasks:
 ## Finding the phone without a fixed IP
 - [x] `http://OnePlus-6T:8899/` (the ASUS resolves the phone's DHCP name) and `http://printhost-cam.local/app` (the board redirects to the phone's last-seen IP, learned from its Dalvik requests). Both verified from the Mac.
 
+## 2026-09-28 (after the 13.3 h print)
+- [x] Camera freezes / black picture in the dashboard: the page now reads the MJPEG stream itself (fetch + multipart
+  parsing) instead of `<img src=stream>`, so it sees every frame; a watchdog restarts the connection after 6 s without
+  a frame; the badge shows "No new picture for N s" and keeps the last frame instead of going black. Only the
+  browser-to-phone leg restarts; the phone's single connection to the board is unchanged. Installed on the phone.
+- [x] Scheduled print: "Change time" button on the active schedule (same file, new date/time; a failed job becomes
+  pending again). Uses the existing `POST /schedule/set`.
+- [x] Scheduled print with the plug off: a file chosen while scheduling stays in the page, "Start at" sends it to the
+  phone (`POST /schedule/upload`), and the phone powers the plug and sends it to the board `uploadLeadMs()` before
+  the start (45 s boot + size at 200 KB/s + 2 min), then starts it on time. Upload failures retry every 20 s until
+  start + 5 min, then FAILED (the file stays on the phone for "Change time", `POST /schedule/time`). NOT yet run
+  end to end: the first real run is the 2026-09-29 08:30 job.
+- [x] Board Wi-Fi was weak on 2026-09-28 (RSSI -70, gateway loss up to 30%): only OUR router got ~10 dB quieter
+  (neighbours unchanged). The user spread the router antennas apart: back to -55..-57, 0% loss, ~27 fps.
+- [x] Free internal RAM while streaming: IDF 4.4 on the S3 never passed SPIRAM_TRY_ALLOCATE_WIFI_LWIP to lwIP (it
+  checks the old name `CONFIG_WIFI_LWIP_ALLOCATION_FROM_SPIRAM_FIRST`), so every stream packet sat in internal RAM.
+  Fixed in `esp32-firmware/CMakeLists.txt`, flashed (build 2026-09-28 20:45). Streaming: avg 94 -> 123 KB free,
+  min 49 -> 110 KB, min since boot 35 -> 88 KB.
+- [x] Remote access: Tailscale on the phone (100.101.233.103). Check that "Always-on VPN" is enabled on the phone.
+- [ ] Log download is ~100x slower than upload (1.5-5 KB/s vs 270-460 KB/s): `/logs/read` caps a request at 32 KB and
+  sends 4 KB pieces with a heap wait before each. When no print runs, allow a whole-file streamed download (bigger
+  pieces, one request) so a 10 MB log takes seconds, not half an hour.
+- [ ] Board gap max of ~1.41-1.43 s shows up again and again (avg 14 ms); find what stalls the feed for 1.4 s.
+
 ## Older open items (from the handoff)
 - [-] SKIPPED (user, 2026-09-24): Pause/stop: park the nozzle away from the part (today stop turns the heaters and fan off; the nozzle stays over the print).
 - [-] SKIPPED (user, 2026-09-24): Long file names instead of the 8.3 scheme (`SdFilenameMap`), now that storage is on the board.

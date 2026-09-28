@@ -192,11 +192,15 @@ public class PrinterService extends Service {
             state.scheduledFileDisplay = null;
             state.scheduledAtMillis = 0;
             state.scheduledStatus = null;
+            state.scheduledOnPhone = false;
+            state.scheduledSendAtMillis = 0;
         } else {
             state.scheduledFile = job.filename;
             state.scheduledFileDisplay = job.displayName;
             state.scheduledAtMillis = job.atMillis;
             state.scheduledStatus = job.status;
+            state.scheduledOnPhone = job.needsUpload();
+            state.scheduledSendAtMillis = job.needsUpload() ? job.atMillis - uploadLeadMs(job.sizeBytes) : 0;
         }
     }
 
@@ -927,16 +931,141 @@ public class PrinterService extends Service {
     }
 
     // ---- scheduled print ------------------------------------------------------------------------
-    // Deliberately requires `filename` to already be sitting on the printer's SD card (same
-    // short name selectSdFile()/the sdfiles list already use) - the whole point is a fast,
-    // near-instant start at the target time, not kicking off a slow M28/M29 upload unattended.
+    // Two kinds of job: a file already on the board's SD card (setScheduledPrint, started at the target
+    // time), or a file kept on this phone because the board was off when it was scheduled
+    // (setScheduledPrintFromPhone): that one is sent to the board uploadLeadMs() early, so it still
+    // starts on time.
 
     public void setScheduledPrint(String filename, String displayName, long atMillis) {
+        deleteScheduledLocalFile(scheduledPrintStore.get());
         scheduledPrintStore.set(filename, displayName, atMillis);
     }
 
+    /**
+     * Schedules a file that is NOT on the board yet - the usual case when the plug (and with it the board) is off.
+     * The file is kept on this phone; uploadLeadMs() before the start the phone powers the plug, sends the file to
+     * the board (size + CRC checked) and then starts it like any other scheduled print.
+     */
+    public UploadOutcome setScheduledPrintFromPhone(String displayName, InputStream body, long contentLength, long atMillis) {
+        if (displayName == null || displayName.trim().isEmpty()) return new UploadOutcome(false, "Missing file name");
+        File dest = new File(getFilesDir(), "scheduled_upload.gcode");
+        File tmp = new File(getFilesDir(), "scheduled_upload.tmp");
+        try {
+            saveToLocalFile(body, tmp);
+        } catch (IOException e) {
+            tmp.delete();
+            return new UploadOutcome(false, "Failed to receive the file: " + e.getMessage());
+        }
+        if (tmp.length() == 0 || (contentLength > 0 && tmp.length() != contentLength)) {
+            long got = tmp.length();
+            tmp.delete();
+            return new UploadOutcome(false, "The file arrived incomplete (" + got + " of " + contentLength + " bytes)");
+        }
+        dest.delete();
+        if (!tmp.renameTo(dest)) {
+            tmp.delete();
+            return new UploadOutcome(false, "Couldn't store the file on the phone");
+        }
+        scheduledPrintStore.setWithLocalFile(toSafeSdFilename(displayName), displayName, atMillis, dest.getAbsolutePath(), dest.length());
+        return new UploadOutcome(true, "Scheduled; the file goes to the board before the start");
+    }
+
+    /** "Change time": same file, new time; a failed job becomes pending again. */
+    public boolean rescheduleScheduledPrint(long atMillis) {
+        return scheduledPrintStore.reschedule(atMillis);
+    }
+
     public void cancelScheduledPrint() {
+        deleteScheduledLocalFile(scheduledPrintStore.get());
         scheduledPrintStore.clear();
+    }
+
+    private static void deleteScheduledLocalFile(ScheduledPrintStore.Job job) {
+        if (job != null && job.localPath != null) new File(job.localPath).delete();
+    }
+
+    // How long before the start a phone-held file is sent: the plug and the board need ~30 s to boot and join
+    // Wi-Fi, the upload runs at 250-460 KB/s (counted at the slow end), plus a couple of minutes for one retry.
+    private static final long UPLOAD_BOOT_MS = 45_000;
+    private static final long UPLOAD_BYTES_PER_SEC = 200 * 1024;
+    private static final long UPLOAD_MARGIN_MS = 120_000;
+
+    static long uploadLeadMs(long sizeBytes) {
+        return UPLOAD_BOOT_MS + sizeBytes * 1000 / UPLOAD_BYTES_PER_SEC + UPLOAD_MARGIN_MS;
+    }
+
+    /** Whether the board answers at all (quick, so the scheduler does not start a long upload into nothing). */
+    private boolean boardReachable() {
+        try {
+            java.net.HttpURLConnection c = (java.net.HttpURLConnection)
+                    new java.net.URL("http://" + espHost + "/status").openConnection();
+            c.setConnectTimeout(3000);
+            c.setReadTimeout(5000);
+            int code = c.getResponseCode();
+            c.disconnect();
+            return code == 200;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /** Turns the plug on if it is configured and off. True if it was switched on just now. */
+    private boolean powerPlugForSchedule() {
+        if (!tapoPlugController.isConfigured()) return false;
+        try {
+            if (tapoPlugController.isOn()) return false;
+            tapoPlugController.turnOn();
+            state.plugOn = true;
+            return true;
+        } catch (IOException e) {
+            Log.w(TAG, "Scheduled print: couldn't turn on Tapo plug (non-fatal, trying anyway)", e);
+            return false;
+        }
+    }
+
+    /**
+     * The first half of a phone-held scheduled print: at uploadLeadMs() before the start, power the plug, wait for
+     * the board, send it the file. Retries on every poll until the start time plus SCHEDULED_PRINT_MAX_RETRY_MS.
+     * On success the job becomes an ordinary one (file on the board) and runScheduledPrintIfDue starts it on time.
+     */
+    private void sendScheduledFileIfDue(ScheduledPrintStore.Job job) {
+        long now = System.currentTimeMillis();
+        if (now < job.atMillis - uploadLeadMs(job.sizeBytes)) return;
+        File local = new File(job.localPath);
+        if (!local.exists() || local.length() != job.sizeBytes) {
+            scheduledPrintStore.markFailed("the file kept on the phone is missing - schedule it again");
+            return;
+        }
+        synchronized (commandLock) {
+            if (state.phase == PrinterState.Phase.PRINTING || state.phase == PrinterState.Phase.PAUSED
+                    || state.phase == PrinterState.Phase.UPLOADING) {
+                if (now > job.atMillis) scheduledPrintStore.markFailed("printer was busy at the scheduled time");
+                return;  // before the start time: wait, the current print may still finish in time
+            }
+            powerPlugForSchedule();
+            if (!boardReachable()) {  // still booting (or gone): try again on the next poll
+                if (now - job.atMillis > SCHEDULED_PRINT_MAX_RETRY_MS) scheduledPrintStore.markFailed("the board did not come up to receive the file");
+                return;
+            }
+            if (scheduledPrintStore.get() != job) return;  // cancelled or changed meanwhile
+            updateNotification("Sending scheduled file to the board: " + job.displayName);
+            UploadOutcome outcome;
+            try (InputStream in = new FileInputStream(local)) {
+                outcome = upload(job.displayName, in, local.length());
+            } catch (IOException e) {
+                outcome = new UploadOutcome(false, String.valueOf(e.getMessage()));
+            }
+            if (scheduledPrintStore.get() != job) return;
+            if (outcome.success) {
+                scheduledPrintStore.markUploaded(state.currentFile);
+                local.delete();
+                Log.i(TAG, "Scheduled file is on the board as " + state.currentFile);
+            } else if (System.currentTimeMillis() - job.atMillis > SCHEDULED_PRINT_MAX_RETRY_MS) {
+                scheduledPrintStore.markFailed("couldn't send the file to the board: " + outcome.message);
+            } else {
+                Log.w(TAG, "Scheduled file upload failed, retrying on the next poll: " + outcome.message);
+            }
+        }
     }
 
     // ---- auto shutoff (power off the plug once the printer cools down after a print) --------
@@ -970,6 +1099,11 @@ public class PrinterService extends Service {
     private void runScheduledPrintIfDue() {
         ScheduledPrintStore.Job job = scheduledPrintStore.get();
         if (job == null || !"PENDING".equals(job.status)) return;
+        if (job.needsUpload()) {  // the file is still on the phone: send it first, then carry on if it is time
+            sendScheduledFileIfDue(job);
+            job = scheduledPrintStore.get();
+            if (job == null || job.needsUpload() || !"PENDING".equals(job.status)) return;
+        }
         if (System.currentTimeMillis() < job.atMillis) return;
 
         synchronized (commandLock) {

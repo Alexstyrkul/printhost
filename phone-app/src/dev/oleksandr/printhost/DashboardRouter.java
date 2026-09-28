@@ -163,6 +163,40 @@ public class DashboardRouter implements RequestRouter {
             }
             service.setScheduledPrint(filename, displayName, atMillis);
             writeJson(out, 200, resultJson(true, service.getStateJson()));
+        } else if (p.equals("/schedule/upload") && req.method.equals("POST")) {
+            // body = the gcode file; kept on the phone and sent to the board shortly before the start
+            long atMillis;
+            try {
+                atMillis = Long.parseLong(req.queryParam("atMillis"));
+            } catch (NumberFormatException e) {
+                writeJson(out, 400, errorJson("atMillis must be a number"));
+                return;
+            }
+            if (atMillis <= System.currentTimeMillis()) {
+                writeJson(out, 400, errorJson("Scheduled time must be in the future"));
+                return;
+            }
+            PrinterService.UploadOutcome outcome = service.setScheduledPrintFromPhone(req.queryParam("displayName"), req.body, req.contentLength, atMillis);
+            JSONObject json = resultJson(outcome.success, service.getStateJson());
+            try {
+                json.put("message", outcome.message);
+            } catch (Exception ignored) {
+            }
+            writeJson(out, outcome.success ? 200 : 422, json);
+        } else if (p.equals("/schedule/time") && req.method.equals("POST")) {
+            long atMillis;
+            try {
+                atMillis = Long.parseLong(req.queryParam("atMillis"));
+            } catch (NumberFormatException e) {
+                writeJson(out, 400, errorJson("atMillis must be a number"));
+                return;
+            }
+            if (atMillis <= System.currentTimeMillis()) {
+                writeJson(out, 400, errorJson("Scheduled time must be in the future"));
+                return;
+            }
+            boolean ok = service.rescheduleScheduledPrint(atMillis);
+            writeJson(out, ok ? 200 : 409, ok ? resultJson(true, service.getStateJson()) : errorJson("Nothing is scheduled"));
         } else if (p.equals("/schedule/cancel") && req.method.equals("POST")) {
             service.cancelScheduledPrint();
             writeJson(out, 200, resultJson(true, service.getStateJson()));

@@ -48,6 +48,8 @@ public class PrinterState {
     public volatile String scheduledFileDisplay = null;
     public volatile long scheduledAtMillis = 0;
     public volatile String scheduledStatus = null; // "PENDING" | "FAILED", null = no active schedule
+    public volatile boolean scheduledOnPhone = false; // the file is still on the phone, not yet on the board
+    public volatile long scheduledSendAtMillis = 0;   // when the phone powers the plug and sends it to the board
 
     public volatile boolean autoShutoffEnabled = false; // power off the plug once cooled after a print
 
@@ -82,6 +84,8 @@ public class PrinterState {
             o.put("scheduledFileDisplay", scheduledFileDisplay == null ? JSONObject.NULL : scheduledFileDisplay);
             o.put("scheduledAtMillis", scheduledAtMillis);
             o.put("scheduledStatus", scheduledStatus == null ? JSONObject.NULL : scheduledStatus);
+            o.put("scheduledOnPhone", scheduledOnPhone);
+            o.put("scheduledSendAtMillis", scheduledSendAtMillis);
             o.put("autoShutoffEnabled", autoShutoffEnabled);
 
             long remaining = 0;

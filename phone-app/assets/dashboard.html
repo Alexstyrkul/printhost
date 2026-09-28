@@ -138,10 +138,11 @@
   .camera-frame { aspect-ratio: 16/9; width: 100%; border-radius: var(--radius-sm); background: #000;
                    position: relative; overflow: hidden; display: flex; align-items: center; justify-content: center; }
   #cameraImg { width: 100%; height: 100%; object-fit: contain; background: #0a0a0c; display: none; }
-  .camera-placeholder { width: 100%; height: 100%; display: flex; flex-direction: column; gap: 6px; align-items: center; justify-content: center; color: #3a3d42; font-size: 11.5px; }
+  .camera-placeholder { width: 100%; height: 100%; display: flex; flex-direction: column; gap: 6px; align-items: center; justify-content: center; color: #8a8f98; font-size: 11.5px; }
   .live-badge { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.55); color: var(--text-dim);
                 font-size: 10.5px; font-weight: 600; padding: 3px 8px; border-radius: 20px; display: none; }
   .live-badge.show { display: block; }
+  .live-badge.stale { color: #f0b429; }
   .cam-menu { border: 1px solid var(--panel-border); border-radius: var(--radius-sm); overflow: hidden; background: var(--panel-2); }
   .cam-menu-head { width: 100%; display: flex; align-items: center; gap: 10px; background: transparent; border: none; border-radius: 0;
                     color: var(--text); padding: 11px 12px; font-size: 12.5px; font-weight: 600; text-align: left; }
@@ -465,7 +466,30 @@
       </div>
       <div id="scheduleActive" class="schedule-body" style="display:none;">
         <div class="pill" id="scheduleInfo" style="font-size: 12px;"></div>
-        <button id="scheduleCancelBtn" class="small danger">Cancel</button>
+        <div class="datetime-row" id="reschedFields" style="display:none;">
+          <div class="datetime-wrap" style="flex: 1.3;">
+            <span id="reschedDateDisplay" class="datetime-display">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg>
+              <span id="reschedDateText">Date</span>
+            </span>
+            <input type="date" id="reschedDate">
+          </div>
+          <div class="datetime-wrap" style="flex: 1;">
+            <span id="reschedTimeDisplay" class="datetime-display">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>
+              <span id="reschedTimeText">Time</span>
+            </span>
+            <input type="time" id="reschedTime">
+          </div>
+        </div>
+        <div class="datetime-row" id="scheduleButtons">
+          <button id="reschedBtn" class="small" style="flex: 1;" title="Move the scheduled print to another date or time (same file)">Change time</button>
+          <button id="scheduleCancelBtn" class="small danger" style="flex: 1;">Cancel</button>
+        </div>
+        <div class="datetime-row" id="reschedButtons" style="display:none;">
+          <button id="reschedSaveBtn" class="small primary" style="flex: 1;">Save</button>
+          <button id="reschedBackBtn" class="small" style="flex: 1;">Back</button>
+        </div>
       </div>
       <label class="action-row" title="Turn off the smart plug once the printer has cooled down (&le;50&deg;C) after a print finishes or is stopped">
         <span class="action-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4v10.54a4 4 0 1 1-4 0V4a2 2 0 0 1 4 0Z"/></svg></span>
@@ -814,6 +838,7 @@ function renderSchedule(s) {
   scheduledNow = hasJob;
   $("scheduleRow").style.display = hasJob ? "none" : "";
   $("scheduleActive").style.display = hasJob ? "flex" : "none";
+  if (!hasJob) showReschedule(false);
   if (hasJob) {
     var when = new Date(s.scheduledAtMillis).toLocaleString();
     var failed = s.scheduledStatus && s.scheduledStatus.indexOf("FAILED") === 0;
@@ -823,6 +848,11 @@ function renderSchedule(s) {
       info.style.color = "var(--danger)";
     } else {
       info.textContent = (s.scheduledFileDisplay || s.scheduledFile) + " at " + when;
+      if (s.scheduledOnPhone) {
+        var send = new Date(s.scheduledSendAtMillis);
+        info.textContent += " · the file is on the phone; the printer powers on and gets it at "
+            + pad2(send.getHours()) + ":" + pad2(send.getMinutes());
+      }
       info.style.color = "";
     }
   }
@@ -839,8 +869,26 @@ function updateStartLabel() {
 }
 $("scheduleToggle").onchange = function () {
   $("scheduleFields").style.display = this.checked ? "flex" : "none";
+  if (!this.checked && scheduleHeldFile) {
+    // Scheduling given up: with the plug on, the held file goes to the board now like any chosen file.
+    var f = scheduleHeldFile;
+    if (lastState && lastState.plugOn !== false) { scheduleHeldFile = null; chooseFile(f); }
+    else showToast("error", "The printer is off, so this file can only be scheduled");
+  }
   updateStartLabel();
+  if (lastState) renderStatus(lastState);
 };
+
+// A file chosen while scheduling: kept in this page until "Start at" sends it to the phone.
+var scheduleHeldFile = null;
+function holdForSchedule(file) {
+  scheduleHeldFile = file;
+  $("scheduleToggle").checked = true;
+  $("scheduleFields").style.display = "flex";
+  $("chosenFileName").textContent = file.name + " · goes to the board before the start";
+  updateStartLabel();
+  if (lastState) renderStatus(lastState);
+}
 
 // A bare date/time input only opens its native picker when you hit the small calendar/clock
 // glyph - showPicker() forces it open no matter where in the field you tap. The input itself is
@@ -877,11 +925,12 @@ wireDateTimeField("scheduleTime", "scheduleTimeDisplay", "scheduleTimeText", fun
 function scheduleFromStart() {
   var s = lastState || {};
   var filename = s.currentFile;
-  if (!s.fileReady || !filename) { showToast("error", "Choose a file first"); return; }
   var datePart = $("scheduleDate").value, timePart = $("scheduleTime").value;
+  if (!scheduleHeldFile && (!s.fileReady || !filename)) { showToast("error", "Choose a file first"); return; }
   if (!datePart || !timePart) { showToast("error", "Pick a date and time first"); return; }
   var atMillis = new Date(datePart + "T" + timePart).getTime();
   if (atMillis <= Date.now()) { showToast("error", "Scheduled time must be in the future"); return; }
+  if (scheduleHeldFile) { scheduleHeldToPhone(scheduleHeldFile, atMillis); return; }
   var q = "/schedule/set?filename=" + encodeURIComponent(filename)
       + "&displayName=" + encodeURIComponent(s.currentFileDisplay || "")
       + "&atMillis=" + atMillis;
@@ -898,8 +947,92 @@ function scheduleFromStart() {
   });
 }
 
+// Sends the held file to the phone together with the time. Only this browser-to-phone leg happens now; the phone
+// sends the file on to the board by itself before the start (the board may be off until then).
+function scheduleHeldToPhone(file, atMillis) {
+  var xhr = new XMLHttpRequest(), btn = $("startBtn");
+  xhr.open("POST", "/schedule/upload?displayName=" + encodeURIComponent(file.name) + "&atMillis=" + atMillis);
+  btn.disabled = true;
+  $("uploadProgressWrap").style.display = "flex";
+  $("cancelUploadBtn").style.display = "none";
+  xhr.upload.onprogress = function (e) {
+    if (!e.lengthComputable) return;
+    $("uploadProgress").value = Math.round(e.loaded * 100 / e.total);
+    $("uploadStatus").textContent = "to the phone " + fmtBytes(e.loaded) + " / " + fmtBytes(e.total);
+  };
+  function done(ok, msg) {
+    btn.disabled = false;
+    $("uploadProgressWrap").style.display = "none";
+    $("cancelUploadBtn").style.display = "";
+    if (!ok) { showToast("error", msg || "Couldn't schedule the print"); return; }
+    scheduleHeldFile = null;
+    selectedFile = null;
+    $("chosenFileName").textContent = "No file selected";
+    $("fileInput").value = "";
+    $("scheduleToggle").checked = false;
+    $("scheduleFields").style.display = "none";
+    updateStartLabel();
+    showToast("success", "Print scheduled - the phone sends the file to the board before the start");
+  }
+  xhr.onload = function () {
+    var r = {};
+    try { r = JSON.parse(xhr.responseText); } catch (e) {}
+    if (r.state) renderStatus(r.state);
+    done(!!r.success, r.message || r.error);
+  };
+  xhr.onerror = function () { done(false, "Network error while sending the file to the phone"); };
+  xhr.send(file);
+}
+
 $("scheduleCancelBtn").onclick = function () {
   post("/schedule/cancel").then(function (r) { renderStatus(r.state); });
+};
+
+// "Change time": move the scheduled print without cancelling it. The same file stays; /schedule/set replaces the job
+// (a failed job becomes pending again at the new time).
+wireDateTimeField("reschedDate", "reschedDateDisplay", "reschedDateText", function (v) {
+  var d = new Date(v + "T00:00");
+  return d.getDate() + " " + SCHEDULE_MONTHS[d.getMonth()] + " " + d.getFullYear();
+});
+wireDateTimeField("reschedTime", "reschedTimeDisplay", "reschedTimeText", function (v) { return v; });
+function pad2(n) { return (n < 10 ? "0" : "") + n; }
+function setDateTimeField(inputId, value) {
+  var input = $(inputId);
+  input.value = value;
+  input.dispatchEvent(new Event("input"));
+}
+function showReschedule(on) {
+  $("reschedFields").style.display = on ? "flex" : "none";
+  $("reschedButtons").style.display = on ? "flex" : "none";
+  $("scheduleButtons").style.display = on ? "none" : "flex";
+}
+$("reschedBtn").onclick = function () {
+  var s = lastState || {};
+  // Start from the current target time; a failed job's time is in the past, so offer a minute from now instead.
+  var d = new Date(Math.max(s.scheduledAtMillis || 0, Date.now() + 60000));
+  setDateTimeField("reschedDate", d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()));
+  setDateTimeField("reschedTime", pad2(d.getHours()) + ":" + pad2(d.getMinutes()));
+  showReschedule(true);
+};
+$("reschedBackBtn").onclick = function () { showReschedule(false); };
+$("reschedSaveBtn").onclick = function () {
+  var s = lastState || {};
+  if (!s.scheduledFile) { showReschedule(false); return; }
+  var datePart = $("reschedDate").value, timePart = $("reschedTime").value;
+  if (!datePart || !timePart) { showToast("error", "Pick a date and time first"); return; }
+  var atMillis = new Date(datePart + "T" + timePart).getTime();
+  if (atMillis <= Date.now()) { showToast("error", "Scheduled time must be in the future"); return; }
+  var btn = this;
+  btn.disabled = true;
+  post("/schedule/time?atMillis=" + atMillis).then(function (r) {
+    if (r.success) {
+      showReschedule(false);
+      renderStatus(r.state);
+      showToast("success", "Print moved to " + new Date(atMillis).toLocaleString());
+    } else {
+      showToast("error", r.message || r.error || "Couldn't change the time");
+    }
+  }).catch(function () {}).then(function () { btn.disabled = false; });
 };
 
 /** Lazily loads the 3D preview once a file is both *selected* and actually ready to read
@@ -1178,7 +1311,9 @@ function renderControls(phase, fileReady, scheduled) {
   var idleish = phase === "UPLOAD_VERIFIED" || phase === "IDLE" || phase === "DISCONNECTED" || phase === "ERROR";
   // Never offer Start while the board is actually printing (the phone may just not be watching it right now).
   var boardBusy = typeof boardPrinter !== "undefined" && boardPrinter && (boardPrinter.state === "PRINTING" || boardPrinter.state === "PAUSED");
-  $("startBtn").style.display = (fileReady && idleish && !scheduled && !boardBusy) ? "" : "none";
+  // A file held on this page for a scheduled print (the board is off) can be scheduled at any time.
+  var holdReady = !!scheduleHeldFile && $("scheduleToggle").checked && !scheduled;
+  $("startBtn").style.display = holdReady || (fileReady && idleish && !scheduled && !boardBusy) ? "" : "none";
   $("pauseBtn").style.display = phase === "PRINTING" ? "" : "none";
   $("resumeBtn").style.display = phase === "PAUSED" ? "" : "none";
   $("stopBtn").style.display = (phase === "PRINTING" || phase === "PAUSED") ? "" : "none";
@@ -1351,6 +1486,14 @@ $("stopBtn").onclick = function () {
 function chooseFile(file) {
   selectedFile = file;
   $("chosenFileName").textContent = file ? file.name : "No file selected";
+  // With the plug off the board cannot take the file now. For a scheduled print it does not need to: the file
+  // stays here until "Start at" hands it to the phone, which sends it to the board shortly before the start.
+  var plugOff = lastState && lastState.plugOn === false;
+  if (file && ($("scheduleToggle").checked || plugOff)) {
+    holdForSchedule(file);
+    if (plugOff && !$("scheduleToggle").checked) showToast("success", "The printer is off: pick a date and time to schedule this file");
+    return;
+  }
   refreshStatus();
   if (file) uploadSelectedFile(file);
 }
@@ -1451,28 +1594,153 @@ function showCamStream(on, msg) {
   $("liveBadge").className = "live-badge" + (on ? " show" : "");
   if (msg) $("camMsg").textContent = msg;
 }
+// The page reads the stream itself (fetch + multipart parsing) instead of handing it to <img src=stream>: an MJPEG
+// <img> gives no signal when frames stop coming (a stalled relay, a Wi-Fi gap, a connection the browser dropped
+// quietly), so the picture froze on the last frame or stayed black for good. Here every frame is seen, a watchdog
+// starts a fresh connection when none arrived for CAM_STALL_MS, and the badge shows how old the picture is.
 var camWanted = false, camRetryTimer = null;
+var camAbort = null, camGen = 0, camLastFrameAt = 0, camFrameUrl = null, camDecoding = false, camNextBlob = null;
+var CAM_STALL_MS = 6000;
+var CAN_READ_STREAM = typeof fetch === "function" && typeof AbortController === "function"
+    && typeof ReadableStream === "function" && typeof TextDecoder === "function";
 function stopCamStream() {
   camWanted = false;
+  camGen++;
   clearTimeout(camRetryTimer);
+  camRetryTimer = null;
+  if (camAbort) { try { camAbort.abort(); } catch (e) {} camAbort = null; }
+  camNextBlob = null;
+  camDecoding = false;
   var img = $("cameraImg");
   img.onload = img.onerror = null;
-  img.src = "";
+  img.removeAttribute("src");
+  if (camFrameUrl) { URL.revokeObjectURL(camFrameUrl); camFrameUrl = null; }
   camStreamUp = false;
 }
-function startCamStream() {
-  camWanted = true;
-  var img = $("cameraImg");
-  img.onload = function () { camStreamUp = true; showCamStream(true); };
-  img.onerror = function () {
-    camStreamUp = false;
-    showCamStream(false, "Camera offline - retrying\u2026");
-    if (camWanted) camRetryTimer = setTimeout(startCamStream, 3000);
-  };
-  img.src = camStreamUrl + "?_=" + Date.now();
+function camRetryLater(msg, ms) {
+  if (!camWanted) return;
+  // Keep the last picture on screen (the badge shows its age) rather than going black, unless there never was one.
+  if (!camStreamUp) showCamStream(false, msg);
+  clearTimeout(camRetryTimer);
+  camRetryTimer = setTimeout(function () { camRetryTimer = null; if (camWanted) startCamStream(); }, ms);
 }
+// Shows one JPEG. While the previous one is still decoding only the newest waiting frame is kept, so a slow device skips frames.
+function camShowFrame(blob) {
+  if (camDecoding) { camNextBlob = blob; return; }
+  camDecoding = true;
+  var img = $("cameraImg"), url = URL.createObjectURL(blob), gen = camGen;
+  img.onload = img.onerror = function () {
+    if (gen !== camGen) { URL.revokeObjectURL(url); return; }
+    if (camFrameUrl && camFrameUrl !== url) URL.revokeObjectURL(camFrameUrl);
+    camFrameUrl = url;
+    camDecoding = false;
+    if (!camStreamUp) { camStreamUp = true; showCamStream(true); }
+    if (camNextBlob) { var b = camNextBlob; camNextBlob = null; camShowFrame(b); }
+  };
+  img.src = url;
+}
+function indexOfBytes(buf, len, pat, from) {
+  outer: for (var i = from; i <= len - pat.length; i++) {
+    for (var j = 0; j < pat.length; j++) if (buf[i + j] !== pat[j]) continue outer;
+    return i;
+  }
+  return -1;
+}
+var CRLF2 = [13, 10, 13, 10];
+function startCamStream() {
+  var keepPicture = camStreamUp;  // a restart after a stall keeps the old frame visible until the new one arrives
+  stopCamStream();
+  camWanted = true;
+  var gen = camGen;
+  if (!CAN_READ_STREAM) {  // old browser: plain <img>, retried on error
+    var img = $("cameraImg");
+    img.onload = function () { camStreamUp = true; camLastFrameAt = Date.now(); showCamStream(true); };
+    img.onerror = function () { camStreamUp = false; camRetryLater("Camera offline - retrying\u2026", 3000); };
+    img.src = camStreamUrl + "?_=" + Date.now();
+    return;
+  }
+  if (keepPicture) camStreamUp = true;
+  camAbort = new AbortController();
+  camLastFrameAt = Date.now();  // the watchdog counts from the start of this attempt
+  fetch(camStreamUrl + "?_=" + Date.now(), { cache: "no-store", signal: camAbort.signal }).then(function (r) {
+    if (!r.ok || !r.body) throw new Error("HTTP " + r.status);
+    var reader = r.body.getReader(), buf = new Uint8Array(256 * 1024), len = 0, dec = new TextDecoder("latin1");
+    function pump() {
+      return reader.read().then(function (res) {
+        if (gen !== camGen) { try { reader.cancel(); } catch (e) {} return; }
+        if (res.done) throw new Error("stream ended");
+        var chunk = res.value;
+        if (len + chunk.length > buf.length) {
+          if (len + chunk.length > 4 * 1024 * 1024) len = 0;  // junk that never parsed: start over
+          var nb = new Uint8Array(Math.max(buf.length * 2, len + chunk.length));
+          nb.set(buf.subarray(0, len));
+          buf = nb;
+        }
+        buf.set(chunk, len);
+        len += chunk.length;
+        // Cut out every complete part: headers with Content-Length, a blank line, then the JPEG bytes.
+        var pos = 0;
+        for (;;) {
+          var he = indexOfBytes(buf, len, CRLF2, pos);
+          if (he < 0) break;
+          var m = /content-length:\s*(\d+)/i.exec(dec.decode(buf.subarray(pos, he)));
+          if (!m) { pos = he + 4; continue; }  // response headers or a boundary without a frame
+          var n = parseInt(m[1], 10), bodyAt = he + 4;
+          if (len < bodyAt + n) break;  // the rest of this frame has not arrived yet
+          var jpeg = buf.slice(bodyAt, bodyAt + n);
+          pos = bodyAt + n;
+          if (n > 3 && jpeg[0] === 0xFF && jpeg[1] === 0xD8) {
+            camLastFrameAt = Date.now();
+            camShowFrame(new Blob([jpeg], { type: "image/jpeg" }));
+          }
+        }
+        if (pos > 0) { buf.copyWithin(0, pos, len); len -= pos; }
+        return pump();
+      });
+    }
+    return pump();
+  }).catch(function () {
+    if (gen !== camGen) return;  // stopped or restarted on purpose
+    camRetryLater("Camera offline - retrying\u2026", 2000);
+  });
+}
+// Watchdog: no new frame for CAM_STALL_MS -> a fresh connection. Meanwhile the badge says how old the picture is.
+setInterval(function () {
+  if (!camWanted || document.hidden) return;
+  var age = Date.now() - camLastFrameAt, badge = $("liveBadge");
+  if (camStreamUp) {
+    var stale = age > 2500;
+    badge.textContent = stale ? "No new picture for " + Math.round(age / 1000) + " s" : "LIVE";
+    badge.classList.toggle("stale", stale);
+  }
+  if (CAN_READ_STREAM && age > CAM_STALL_MS && !camRetryTimer) startCamStream();
+}, 1000);
+// A browser quietly freezes or drops an MJPEG <img> when the tab sits in the background or the computer sleeps, and no
+// error event tells the page: the picture then stays dead. So: pause the stream while the page is hidden (it also spares
+// the board's Wi-Fi and memory), start a fresh one when the page is shown again, and restart it after a sleep (timers
+// stop while the machine sleeps, so a long gap between status polls means we just woke up).
+var camLastPollAt = 0;
+function camRestartIfWanted() {
+  if (document.hidden || boardCamOn === false) return;
+  clearTimeout(camRetryTimer);
+  startCamStream();
+}
+document.addEventListener("visibilitychange", function () {
+  if (document.hidden) {
+    if (camWanted || camStreamUp) stopCamStream();
+    showCamStream(false, "Paused while the page is in the background");
+  } else {
+    camRestartIfWanted();
+  }
+});
+window.addEventListener("pageshow", camRestartIfWanted);
+window.addEventListener("online", camRestartIfWanted);
+
 var camFpsHist = [];
 function pollCamStatus() {
+  var nowPoll = Date.now();
+  if (camLastPollAt && nowPoll - camLastPollAt > 10000) camRestartIfWanted();  // the machine slept
+  camLastPollAt = nowPoll;
   fetch(camStatusUrl).then(function (r) { return r.json(); }).then(function (s) {
     boardCamOn = s.cameraOn !== false; syncCamToggle();
     if (s.profile && Date.now() >= qualityHoldUntil) renderQuality(s.profile);
@@ -1480,7 +1748,7 @@ function pollCamStatus() {
     if (s.cameraOn === false) {
       if (camWanted || camStreamUp) stopCamStream();
       showCamStream(false, "Camera is off - it turns on with the printer power");
-    } else if (!camWanted) {
+    } else if (!camWanted && !document.hidden) {
       startCamStream();
     }
     // Average the last ~10 s: a single 2 s window jumps around with the scene.
