@@ -192,6 +192,7 @@
   .cam-log-file b { font-weight: 400; white-space: nowrap; }
 
   .footer { text-align: center; font-size: 10.5px; color: var(--text-faint); margin-top: 8px; }
+  .firmware-info { text-align: left; margin: 0 2px; word-break: break-word; line-height: 1.5; }
 
   .title-group { display: flex; align-items: center; gap: 10px; }
   .menu-btn { width: 30px; height: 30px; padding: 0; flex: none; display: flex; align-items: center; justify-content: center;
@@ -332,6 +333,154 @@
   .schedule-divider { border-top: 1px solid var(--panel-border); padding-top: 12px; margin-top: 5px; }
   .schedule-divider .action-row { padding: 10px 12px; cursor: pointer; }
   .schedule-divider .action-label { font-weight: 600; }
+
+  /* ---- Layout A: camera + running print on the left, what you read while printing on the right, the board's
+     vitals in one line at the bottom. On a wide screen it all fits the window (no page scroll); narrower, the
+     blocks stack in phone order. ---- */
+  body { padding: 0; }
+  .top-row { padding: 12px 20px; margin: 0; border-bottom: 1px solid var(--panel-border); }
+  .msg { padding: 0 20px; margin: 6px 0 0; }
+  .msg:empty { display: none; }
+  .layout { display: grid; grid-template-columns: minmax(0, 1fr) 420px; gap: 16px; padding: 16px 20px; }
+  .stage-col, .side-col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  .stage-col { gap: 16px; }
+
+  .camera-card { position: relative; border: 1px solid var(--panel-border); border-radius: var(--radius); overflow: hidden; background: #000; }
+  .camera-card .camera-frame { border-radius: 0; aspect-ratio: 4 / 3; }
+  .cam-chips { position: absolute; top: 10px; left: 10px; display: flex; gap: 6px; z-index: 2; }
+  .cam-chips .live-badge { position: static; }
+  .cam-chip { background: rgba(0,0,0,0.55); color: var(--text); font-size: 10.5px; font-weight: 600; padding: 3px 8px; border-radius: 20px; }
+  .cam-chip:empty { display: none; }
+
+  .progress-card { display: flex; flex-direction: column; gap: 12px; }
+  .progress-top { display: flex; align-items: center; gap: 14px; }
+  .progress-file { flex: 1; min-width: 0; }
+  .file-name { font-size: 15px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .file-sub { font-size: 12px; color: var(--text-dim); margin-top: 3px; }
+  .progress-pct { font-size: 32px; font-weight: 700; line-height: 1; }
+  .progress-bar { height: 8px; border-radius: 4px; background: var(--panel-2); overflow: hidden; }
+  .progress-fill { height: 100%; width: 0; background: var(--accent); border-radius: 4px; transition: width 0.4s; }
+  .progress-fill.PAUSED, .progress-fill.UPLOADING, .progress-fill.UPLOAD_VERIFIED { background: var(--warn); }
+  .progress-fill.ERROR { background: var(--danger); }
+  .progress-bottom { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  .progress-times { flex: 1; display: flex; gap: 26px; font-size: 12px; color: var(--text-dim); }
+  .progress-times b { color: var(--text); font-size: 14px; margin-left: 4px; }
+  .progress-card .controls-row button { flex: none; padding: 11px 22px; }
+
+  .temps-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .temp-tile { background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius-sm); padding: 10px 12px;
+               display: flex; align-items: baseline; gap: 8px; white-space: nowrap; min-width: 0; }
+  .tile-label { flex: 1; font-size: 10.5px; font-weight: 700; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.4px; }
+  .temp-tile b { font-size: 20px; font-weight: 700; }
+  .temp-tile b.hot { color: #ff9a57; }
+  .temp-tile b.bed { color: #6fb2ff; }
+  .tile-sub { font-size: 13px; color: var(--text-faint); }
+
+  .files-card { display: flex; flex-direction: column; gap: 8px; padding: 12px; }
+  .files-card .sdfiles-list { max-height: 108px; }
+  .files-card .sdfile-row { background: var(--panel-2); }
+  .files-card .sdfile-row:hover { background: #26292e; }
+  .files-card .sdfile-row.selected { background: var(--accent-dim); }
+  .files-card .upload-box { border: none; padding: 2px 0; }
+  .toggle-pair { display: flex; gap: 8px; }
+  .toggle-row { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; padding: 8px 10px; cursor: pointer; font-size: 12px; font-weight: 600;
+                background: var(--panel-2); border: 1px solid var(--panel-border); border-radius: var(--radius-sm); }
+  .toggle-row .grow { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  #scheduleActive.schedule-card { padding: 10px 12px; flex-direction: column; gap: 10px; overflow: visible; }
+  .sched-top { display: flex; align-items: center; gap: 12px; }
+  .sched-when { flex: none; width: 60px; text-align: center; border-radius: var(--radius-sm); background: var(--panel-2); padding: 5px 0; }
+  .sched-day { font-size: 10px; color: var(--text-dim); }
+  .sched-time { font-size: 16px; font-weight: 700; }
+  .sched-text { flex: 1; min-width: 0; }
+  .sched-name { font-size: 13px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sched-sub { font-size: 11.5px; color: var(--text-dim); }
+  #scheduleInfo { line-height: 1.4; }
+  .sched-link { flex: none; background: none; border: none; color: var(--accent); padding: 6px 4px; font-size: 12px; }
+  .sched-x { flex: none; width: 30px; height: 30px; padding: 0; display: flex; align-items: center; justify-content: center;
+             background: none; border: 1px solid var(--danger-dim); color: var(--danger); }
+
+  .board-bar { flex: none; display: flex; align-items: center; gap: 18px; min-height: 36px; padding: 0 20px;
+               border-top: 1px solid var(--panel-border); font-size: 11.5px; color: var(--text-dim); }
+  .board-title { display: flex; align-items: center; gap: 6px; font-weight: 700; color: var(--text); }
+  #camDot { display: none; }  /* healthDot shows the worst of both */
+  .board-stats { flex: 1; min-width: 0; display: flex; gap: 18px; overflow: hidden; }
+  .board-bar .cam-stat { flex: none; background: none; padding: 0; display: inline-flex; flex-direction: row-reverse; align-items: baseline; gap: 5px; white-space: nowrap; }
+  .board-bar .cam-stat b { display: inline; font-size: 11.5px; }
+  .board-bar .cam-stat span { display: inline; margin: 0; font-size: 11.5px; color: var(--text-dim); text-transform: none; letter-spacing: 0; }
+  .board-log { background: none; border: none; color: var(--accent); padding: 4px; font-size: 12px; }
+  .board-bar .footer { margin: 0; }
+  .board-bar .footer:empty { display: none; }
+
+  /* Wide and tall enough: exactly one screen, the camera and the preview take whatever height is left. */
+  /* A laptop browser window is often only ~650 px tall (13" screen minus the browser's own bars), so this mode
+     starts low; the right column scrolls by itself if it ever runs out of room, the page never does. */
+  @media (min-width: 1000px) and (min-height: 520px) {
+    body { height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; }
+    .layout { flex: 1; min-height: 0; }
+    .stage-col, .side-col { min-height: 0; }
+    .side-col { overflow-y: auto; }
+    .camera-card { flex: 1; min-height: 0; }
+    .camera-card .camera-frame { aspect-ratio: auto; height: 100%; }
+    .progress-card, .temps-grid, .files-card, #scheduleActive { flex: none; }
+    .side-col .preview-card { flex: 1 1 0; min-height: 150px; display: flex; flex-direction: column; }
+    .side-col .preview-body { flex: 1; min-height: 0; max-height: none; display: flex; flex-direction: column; }
+    .side-col .preview-stage { flex: 1; min-height: 0; aspect-ratio: auto; }
+  }
+  /* Short windows: tighter spacing and smaller numbers so the camera keeps most of the height. */
+  @media (min-width: 1000px) and (max-height: 820px) {
+    .top-row { padding: 8px 16px; }
+    .layout { padding: 10px 16px; gap: 12px; }
+    .stage-col { gap: 10px; }
+    .side-col { gap: 8px; }
+    .progress-card { padding: 10px 14px; gap: 8px; }
+    .progress-pct { font-size: 26px; }
+    .file-name { font-size: 14px; }
+    .progress-card .controls-row button { padding: 8px 18px; }
+    .temp-tile { padding: 7px 10px; }
+    .temp-tile b { font-size: 17px; }
+    .preview-header { padding: 8px 12px; }
+    .preview-legend { padding: 6px 12px 8px; }
+    .files-card { padding: 10px; gap: 6px; }
+    .files-card .sdfiles-list { max-height: 72px; }
+    .toggle-row { padding: 6px 10px; }
+    #scheduleActive.schedule-card { padding: 8px 10px; }
+    .board-bar { min-height: 30px; padding: 0 16px; }
+  }
+  /* Wide but short enough to still stack: never let the camera take more than most of the window. */
+  @media (min-width: 1000px) and (max-height: 519px) {
+    .camera-card .camera-frame { aspect-ratio: auto; height: 70vh; }
+  }
+
+  /* Narrow (a phone, or a small window): one column in phone order; the board's vitals become a tile grid. */
+  @media (max-width: 999px) {
+    .top-row { padding: 10px 12px; flex-wrap: wrap; row-gap: 10px; }
+    .status-group { display: contents; }  /* the status pill stays next to the title, the switches get their own row */
+    .status-toggles { flex-basis: 100%; gap: 16px; }
+    .layout { grid-template-columns: minmax(0, 1fr); padding: 12px; gap: 12px; }
+    .side-col .temps-grid { order: 1; }
+    .side-col #scheduleActive { order: 2; }
+    .side-col .files-card { order: 3; }
+    .side-col .preview-card { order: 4; }
+    .progress-times { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; flex-basis: 100%; }
+    .progress-times b { display: block; margin: 2px 0 0; font-size: 15px; }
+    .progress-card .controls-row { width: 100%; }
+    .progress-card .controls-row button { flex: 1; }
+    /* the schedule's buttons get their own full-width row on a phone */
+    .sched-top { flex-wrap: wrap; }
+    .sched-text { flex-basis: calc(100% - 72px); }
+    .sched-link { order: 3; flex: 1; height: 42px; background: var(--panel-2); border: 1px solid var(--panel-border);
+                  color: var(--text); font-size: 13px; font-weight: 700; }
+    .sched-x { order: 4; width: 42px; height: 42px; }
+    .board-bar { flex-wrap: wrap; gap: 8px; margin: 0 12px 12px; padding: 12px; border: 1px solid var(--panel-border);
+                 border-radius: var(--radius); background: var(--panel); }
+    .board-title { flex: 1; font-size: 13px; }
+    .board-stats { order: 3; flex-basis: 100%; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+    .board-bar .cam-stat { flex-direction: column; align-items: center; background: var(--panel-2); border-radius: var(--radius-sm); padding: 8px 4px; text-align: center; }
+    .board-bar .cam-stat b { font-size: 14px; }
+    .board-bar .cam-stat span { font-size: 9.5px; text-transform: uppercase; color: var(--text-faint); margin-top: 2px; }
+    .board-bar .footer { order: 4; flex-basis: 100%; }
+  }
 </style>
 <script type="importmap">
 {
@@ -368,56 +517,90 @@
         <span class="switch-label">Printer</span>
         <span class="switch"><input type="checkbox" id="connectToggle"><span class="switch-slider"></span></span>
       </label>
+      <label class="switch-item" title="Switch the camera on or off (also during a print)">
+        <span class="switch-label">Camera</span>
+        <span class="switch"><input type="checkbox" id="camForceToggle"><span class="switch-slider"></span></span>
+      </label>
     </div>
   </div>
 </div>
 
 <div class="msg" id="errorMsg"></div>
 
-<div class="main-grid">
-  <div class="card print-card">
-    <div class="ring-wrap">
-      <svg viewBox="0 0 118 118" class="ring">
-        <circle class="ring-bg" cx="59" cy="59" r="50" />
-        <circle class="ring-fg" id="progressRing" cx="59" cy="59" r="50" />
-        <text x="59" y="67" text-anchor="middle" class="ring-pct" id="ringPercent">0%</text>
-      </svg>
-    </div>
-
-    <div class="pill time-pill">
-      <svg class="pill-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>
-      <div>
-        <div class="time-elapsed"><span id="elapsed" class="num">-</span></div>
-        <div class="time-remaining"><span id="remaining" class="num">-</span></div>
+<!-- Layout A: the camera and the running print take the big left column; everything the user reads while printing
+     (temperatures, preview, files, the next scheduled print) sits in one right column; the board's vitals are one
+     line at the bottom. Everything fits one desktop screen; on a phone the blocks stack (no 3D preview there). -->
+<div class="layout">
+  <section class="stage-col">
+    <div class="camera-card">
+      <div class="camera-frame">
+        <img id="cameraImg" alt="camera stream">
+        <div class="camera-placeholder" id="cameraPlaceholder">
+          <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8a2 2 0 0 1 2-2h1.5l1-1.5h7l1 1.5H18a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/><circle cx="12" cy="13" r="3.5"/></svg>
+          <span id="camMsg">Connecting to camera&hellip;</span>
+        </div>
+        <div class="cam-chips">
+          <span class="live-badge" id="liveBadge">LIVE</span>
+          <span class="cam-chip num" id="camFpsChip"></span>
+        </div>
       </div>
     </div>
 
-    <div class="pill time-pill mobile-layer-pill">
-      <svg class="pill-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 2 7l10 5 10-5-10-5Z"/><path d="M2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
-      <div class="time-elapsed"><span id="mobileLayerReadout" class="num">Layer -/-</span></div>
-    </div>
-
-    <div class="temps-row">
-      <div class="pill temp-pill">
-        <svg class="pill-icon" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M7.5 3h9v4.2l-2.3 4.3v8.3a1.2 1.2 0 0 1-1.2 1.2h-2a1.2 1.2 0 0 1-1.2-1.2v-8.3L7.5 7.2z"/></svg>
-        <div class="temp-val num"><span id="hotendTemp">-</span>&deg;<span class="temp-target">/<span id="hotendTarget">-</span>&deg;</span></div>
+    <div class="card progress-card">
+      <div class="progress-top">
+        <div class="progress-file">
+          <div class="file-name" id="currentFile">no file selected</div>
+          <div class="file-sub num" id="layerLine">Layer -/-</div>
+        </div>
+        <div class="progress-pct num" id="ringPercent">0%</div>
       </div>
-      <div class="pill temp-pill">
-        <svg class="pill-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="8" width="18" height="11" rx="1.5"/><path d="M3 13.5h18M9 8v11M15 8v11"/></svg>
-        <div class="temp-val num"><span id="bedTemp">-</span>&deg;<span class="temp-target">/<span id="bedTarget">-</span>&deg;</span></div>
+      <div class="progress-bar"><div class="progress-fill" id="progressRing"></div></div>
+      <div class="progress-bottom">
+        <div class="progress-times">
+          <span>Elapsed <b class="num" id="elapsed">-</b></span>
+          <span>Remaining <b class="num" id="remaining">-</b></span>
+          <span>Finishes at <b class="num" id="finishAt">-</b></span>
+        </div>
+        <div class="controls-row">
+          <button id="startBtn" class="primary">Start</button>
+          <button id="pauseBtn">Pause</button>
+          <button id="resumeBtn" class="primary">Resume</button>
+          <button id="stopBtn" class="danger">Stop</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <aside class="side-col">
+    <div class="temps-grid">
+      <div class="temp-tile"><span class="tile-label">Nozzle</span><b class="num hot" id="hotendTemp">-</b><span class="tile-sub num">/ <span id="hotendTarget">-</span>&deg;</span></div>
+      <div class="temp-tile"><span class="tile-label">Bed</span><b class="num bed" id="bedTemp">-</b><span class="tile-sub num">/ <span id="bedTarget">-</span>&deg;</span></div>
+      <div class="temp-tile"><span class="tile-label">Fan</span><b class="num" id="fanVal">-</b></div>
+      <div class="temp-tile" title="Room temperature and humidity (DHT11 sensor on the board)"><span class="tile-label">Room</span><b class="num" id="roomTemp">-</b><b class="num" id="roomHum">-</b></div>
+    </div>
+
+    <div class="card preview-card">
+      <div class="preview-header">
+        <span class="action-label">Print Preview</span>
+        <span class="num" id="previewLayerReadout">Layer -/-</span>
+      </div>
+      <div class="preview-body" id="previewBody">
+        <div class="preview-stage" id="previewStage">
+          <canvas id="previewGhostCanvas"></canvas>
+          <canvas id="previewSolidCanvas"></canvas>
+          <div class="preview-loading" id="previewLoading">No file loaded</div>
+        </div>
+        <div class="preview-legend">
+          <div class="preview-legend-swatches">
+            <span><span class="swatch" style="background:#3ecf7e"></span>Printed</span>
+            <span><span class="swatch" style="background:#9aa0ac"></span>Remaining</span>
+          </div>
+          <span class="num" id="previewPercentReadout">-</span>
+        </div>
       </div>
     </div>
 
-    <div class="pill file-box" id="currentFile">no file selected</div>
-
-    <div class="controls-row">
-      <button id="startBtn" class="primary">Start</button>
-      <button id="pauseBtn" class="warn">Pause</button>
-      <button id="resumeBtn" class="primary">Resume</button>
-      <button id="stopBtn" class="danger">Stop</button>
-    </div>
-
-    <div class="sdfiles-box">
+    <div class="card files-card">
       <div class="sdfiles-header">
         <span>On SD Card</span>
         <button id="refreshSdBtn" title="Refresh list">
@@ -427,179 +610,133 @@
       <div class="sdfiles-list" id="sdFilesList">
         <div class="sdfiles-empty">No files yet - upload one below</div>
       </div>
-    </div>
 
-    <div class="upload-box">
-      <button id="chooseFileBtn" class="primary small">Choose File</button>
-      <span class="fname" id="chosenFileName">No file selected</span>
-      <input type="file" id="fileInput" accept=".gcode,.gco,.g">
-    </div>
-    <div class="pill" id="uploadProgressWrap" style="display:none; padding: 6px 12px; gap: 8px;">
-      <progress id="uploadProgress" value="0" max="100" style="width:100%; height:8px;"></progress>
-      <span id="uploadStatus" style="font-size:11px; white-space:nowrap;"></span>
-      <button id="cancelUploadBtn" class="small danger" style="flex: none;">Cancel</button>
-    </div>
-
-    <div class="schedule-section">
-      <div id="scheduleRow">
-        <label class="action-row" title="Start the print at a chosen date and time instead of right now">
-          <span class="action-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg></span>
-          <span class="action-label">Scheduled print</span>
-          <span class="switch"><input type="checkbox" id="scheduleToggle"><span class="switch-slider"></span></span>
-        </label>
-        <div class="datetime-row" id="scheduleFields" style="display:none; margin-top:8px;">
-        <div class="datetime-wrap" style="flex: 1.3;">
-          <span id="scheduleDateDisplay" class="datetime-display">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg>
-            <span id="scheduleDateText">Date</span>
-          </span>
-          <input type="date" id="scheduleDate">
-        </div>
-        <div class="datetime-wrap" style="flex: 1;">
-          <span id="scheduleTimeDisplay" class="datetime-display">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>
-            <span id="scheduleTimeText">Time</span>
-          </span>
-          <input type="time" id="scheduleTime">
-        </div>
-        </div>
+      <div class="upload-box">
+        <button id="chooseFileBtn" class="primary small">Choose File</button>
+        <span class="fname" id="chosenFileName">No file selected</span>
+        <input type="file" id="fileInput" accept=".gcode,.gco,.g">
       </div>
-      <div id="scheduleActive" class="schedule-body" style="display:none;">
-        <div class="pill" id="scheduleInfo" style="font-size: 12px;"></div>
-        <div class="datetime-row" id="reschedFields" style="display:none;">
+      <div class="pill" id="uploadProgressWrap" style="display:none; padding: 6px 12px; gap: 8px;">
+        <progress id="uploadProgress" value="0" max="100" style="width:100%; height:8px;"></progress>
+        <span id="uploadStatus" style="font-size:11px; white-space:nowrap;"></span>
+        <button id="cancelUploadBtn" class="small danger" style="flex: none;">Cancel</button>
+      </div>
+
+      <div>
+        <div class="toggle-pair">
+          <label class="toggle-row" id="scheduleRow" title="Start the print at a chosen date and time instead of right now">
+            <span class="grow">Scheduled print</span>
+            <span class="switch"><input type="checkbox" id="scheduleToggle"><span class="switch-slider"></span></span>
+          </label>
+          <label class="toggle-row" title="Turn off the smart plug once the printer has cooled down (&le;50&deg;C) after a print finishes or is stopped">
+            <span class="grow">Auto power off</span>
+            <span class="switch"><input type="checkbox" id="autoShutoffToggle"><span class="switch-slider"></span></span>
+          </label>
+        </div>
+        <div class="datetime-row" id="scheduleFields" style="display:none; margin-top:8px;">
           <div class="datetime-wrap" style="flex: 1.3;">
-            <span id="reschedDateDisplay" class="datetime-display">
+            <span id="scheduleDateDisplay" class="datetime-display">
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg>
-              <span id="reschedDateText">Date</span>
+              <span id="scheduleDateText">Date</span>
             </span>
-            <input type="date" id="reschedDate">
+            <input type="date" id="scheduleDate">
           </div>
           <div class="datetime-wrap" style="flex: 1;">
-            <span id="reschedTimeDisplay" class="datetime-display">
+            <span id="scheduleTimeDisplay" class="datetime-display">
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>
-              <span id="reschedTimeText">Time</span>
+              <span id="scheduleTimeText">Time</span>
             </span>
-            <input type="time" id="reschedTime">
+            <input type="time" id="scheduleTime">
           </div>
         </div>
-        <div class="datetime-row" id="scheduleButtons">
-          <button id="reschedBtn" class="small" style="flex: 1;" title="Move the scheduled print to another date or time (same file)">Change time</button>
-          <button id="scheduleCancelBtn" class="small danger" style="flex: 1;">Cancel</button>
-        </div>
-        <div class="datetime-row" id="reschedButtons" style="display:none;">
-          <button id="reschedSaveBtn" class="small primary" style="flex: 1;">Save</button>
-          <button id="reschedBackBtn" class="small" style="flex: 1;">Back</button>
-        </div>
       </div>
-      <label class="action-row" title="Turn off the smart plug once the printer has cooled down (&le;50&deg;C) after a print finishes or is stopped">
-        <span class="action-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4v10.54a4 4 0 1 1-4 0V4a2 2 0 0 1 4 0Z"/></svg></span>
-        <span class="action-label">Auto power off after cooldown</span>
-        <span class="switch"><input type="checkbox" id="autoShutoffToggle"><span class="switch-slider"></span></span>
-      </label>
     </div>
-  </div>
 
-  <div class="card camera-card">
-    <div class="camera-frame">
-      <img id="cameraImg" alt="camera stream">
-      <div class="camera-placeholder" id="cameraPlaceholder">
-        <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8a2 2 0 0 1 2-2h1.5l1-1.5h7l1 1.5H18a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/><circle cx="12" cy="13" r="3.5"/></svg>
-        <span id="camMsg">Connecting to camera&hellip;</span>
-      </div>
-      <span class="live-badge" id="liveBadge">LIVE</span>
-    </div>
-    <div class="cam-menu">
-      <div class="cam-menu-head cam-menu-title">
-        <span class="cam-dot" id="camDot"></span>
-        <span class="grow">Camera board</span>
-      </div>
-      <div class="cam-menu-body" id="camMenuBody">
-        <div class="cam-stats">
-          <div class="cam-stat" id="stFps"><b>&ndash;</b><span>FPS</span></div>
-          <div class="cam-stat" id="stWifi"><b>&ndash;</b><span>Wi-Fi</span></div>
-          <div class="cam-stat" id="stTemp"><b>&ndash;</b><span>Chip temp</span></div>
-          <div class="cam-stat" id="stCpu"><b>&ndash;</b><span>CPU</span></div>
+    <div class="card schedule-card" id="scheduleActive" style="display:none;">
+      <div class="sched-top">
+        <div class="sched-when"><div class="sched-day" id="schedDay">-</div><div class="sched-time num" id="schedTime">-</div></div>
+        <div class="sched-text">
+          <div class="sched-name" id="schedName">-</div>
+          <div class="sched-sub" id="scheduleInfo">Scheduled</div>
         </div>
-        <label class="cam-menu-head sub" style="cursor:pointer">
-          <span class="grow">Camera</span>
-          <span class="switch"><input type="checkbox" id="camForceToggle"><span class="switch-slider"></span></span>
-        </label>
-      </div>
-    </div>
-    <div class="cam-menu">
-      <div class="cam-menu-head cam-menu-title">
-        <span class="cam-dot" id="healthDot"></span>
-        <span class="grow">Board status</span>
-      </div>
-      <div class="cam-menu-body">
-        <div class="cam-stats">
-          <div class="cam-stat" id="stMem" title="Free working memory of the board."><b>&ndash;</b><span>Free RAM</span></div>
-          <div class="cam-stat" id="stPause" title="Time the board takes between the printer's ok and the next line. Yellow from 20 ms, red from 100 ms on average."><b>&ndash;</b><span>Board delay</span></div>
-          <div class="cam-stat" id="stResend" title="Lines resent after the printer got them damaged."><b>&ndash;</b><span>Resends</span></div>
-          <div class="cam-stat" id="stAck" title="How fast the printer answers each line. Long is normal."><b>&ndash;</b><span>Printer reply</span></div>
-          <div class="cam-stat" id="stEnvTemp" title="Room temperature from the DHT11 sensor."><b>&ndash;</b><span>Temp</span></div>
-          <div class="cam-stat" id="stEnvHum" title="Room humidity from the DHT11 sensor."><b>&ndash;</b><span>Humidity</span></div>
-        </div>
-        <button class="cam-menu-head sub" id="camLogBtn" aria-expanded="false">
-          <span class="grow">Log</span>
-          <svg class="chev down" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+        <button id="reschedBtn" class="sched-link" title="Move the scheduled print to another date or time (same file)">Change time</button>
+        <button id="scheduleCancelBtn" class="sched-x" aria-label="Cancel the scheduled print" title="Cancel the scheduled print">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
         </button>
-        <div id="camLogBody" hidden>
-          <div class="cam-kv"><span>Uptime</span><b id="lgUp">&ndash;</b></div>
-          <div class="cam-tabs"><button id="camTabEvents" class="on">Events</button><button id="camTabFiles">Files</button></div>
-          <div id="camLogEventsPane">
-            <div class="cam-hint">Recent important events (kept in RAM, lost on restart).</div>
-            <pre class="cam-events" id="camEventsText">Loading&hellip;</pre>
-            <div class="cam-modal-actions"><button id="camEventsCopy">Copy</button></div>
-          </div>
-          <div id="camLogFilesPane" hidden>
-            <div id="camLogList"></div>
-            <div id="camLogViewer" hidden>
-              <div class="cam-kv"><span id="camLogViewerName">&ndash;</span><b id="camLogViewerSize">&ndash;</b></div>
-              <div class="cam-hint" id="camLogViewerHint"></div>
-              <pre class="cam-events" id="camLogViewerText">Loading&hellip;</pre>
-              <div class="cam-modal-actions">
-                <button id="camLogBack">&larr; Files</button>
-                <button id="camLogEarlier">Earlier</button>
-                <button id="camLogJumpPrint">Last print</button>
-                <button id="camLogCopy">Copy</button>
-                <button id="camLogDownload">Download</button>
-              </div>
+      </div>
+      <div class="datetime-row" id="reschedFields" style="display:none;">
+        <div class="datetime-wrap" style="flex: 1.3;">
+          <span id="reschedDateDisplay" class="datetime-display">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg>
+            <span id="reschedDateText">Date</span>
+          </span>
+          <input type="date" id="reschedDate">
+        </div>
+        <div class="datetime-wrap" style="flex: 1;">
+          <span id="reschedTimeDisplay" class="datetime-display">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>
+            <span id="reschedTimeText">Time</span>
+          </span>
+          <input type="time" id="reschedTime">
+        </div>
+      </div>
+      <div class="datetime-row" id="reschedButtons" style="display:none;">
+        <button id="reschedSaveBtn" class="small primary" style="flex: 1;">Save</button>
+        <button id="reschedBackBtn" class="small" style="flex: 1;">Back</button>
+      </div>
+      <div class="datetime-row" id="scheduleButtons" style="display:none;"></div>
+    </div>
+  </aside>
+</div>
+
+<footer class="board-bar">
+  <span class="board-title"><span class="cam-dot" id="healthDot"></span><span class="cam-dot" id="camDot"></span>Board</span>
+  <div class="board-stats">
+    <span class="cam-stat" id="stTemp"><b>&ndash;</b><span>Chip temp</span></span>
+    <span class="cam-stat" id="stCpu"><b>&ndash;</b><span>CPU</span></span>
+    <span class="cam-stat" id="stWifi"><b>&ndash;</b><span>Wi-Fi</span></span>
+    <span class="cam-stat" id="stMem" title="Free working memory of the board."><b>&ndash;</b><span>Free RAM</span></span>
+    <span class="cam-stat" id="stPause" title="Time the board takes between the printer's ok and the next line. Yellow from 20 ms, red from 100 ms on average."><b>&ndash;</b><span>Board delay</span></span>
+    <span class="cam-stat" id="stAck" title="How fast the printer answers each line. Long is normal."><b>&ndash;</b><span>Printer reply</span></span>
+    <span class="cam-stat" id="stResend" title="Lines resent after the printer got them damaged."><b>&ndash;</b><span>Resends</span></span>
+  </div>
+  <button class="board-log" id="camLogBtn" aria-expanded="false">Log</button>
+</footer>
+
+<div class="cam-modal" id="camLogModal">
+  <div class="cam-modal-card">
+    <div class="cam-modal-top">
+      <h3>Board log</h3>
+      <button class="cam-modal-x" id="camLogClose" aria-label="Close">&times;</button>
+    </div>
+    <div class="cam-modal-body">
+      <div id="camLogBody" hidden>
+        <div class="cam-kv"><span>Uptime</span><b id="lgUp">&ndash;</b></div>
+        <div class="cam-tabs"><button id="camTabEvents" class="on">Events</button><button id="camTabFiles">Files</button></div>
+        <div id="camLogEventsPane">
+          <div class="cam-hint">Recent important events (kept in RAM, lost on restart).</div>
+          <pre class="cam-events" id="camEventsText">Loading&hellip;</pre>
+          <div class="cam-modal-actions"><button id="camEventsCopy">Copy</button></div>
+        </div>
+        <div id="camLogFilesPane" hidden>
+          <div id="camLogList"></div>
+          <div id="camLogViewer" hidden>
+            <div class="cam-kv"><span id="camLogViewerName">&ndash;</span><b id="camLogViewerSize">&ndash;</b></div>
+            <div class="cam-hint" id="camLogViewerHint"></div>
+            <pre class="cam-events" id="camLogViewerText">Loading&hellip;</pre>
+            <div class="cam-modal-actions">
+              <button id="camLogBack">&larr; Files</button>
+              <button id="camLogEarlier">Earlier</button>
+              <button id="camLogJumpPrint">Last print</button>
+              <button id="camLogCopy">Copy</button>
+              <button id="camLogDownload">Download</button>
             </div>
           </div>
         </div>
       </div>
     </div>
   </div>
-
-  <div class="card preview-card">
-    <div class="preview-header">
-      <span class="action-icon"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 2 7l10 5 10-5-10-5Z"/><path d="M2 17l10 5 10-5M2 12l10 5 10-5"/></svg></span>
-      <span class="action-label">Print Preview</span>
-      <span class="num" id="previewLayerReadout">Layer -/-</span>
-    </div>
-    <div class="preview-body" id="previewBody">
-      <div class="preview-stage" id="previewStage">
-        <canvas id="previewGhostCanvas"></canvas>
-        <canvas id="previewSolidCanvas"></canvas>
-        <div class="preview-loading" id="previewLoading">No file loaded</div>
-      </div>
-      <div class="preview-legend">
-        <div class="preview-legend-swatches">
-          <span><span class="swatch" style="background:#3ecf7e"></span>Printed</span>
-          <span><span class="swatch" style="background:#9aa0ac"></span>Remaining</span>
-        </div>
-        <span class="num" id="previewPercentReadout">-</span>
-      </div>
-    </div>
-  </div>
-
-
-
-
 </div>
-
-<div class="footer" id="firmwareInfo"></div>
 
 <div class="sidebar-scrim" id="sidebarScrim"></div>
 <div class="sidebar" id="sidebar">
@@ -633,6 +770,9 @@
       <button class="quality-row" data-profile="fast"><span class="q-dot"></span><span class="q-name">VGA 640&times;480</span><span class="q-note">smooth</span></button>
       <button class="quality-row" data-profile="xga"><span class="q-dot"></span><span class="q-name">XGA 1024&times;768</span><span class="q-note">sharp</span></button>
     </div>
+
+    <div class="section-label">Printer firmware</div>
+    <div class="footer firmware-info" id="firmwareInfo"></div>
   </div>
 </div>
 
@@ -840,22 +980,41 @@ function renderSchedule(s) {
   $("scheduleActive").style.display = hasJob ? "flex" : "none";
   if (!hasJob) showReschedule(false);
   if (hasJob) {
-    var when = new Date(s.scheduledAtMillis).toLocaleString();
+    var at = new Date(s.scheduledAtMillis), name = s.scheduledFileDisplay || s.scheduledFile;
     var failed = s.scheduledStatus && s.scheduledStatus.indexOf("FAILED") === 0;
+    $("schedDay").textContent = dayWord(at);
+    $("schedTime").textContent = pad2(at.getHours()) + ":" + pad2(at.getMinutes());
+    $("schedName").textContent = name;
+    $("schedName").title = name;
     var info = $("scheduleInfo");
     if (failed) {
-      info.textContent = "Failed: " + s.scheduledStatus.substring("FAILED:".length) + " (" + (s.scheduledFileDisplay || s.scheduledFile) + ")";
+      info.textContent = "Failed: " + s.scheduledStatus.substring("FAILED:".length);
       info.style.color = "var(--danger)";
     } else {
-      info.textContent = (s.scheduledFileDisplay || s.scheduledFile) + " at " + when;
-      if (s.scheduledOnPhone) {
-        var send = new Date(s.scheduledSendAtMillis);
-        info.textContent += " · the file is on the phone; the printer powers on and gets it at "
-            + pad2(send.getHours()) + ":" + pad2(send.getMinutes());
-      }
+      var dur = slicerDuration(name);
+      info.textContent = "Scheduled" + (dur ? " · " + dur : "");
       info.style.color = "";
     }
+    info.title = s.scheduledOnPhone && !failed
+        ? "The file is on the phone; the printer powers on and gets it at "
+          + pad2(new Date(s.scheduledSendAtMillis).getHours()) + ":" + pad2(new Date(s.scheduledSendAtMillis).getMinutes())
+        : "";
   }
+}
+// "today" / "tomorrow" / "Wed 30 Sep" for the schedule card.
+function dayWord(d) {
+  var start = new Date(); start.setHours(0, 0, 0, 0);
+  var days = Math.round((new Date(d.getFullYear(), d.getMonth(), d.getDate()) - start) / 86400000);
+  if (days === 0) return "today";
+  if (days === 1) return "tomorrow";
+  return ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getDay()] + " " + d.getDate() + " " + SCHEDULE_MONTHS[d.getMonth()];
+}
+// The print time the slicer puts into the file name ("..._PETG_3h43m.gcode" -> "3h 43m"), if there is one.
+function slicerDuration(name) {
+  var m = /_(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?\.[A-Za-z0-9]+$/.exec(name || "");
+  if (!m || !(m[1] || m[2] || m[3])) return "";
+  var h = (+(m[1] || 0)) * 24 + (+(m[2] || 0));
+  return ((h ? h + "h " : "") + (m[3] ? +m[3] + "m" : "")).trim();
 }
 
 // Kept only so ensurePreview() has nothing left to hijack the main preview with.
@@ -1004,7 +1163,8 @@ function setDateTimeField(inputId, value) {
 function showReschedule(on) {
   $("reschedFields").style.display = on ? "flex" : "none";
   $("reschedButtons").style.display = on ? "flex" : "none";
-  $("scheduleButtons").style.display = on ? "none" : "flex";
+  $("reschedBtn").style.display = on ? "none" : "";
+  $("scheduleCancelBtn").style.display = on ? "none" : "";
 }
 $("reschedBtn").onclick = function () {
   var s = lastState || {};
@@ -1113,9 +1273,7 @@ function ensurePreview(s) {
     // needs to keep the mobile-layer-pill that replaces it up to date, never touch the 3D
     // canvases at all. No percent here - the progress ring above already shows it.
     if (previewApi || previewFile) { previewApi = null; previewFile = null; }
-    $("mobileLayerReadout").textContent = s.currentLayer != null && s.totalLayers != null
-        ? "Layer " + s.currentLayer + "/" + s.totalLayers : "Layer -/-";
-    return;
+    return;  // the layer count is in the progress card (renderStatus), for every device
   }
   // Browsing the scheduled-print file picker takes over this same canvas to show what would
   // get printed - there's nothing live to show yet, so it wins over the status-driven view
@@ -1230,24 +1388,33 @@ function renderStatus(s) {
   var showAsConnected = live && s.phase !== "ERROR";
   $("connectToggle").checked = showAsConnected;
   $("connectToggle").disabled = s.phase === "CONNECTING";
-  $("hotendTemp").textContent = live ? Math.round(s.hotendTemp) : "-";
+  $("hotendTemp").textContent = live ? Math.round(s.hotendTemp) + "°" : "-";
   $("hotendTarget").textContent = live ? Math.round(s.hotendTarget) : "-";
-  $("bedTemp").textContent = live ? Math.round(s.bedTemp) : "-";
+  $("bedTemp").textContent = live ? Math.round(s.bedTemp) + "°" : "-";
   $("bedTarget").textContent = live ? Math.round(s.bedTarget) : "-";
+  $("fanVal").textContent = s.fanSpeed != null ? Math.round(s.fanSpeed * 100 / 255) + "%" : "-";
 
-  var ring = $("progressRing");
-  var offset = RING_CIRCUMFERENCE * (1 - s.printProgressPercent / 100);
-  ring.style.strokeDasharray = RING_CIRCUMFERENCE;
-  ring.style.strokeDashoffset = offset;
-  ring.setAttribute("class", "ring-fg " + s.phase);
+  var bar = $("progressRing");
+  bar.style.width = Math.max(0, Math.min(100, s.printProgressPercent)) + "%";
+  bar.className = "progress-fill " + s.phase;
   $("ringPercent").textContent = s.printProgressPercent + "%";
+  $("layerLine").textContent = s.currentLayer != null && s.totalLayers != null
+      ? "Layer " + s.currentLayer + " / " + s.totalLayers : "Layer -/-";
 
-  $("elapsed").textContent = fmtTime(s.elapsedSeconds);
-  $("remaining").textContent = s.printProgressPercent >= REMAINING_MIN_PERCENT
-      ? fmtTime(s.estimatedRemainingSeconds || 0) + " remaining"
-      : (s.phase === "PRINTING" ? "Calculating..." : "-");
+  var active = s.phase === "PRINTING" || s.phase === "PAUSED";
+  var haveEstimate = s.printProgressPercent >= REMAINING_MIN_PERCENT && active;
+  $("elapsed").textContent = active || s.elapsedSeconds ? fmtTime(s.elapsedSeconds) : "-";
+  $("remaining").textContent = haveEstimate ? fmtTime(s.estimatedRemainingSeconds || 0)
+      : (s.phase === "PRINTING" ? "calculating" : "-");
+  if (haveEstimate) {
+    var end = new Date(Date.now() + (s.estimatedRemainingSeconds || 0) * 1000);
+    $("finishAt").textContent = pad2(end.getHours()) + ":" + pad2(end.getMinutes());
+  } else {
+    $("finishAt").textContent = "-";
+  }
 
   $("currentFile").textContent = s.currentFileDisplay || s.currentFile || "no file selected";
+  $("currentFile").title = $("currentFile").textContent;
 
   ensurePreview(s);
 
@@ -1747,7 +1914,7 @@ function pollCamStatus() {
     // The camera runs only while the printer's smart plug is on; the board itself always runs.
     if (s.cameraOn === false) {
       if (camWanted || camStreamUp) stopCamStream();
-      showCamStream(false, "Camera is off - it turns on with the printer power");
+      showCamStream(false, "Camera is off");
     } else if (!camWanted && !document.hidden) {
       startCamStream();
     }
@@ -1767,27 +1934,25 @@ function pollCamStatus() {
     // where the sensor itself gets unreliable, and treat 90+ as a real problem.
     var lFps = fps < 8 ? "bad" : (fps < 12 ? "warn" : ""), lWifi = s.rssi < -75 ? "bad" : (s.rssi < -67 ? "warn" : ""),
         lTemp = s.tempC >= 90 ? "bad" : (s.tempC >= 80 ? "warn" : ""), lCpu = cpu > 90 ? "bad" : "";
-    setCamStat("stFps", fps.toFixed(0), lFps);
     setCamStat("stWifi", s.rssi + " dBm", lWifi);
     setCamStat("stTemp", s.tempC.toFixed(0) + " \u00b0C", lTemp);
     setCamStat("stCpu", cpu + "%", lCpu);
-    if (s.envOk) {
-      setCamStat("stEnvTemp", s.envTempC.toFixed(1) + " \u00b0C", "");
-      setCamStat("stEnvHum", s.envHum.toFixed(0) + "%", "");
-    } else {
-      setCamStat("stEnvTemp", "\u2013");
-      setCamStat("stEnvHum", "\u2013");
-    }
+    $("camFpsChip").textContent = s.cameraOn === false ? "" : Math.round(fps) + " fps";
+    $("roomTemp").textContent = s.envOk ? Math.round(s.envTempC) + "\u00b0" : "-";
+    $("roomHum").textContent = s.envOk ? Math.round(s.envHum) + "%" : "";
     var worst = [lFps, lWifi, lTemp, lCpu].indexOf("bad") >= 0 ? "bad" : ([lFps, lWifi, lTemp, lCpu].indexOf("warn") >= 0 ? "warn" : "ok");
     $("camDot").className = "cam-dot " + worst;
+    camWorst = worst; renderHealth();
   }).catch(function () {
-    ["stFps", "stWifi", "stTemp", "stCpu", "stEnvTemp", "stEnvHum"].forEach(function (id) { setCamStat(id, "\u2013"); });
+    ["stWifi", "stTemp", "stCpu"].forEach(function (id) { setCamStat(id, "\u2013"); });
+    $("camFpsChip").textContent = ""; $("roomTemp").textContent = "-"; $("roomHum").textContent = "";
+    camWorst = "bad"; renderHealth();
     $("camDot").className = "cam-dot";
   });
 }
 
 // ---- Board status: free memory, the board's pause between print lines, resends, the printer's answer time
-var boardHeapNow = null, boardHeapMin = null, boardPrinter = null, bootHeapKB = 256;  // ~256 KB is free right after the board starts
+var boardHeapNow = null, boardHeapMin = null, boardPrinter = null, bootHeapKB = 256, camWorst = "";  // ~256 KB is free right after the board starts
 function renderHealth() {
   var p = boardPrinter, live = !!p && (p.state === "PRINTING" || p.state === "PAUSED");
   var lMem = "", lPause = "", lResend = "";
@@ -1812,7 +1977,7 @@ function renderHealth() {
   } else {
     ["stPause", "stResend", "stAck"].forEach(function (id) { setCamStat(id, "–"); });
   }
-  var lv = [lMem, lPause, lResend];
+  var lv = [lMem, lPause, lResend, camWorst];  // one dot for the whole board: its own vitals and the camera side
   $("healthDot").className = "cam-dot " + (lv.indexOf("bad") >= 0 ? "bad" : (lv.indexOf("warn") >= 0 ? "warn" : (boardHeapNow != null || live ? "ok" : "")));
 }
 function pollBoardHealth() {
@@ -1833,9 +1998,11 @@ var camLogFollowTimer = null, camLogView = null; // {name, size, current, from, 
 
 var camLogTab = "events", camLogEventsTimer = null;
 
+// The log opens in a window over the page (it is read now and then, never watched).
 function toggleCamLog() {
   var open = $("camLogBody").hidden;
   $("camLogBody").hidden = !open;
+  $("camLogModal").classList.toggle("show", open);
   $("camLogBtn").setAttribute("aria-expanded", open ? "true" : "false");
   if (open) setCamLogTab("events"); // real-time events first, the file manager is one tap away
   else stopCamLogTabTimers();
@@ -2029,6 +2196,8 @@ function downloadCamLogFile() {
 }
 
 $("camLogBtn").onclick = toggleCamLog;
+$("camLogClose").onclick = toggleCamLog;
+$("camLogModal").addEventListener("click", function (e) { if (e.target === this) toggleCamLog(); });
 $("camTabEvents").onclick = function () { setCamLogTab("events"); };
 $("camTabFiles").onclick = function () { setCamLogTab("files"); };
 $("camLogBack").onclick = backToCamLogList;
