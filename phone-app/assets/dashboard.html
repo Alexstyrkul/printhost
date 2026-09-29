@@ -345,6 +345,7 @@
   .top-row { padding: 12px 20px; margin: 0; border-bottom: 1px solid var(--panel-border); }
   .msg { padding: 0 20px; margin: 6px 0 0; }
   .msg:empty { display: none; }
+  .alert-box { flex: none; margin: 10px 20px 0; }
   .layout { display: grid; grid-template-columns: minmax(0, 1fr) 420px; gap: 16px; padding: 16px 20px; }
   .stage-col, .side-col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
   .stage-col { gap: 16px; }
@@ -462,6 +463,8 @@
     .status-group { display: contents; }  /* the status pill stays next to the title, the switches get their own row */
     .status-toggles { flex-basis: 100%; gap: 16px; }
     .layout { grid-template-columns: minmax(0, 1fr); padding: 12px; gap: 12px; }
+    .alert-box { margin: 10px 12px 0; }
+    .msg { padding: 0 12px; }
     .side-col .temps-grid { order: 1; }
     .side-col #scheduleActive { order: 2; }
     .side-col .files-card { order: 3; }
@@ -596,7 +599,7 @@
     <div class="card preview-card">
       <div class="preview-header">
         <span class="action-label">Print Preview</span>
-        <span class="num" id="previewLayerReadout">Layer -/-</span>
+        <span class="num" id="previewLayerReadout" hidden>Layer -/-</span><!-- the layer is shown in the progress card -->
       </div>
       <div class="preview-body" id="previewBody">
         <div class="preview-stage" id="previewStage">
@@ -617,9 +620,6 @@
     <div class="card files-card">
       <div class="sdfiles-header">
         <span>On SD Card</span>
-        <button id="refreshSdBtn" title="Refresh list">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 4v6h-6"/></svg>
-        </button>
       </div>
       <div class="sdfiles-list" id="sdFilesList">
         <div class="sdfiles-empty">No files yet - upload one below</div>
@@ -739,9 +739,10 @@
             <div class="cam-hint" id="camLogViewerHint"></div>
             <pre class="cam-events" id="camLogViewerText">Loading&hellip;</pre>
             <div class="cam-modal-actions">
-              <button id="camLogBack">&larr; Files</button>
-              <button id="camLogEarlier">Earlier</button>
-              <button id="camLogJumpPrint">Last print</button>
+              <!-- back = the Files tab above; earlier / last print dropped by request: only Copy and Download -->
+              <button id="camLogBack" hidden>&larr; Files</button>
+              <button id="camLogEarlier" hidden>Earlier</button>
+              <button id="camLogJumpPrint" hidden>Last print</button>
               <button id="camLogCopy">Copy</button>
               <button id="camLogDownload">Download</button>
             </div>
@@ -917,10 +918,21 @@ function checkForNotifiableTransition(s) {
   lastPhase = s.phase;
 }
 
+// The list counts as loaded only when the phone really answered with it (it answers {} when the board could not be
+// asked); until then it is asked again every few seconds, so a first request that failed does not leave the
+// placeholder up for good.
+var sdListLoading = false, sdListRetryTimer = null;
 function loadSdFiles() {
+  if (sdListLoading) return;
+  sdListLoading = true;
+  clearTimeout(sdListRetryTimer);
   fetch("/sdfiles").then(function (r) { return r.json(); }).then(function (data) {
-    renderSdFiles((data && data.files) || []);
-  }).catch(function () {});
+    if (!data || !data.files) throw new Error("no list");
+    sdListLoadedOnce = true;
+    renderSdFiles(data.files);
+  }).catch(function () {
+    sdListRetryTimer = setTimeout(loadSdFiles, 5000);
+  }).then(function () { sdListLoading = false; });
 }
 
 
@@ -981,7 +993,13 @@ function deleteSdFile(name) {
   });
 }
 
-$("refreshSdBtn").onclick = function () { loadSdFiles(); };
+// No refresh button: the list re-reads itself when the tab comes back into view and once a minute while nothing is
+// printing (a file added from another device, or on the card from a computer, shows up by itself).
+document.addEventListener("visibilitychange", function () { if (!document.hidden) loadSdFiles(); });
+setInterval(function () {
+  var busy = lastState && (lastState.phase === "PRINTING" || lastState.phase === "PAUSED" || lastState.phase === "UPLOADING");
+  if (!document.hidden && !busy) loadSdFiles();
+}, 60000);
 
 // ---- scheduled print --------------------------------------------------------------------------
 
@@ -1304,7 +1322,9 @@ function ensurePreview(s) {
     return;
   }
 
-  var ready = !!(s.currentFile || s.currentFileDisplay) && !!PREVIEW_READY_PHASES[s.phase];
+  // The preview is built from the phone's own copy of the file, so the printer does not have to be on: a chosen
+  // file (fileReady) shows even while the printer is disconnected, which is the usual case right after an upload.
+  var ready = !!(s.currentFile || s.currentFileDisplay) && (!!s.fileReady || !!PREVIEW_READY_PHASES[s.phase]) && s.phase !== "UPLOADING";
   if (!ready) {
     if (previewApi || previewFile) {
       previewApi = null;
@@ -1402,6 +1422,7 @@ function renderAlert(s) {
     note += inter.printerKept
         ? "The printer kept its position: resume heats up, returns to the spot and continues."
         : "The printer restarted since: resume homes X and Y only (keep the part on the bed, do not move Z by hand).";
+    if (inter.crashLoop) note += " The board kept restarting, so it switched the heaters off and will not resume by itself: check it before resuming.";
   }
   $("alertNote").textContent = note;
   $("recoverBtn").style.display = inter ? "" : "none";
@@ -1411,14 +1432,15 @@ function renderAlert(s) {
 $("recoverBtn").onclick = function () {
   if (!confirm("Resume the interrupted print? The printer will heat up and move.")) return;
   post("/print/recover?mode=auto").then(function (r) {
+    if (r.state) renderStatus(r.state);
     showToast(r.success ? "success" : "error", r.message || (r.success ? "Resuming" : "Resume failed"));
   });
 };
 $("discardBtn").onclick = function () {
   if (!confirm("Discard the interrupted print? It can not be resumed afterwards.")) return;
-  post("/print/recover/discard").then(function (r) { showToast(r.success ? "success" : "error", r.message || ""); });
+  post("/print/recover/discard").then(function (r) { if (r.state) renderStatus(r.state); showToast(r.success ? "success" : "error", r.message || ""); });
 };
-$("alertDismissBtn").onclick = function () { post("/alert/dismiss"); };
+$("alertDismissBtn").onclick = function () { post("/alert/dismiss").then(function (r) { if (r.state) renderStatus(r.state); }); };
 
 function renderStatus(s) {
   lastState = s;
@@ -1429,6 +1451,7 @@ function renderStatus(s) {
   $("firmwareInfo").textContent = s.firmwareInfo || "";
   $("errorMsg").textContent = s.lastError || "";
   renderAlert(s);
+  if (s.interrupted) $("errorMsg").textContent = "";  // the alert box above explains the interruption
 
   var live = s.phase !== "DISCONNECTED" && s.phase !== "CONNECTING";
   // A printer-side error (upload failed, poll timed out, etc.) doesn't necessarily mean the
@@ -1476,8 +1499,7 @@ function renderStatus(s) {
   // (server now refuses it too, but no reason to even ask).
   // The file list is the ESP32 SD card, so it does not depend on the printer being connected: load it
   // once on the first status, and again whenever the printer (re)connects.
-  if ((!sdListLoadedOnce || (live && !wasLive)) && s.phase !== "PRINTING" && s.phase !== "PAUSED") {
-    sdListLoadedOnce = true;
+  if ((!sdListLoadedOnce && !sdListRetryTimer) || (live && !wasLive)) {  // during a print the phone answers from its own list
     loadSdFiles();
   }
   wasLive = live;
@@ -1958,7 +1980,8 @@ function pollCamStatus() {
   var nowPoll = Date.now();
   if (camLastPollAt && nowPoll - camLastPollAt > 10000) camRestartIfWanted();  // the machine slept
   camLastPollAt = nowPoll;
-  fetch(camStatusUrl).then(function (r) { return r.json(); }).then(function (s) {
+  // The phone answers 502 (with a JSON error) while the board is unreachable: treat that as "no board", not as board data.
+  fetch(camStatusUrl).then(function (r) { if (!r.ok) throw new Error("board unreachable"); return r.json(); }).then(function (s) {
     boardCamOn = s.cameraOn !== false; syncCamToggle();
     if (s.profile && Date.now() >= qualityHoldUntil) renderQuality(s.profile);
     // The camera runs only while the printer's smart plug is on; the board itself always runs.
@@ -1995,6 +2018,7 @@ function pollCamStatus() {
     camWorst = worst; renderHealth();
   }).catch(function () {
     ["stWifi", "stTemp", "stCpu"].forEach(function (id) { setCamStat(id, "\u2013"); });
+    boardHeapNow = null;  // the board is not answering: do not keep showing its last memory figure
     $("camFpsChip").textContent = ""; $("roomTemp").textContent = "-"; $("roomHum").textContent = "";
     camWorst = "bad"; renderHealth();
     $("camDot").className = "cam-dot";
@@ -2031,7 +2055,7 @@ function renderHealth() {
   $("healthDot").className = "cam-dot " + (lv.indexOf("bad") >= 0 ? "bad" : (lv.indexOf("warn") >= 0 ? "warn" : (boardHeapNow != null || live ? "ok" : "")));
 }
 function pollBoardHealth() {
-  fetch(camPrinterUrl).then(function (r) { return r.json(); }).then(function (p) { boardPrinter = p; renderHealth(); })
+  fetch(camPrinterUrl).then(function (r) { if (!r.ok) throw new Error("board unreachable"); return r.json(); }).then(function (p) { boardPrinter = p; renderHealth(); })
     .catch(function () { boardPrinter = null; renderHealth(); });
 }
 
@@ -2254,10 +2278,28 @@ $("camLogBack").onclick = backToCamLogList;
 $("camLogEarlier").onclick = loadCamLogEarlier;
 $("camLogJumpPrint").onclick = jumpCamLogLastPrint;
 $("camLogDownload").onclick = downloadCamLogFile;
+// navigator.clipboard exists only on https or localhost; this page is served over plain http from the phone, so the
+// usual path is the older copy command on a hidden text area (it works on http, desktop and iPhone alike).
+function copyText(text, inside) {
+  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text).then(function () { return true; });
+  var ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;";
+  (inside || document.body).appendChild(ta);  // inside the open log window, where the focus is
+  ta.focus();
+  ta.select();
+  ta.setSelectionRange(0, text.length);  // iOS needs an explicit range
+  var ok = false;
+  try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+  ta.parentNode.removeChild(ta);
+  return Promise.resolve(ok);
+}
 function wireCopyButton(btnId, textId) {
   $(btnId).onclick = function () {
-    var btn = this, done = function () { btn.textContent = "Copied"; setTimeout(function () { btn.textContent = "Copy"; }, 1500); };
-    if (navigator.clipboard) navigator.clipboard.writeText($(textId).textContent).then(done, function () {});
+    var btn = this;
+    var show = function (ok) { btn.textContent = ok ? "Copied" : "Copy failed"; setTimeout(function () { btn.textContent = "Copy"; }, 1500); };
+    copyText($(textId).textContent, btn.parentNode).then(show, function () { show(false); });
   };
 }
 wireCopyButton("camLogCopy", "camLogViewerText");
