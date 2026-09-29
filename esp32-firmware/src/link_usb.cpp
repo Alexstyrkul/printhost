@@ -36,6 +36,9 @@ cdc_acm_dev_hdl_t dev = nullptr;
 // same handle twice - the second call hits an already-released interface deep inside the
 // vendored cdc_acm driver, which ESP_ERROR_CHECKs and panics the whole board.
 portMUX_TYPE devMux = portMUX_INITIALIZER_UNLOCKED;
+// Held while a write uses the handle and while it is closed: without it the engine could be inside
+// cdc_acm_host_data_tx_blocking() on a handle that onEvent() (the printer switched off) is freeing at that moment.
+SemaphoreHandle_t ioMtx = nullptr;
 StreamBufferHandle_t rxBuf = nullptr;
 volatile bool devGone = false;
 
@@ -48,6 +51,14 @@ cdc_acm_dev_hdl_t claimDevForClose() {
   dev = nullptr;
   portEXIT_CRITICAL(&devMux);
   return d;
+}
+
+// Closes the current handle once, never while a write is using it (the write gives up within its 1 s timeout).
+void closeDev() {
+  if (ioMtx) xSemaphoreTake(ioMtx, portMAX_DELAY);
+  cdc_acm_dev_hdl_t d = claimDevForClose();
+  if (d) cdc_acm_host_close(d);
+  if (ioMtx) xSemaphoreGive(ioMtx);
 }
 
 void usbLibTask(void *) {
@@ -67,10 +78,11 @@ void onEvent(const cdc_acm_host_dev_event_data_t *ev, void *) {
   if (ev->type == CDC_ACM_HOST_DEVICE_DISCONNECTED) {
     devGone = true;
     logEvent("usb: printer device disconnected");
-    cdc_acm_dev_hdl_t d = claimDevForClose();
-    if (d) cdc_acm_host_close(d);
+    closeDev();
   } else if (ev->type == CDC_ACM_HOST_ERROR) {
-    logEvent("usb: CDC error %d", ev->data.error);
+    static uint32_t errors = 0;  // reception is re-armed after each one (see the patched in_xfer_cb): log without flooding
+    errors++;
+    if (errors <= 10 || errors % 100 == 0) logEvent("usb: transfer error %d (#%u)", ev->data.error, (unsigned)errors);
   }
 }
 
@@ -141,6 +153,7 @@ class UsbLink : public PrinterLink {
 
   bool open(String &err) override {
     if (!rxBuf) rxBuf = xStreamBufferCreate(4096, 1);
+    if (!ioMtx) ioMtx = xSemaphoreCreateMutex();
     if (!ensureHost(err)) return false;
     devGone = false;
     xStreamBufferReset(rxBuf);
@@ -192,18 +205,19 @@ class UsbLink : public PrinterLink {
     return true;
   }
 
-  void close() override {
-    cdc_acm_dev_hdl_t d = claimDevForClose();
-    if (d) cdc_acm_host_close(d);
-  }
+  void close() override { closeDev(); }
 
   bool isOpen() override { return dev != nullptr && !devGone; }
 
   bool writeBytes(const uint8_t *d, size_t n) override {
+    if (!ioMtx) return false;
     while (n > 0) {
-      if (!isOpen()) return false;
       size_t chunk = n > 512 ? 512 : n;
-      if (cdc_acm_host_data_tx_blocking(dev, d, chunk, 1000) != ESP_OK) return false;
+      xSemaphoreTake(ioMtx, portMAX_DELAY);
+      cdc_acm_dev_hdl_t h = devGone ? nullptr : dev;
+      esp_err_t e = h ? cdc_acm_host_data_tx_blocking(h, d, chunk, 1000) : ESP_ERR_INVALID_STATE;
+      xSemaphoreGive(ioMtx);
+      if (e != ESP_OK) return false;
       d += chunk;
       n -= chunk;
     }

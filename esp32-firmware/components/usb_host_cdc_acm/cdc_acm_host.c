@@ -770,6 +770,16 @@ static void in_xfer_cb(usb_transfer_t *transfer)
     cdc_dev->rx_active = false;
 
     if (!cdc_acm_is_transfer_completed(transfer)) {
+        // PrintHost: after a transient error (not a gone device, a cancel or a stall) poll again, otherwise reception
+        // stops for good and the print engine only notices minutes later as "printer stopped responding".
+        if ((transfer->status == USB_TRANSFER_STATUS_ERROR || transfer->status == USB_TRANSFER_STATUS_TIMED_OUT ||
+             transfer->status == USB_TRANSFER_STATUS_OVERFLOW || transfer->status == USB_TRANSFER_STATUS_SKIPPED) && !cdc_dev->rx_paused) {
+            cdc_acm_reset_in_transfer(cdc_dev);
+            cdc_dev->rx_active = true;
+            if (usb_host_transfer_submit(cdc_dev->data.in_xfer) != ESP_OK) {
+                cdc_dev->rx_active = false;
+            }
+        }
         return;
     }
 
