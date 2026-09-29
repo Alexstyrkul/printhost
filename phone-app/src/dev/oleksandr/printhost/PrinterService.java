@@ -276,8 +276,18 @@ public class PrinterService extends Service {
         if (state.phase == PrinterState.Phase.PRINTING || state.phase == PrinterState.Phase.PAUSED) {
             return listKnownFiles();
         }
-        synchronized (commandLock) {
-            String raw = printerConnection.listSdFiles();
+        // The ESP32 store lists its own SD card over HTTP: no printer command, so it must not wait behind one (a
+        // printer connect attempt held this lock for ~12 s and the dashboard list request gave up).
+        String raw;
+        if (printerConnection instanceof EspStoreConnection) {
+            raw = printerConnection.listSdFiles();
+        } else {
+            synchronized (commandLock) {
+                raw = printerConnection.listSdFiles();
+            }
+        }
+        {
+
             JSONArray files = new JSONArray();
             java.util.Set<String> liveNames = new java.util.HashSet<>();
             boolean inList = false;
@@ -453,7 +463,24 @@ public class PrinterService extends Service {
      * is actually trying to recover from DISCONNECTED or ERROR.
      */
     public boolean connectPrinter() {
+        autoConnectFails = 0;  // a Connect by hand (or a scheduled print) also re-arms the automatic attempts
         return connectPrinter(false);
+    }
+
+    /** Automatic connect attempts give up after this many failures in a row (retrying forever kept the dashboard on
+     *  "Connecting..."); a Connect by hand, the plug turning on again or a successful connect start them again.
+     *  Not applied while the board reports a running print: following a print through a network gap matters more. */
+    private static final int AUTO_CONNECT_MAX_FAILS = 3;
+    private volatile int autoConnectFails = 0;
+
+    /** Counts a failed automatic attempt; true once the limit is reached (and says so in the dashboard). */
+    private boolean autoConnectFailed() {
+        if (++autoConnectFails >= AUTO_CONNECT_MAX_FAILS) {
+            state.lastError = "The printer did not connect after " + AUTO_CONNECT_MAX_FAILS + " tries - press Connect to try again";
+            Log.w(TAG, "auto connect: giving up after " + AUTO_CONNECT_MAX_FAILS + " failed tries");
+            return true;
+        }
+        return false;
     }
 
     /** quiet: an automatic attempt while the printer may still be booting - a failure is not shown as an error. */
@@ -757,6 +784,9 @@ public class PrinterService extends Service {
 
     public void cancelUpload() {
         uploadCancelRequested = true;
+        // A write blocked on a board that stopped taking data would only see the flag after the watchdog fires:
+        // close the connection now.
+        if (printerConnection instanceof EspStoreConnection) ((EspStoreConnection) printerConnection).abortUpload();
     }
 
     class ProgressListener implements PrinterConnection.UploadProgressListener {
@@ -1686,6 +1716,7 @@ public class PrinterService extends Service {
                     boolean plug = p != null && p.booleanValue();
                     long now = System.currentTimeMillis();
                     if (plug && !prevPlugOn) {
+                        autoConnectFails = 0;
                         windowEnd = now + AUTO_CONNECT_WINDOW_MS;
                         lastAttempt = now - AUTO_CONNECT_RETRY_MS + AUTO_CONNECT_FIRST_DELAY_MS;  // first try after the delay
                     }
@@ -1698,9 +1729,11 @@ public class PrinterService extends Service {
                     if (detached && printerConnection instanceof EspPrinterConnection && now - lastReattachCheck >= REATTACH_CHECK_MS) {
                         lastReattachCheck = now;
                         String bs = ((EspPrinterConnection) printerConnection).boardState();
-                        if (bs.equals("PRINTING") || bs.equals("PAUSED") || bs.equals("IDLE")) {
+                        boolean printing = bs.equals("PRINTING") || bs.equals("PAUSED");
+                        if (printing || (bs.equals("IDLE") && autoConnectFails < AUTO_CONNECT_MAX_FAILS)) {
                             Log.i(TAG, "the board is " + bs + " - attaching");
-                            connectPrinter(true);
+                            if (connectPrinter(true)) autoConnectFails = 0;
+                            else if (!printing) autoConnectFailed();
                             continue;
                         }
                     }
@@ -1722,9 +1755,16 @@ public class PrinterService extends Service {
                         continue;
                     }
                     if (now - lastAttempt < AUTO_CONNECT_RETRY_MS) continue;
+                    if (autoConnectFails >= AUTO_CONNECT_MAX_FAILS) {
+                        windowEnd = 0;
+                        continue;
+                    }
                     lastAttempt = now;
                     // Quiet while the printer may still be booting: no error flashes on the dashboard.
                     if (connectPrinter(true)) {
+                        windowEnd = 0;
+                        autoConnectFails = 0;
+                    } else if (autoConnectFailed()) {
                         windowEnd = 0;
                     } else if (now + AUTO_CONNECT_RETRY_MS > windowEnd) {
                         windowEnd = 0;
