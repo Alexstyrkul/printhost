@@ -22,6 +22,7 @@
 #include <lwip/sockets.h>
 #include <netinet/tcp.h>
 #include "ping/ping_sock.h"
+#include "crash.h"
 #include "printer.h"
 #include "test_ui.h"
 #if __has_include("secrets.h")
@@ -1258,6 +1259,18 @@ static esp_err_t printerStopHandler(httpd_req_t *req) {
   bool ok = printerStop(err);
   return printerReply(req, ok, err);
 }
+// POST /printer/recover?offset=<bytes>&mode=auto|kept|restarted&zNow=<mm>: resume the interrupted print (all optional).
+static esp_err_t printerRecoverHandler(httpd_req_t *req) {
+  String err, m = queryValue(req, "mode");
+  int mode = m == "kept" ? 1 : (m == "restarted" ? 2 : 0);
+  bool ok = printerRecover((uint32_t)strtoul(queryValue(req, "offset").c_str(), nullptr, 10), mode, queryValue(req, "zNow").toFloat(), err);
+  return printerReply(req, ok, err);
+}
+static esp_err_t printerDiscardHandler(httpd_req_t *req) {
+  String err;
+  bool ok = printerDiscardInterrupted(err);
+  return printerReply(req, ok, err);
+}
 static esp_err_t printerGcodeHandler(httpd_req_t *req) {
   String err, reply;
   uint32_t t = (uint32_t)queryValue(req, "timeout").toInt();
@@ -1359,16 +1372,16 @@ static esp_err_t statusHandler(httpd_req_t *req) {
   uint8_t wch = 0;
   wifi_second_chan_t wsec;
   esp_wifi_get_channel(&wch, &wsec);
-  char buf[1150];
+  char buf[1900];
   snprintf(buf, sizeof(buf),
            "{\"fps\":%.2f,\"frameBytes\":%u,\"mode\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,"
            "\"freePsram\":%u,\"sd\":\"%s\",\"uptime\":%lu,\"latencyMs\":%u,\"profile\":\"%s\",\"getMs\":%u,\"sendMs\":%u,\"wifiDrops\":%lu,\"reset\":\"%s\",\"tempC\":%.1f,\"cpu0\":%u,\"cpu1\":%u,\"cameraOn\":%s,\"quality\":%d,\"freeHeapKB\":%u,\"minHeapKB\":%u,\"totalHeapKB\":%u,"
-           "\"envOk\":%s,\"envTempC\":%.1f,\"envHum\":%.0f,\"channel\":%u}",
+           "\"envOk\":%s,\"envTempC\":%.1f,\"envHum\":%.0f,\"channel\":%u,\"bootId\":\"%s\",\"crashes\":%u,\"crash\":\"%s\"}",
            currentFps, (unsigned)lastFrameBytes, staMode ? "sta" : "ap", WiFi.SSID().c_str(),
            (staMode ? WiFi.localIP() : WiFi.softAPIP()).toString().c_str(), staMode ? WiFi.RSSI() : 0,
            (unsigned)ESP.getFreePsram(), sdStatus.c_str(), millis() / 1000, (unsigned)lastLatencyMs, PROFILES[curProfile].name, (unsigned)avgGetMs, (unsigned)avgSendMs, (unsigned long)wifiDrops, resetReasonText.c_str(), chipTempC, cpuLoad[0], cpuLoad[1], camEnabled ? "true" : "false", curQuality,
            (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getMinFreeHeap() / 1024), (unsigned)(ESP.getHeapSize() / 1024),
-           envOk ? "true" : "false", envTempC, envHum, (unsigned)wch);
+           envOk ? "true" : "false", envTempC, envHum, (unsigned)wch, printerBootId(), (unsigned)crashCount(), crashReport().c_str());
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");  // the main dashboard reads this from the phone
   return httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
@@ -1562,6 +1575,25 @@ static esp_err_t debugSurveyHandler(httpd_req_t *req) {
   return ESP_OK;
 }
 
+// POST /crash/clear: forget the recorded crash once the user has seen it (the dashboard's Dismiss).
+static esp_err_t crashClearHandler(httpd_req_t *req) {
+  crashClear();
+  logEvent("crash report cleared by %s", peerIp(req).c_str());
+  return sendJsonStatus(req, "200 OK", "{\"ok\":true}");
+}
+
+// POST /debug/crash: crashes the board on purpose (a real CPU fault) to test crash capture and the recovery of an
+// interrupted print. Refused unless the printer link is the simulator, so it can never cut a real print.
+static esp_err_t debugCrashHandler(httpd_req_t *req) {
+  if (printerStatusJson().indexOf("\"link\":\"sim\"") < 0)
+    return sendJsonStatus(req, "409 Conflict", "{\"ok\":false,\"error\":\"only with the simulated printer link\"}");
+  logEvent("debug: crashing on purpose (POST /debug/crash)");
+  delay(1500);  // lets loop() put the line on the SD card
+  volatile uint32_t *bad = (volatile uint32_t *)0x10;
+  *bad = 1;
+  return ESP_OK;
+}
+
 // GET /debug/tx?sec=10: raw upload speed test - the board sends filler bytes for that long (no camera involved),
 // the client measures the rate. Blocks the main HTTP server meanwhile, so keep it short.
 static esp_err_t debugTxHandler(httpd_req_t *req) {
@@ -1617,6 +1649,8 @@ static void startServers() {
       {"/debug/wifi", HTTP_POST, debugWifiHandler, nullptr},
       {"/debug/survey", HTTP_GET, debugSurveyHandler, nullptr},
       {"/debug/tx", HTTP_GET, debugTxHandler, nullptr},
+      {"/debug/crash", HTTP_POST, debugCrashHandler, nullptr},
+      {"/crash/clear", HTTP_POST, crashClearHandler, nullptr},
       {"/log", HTTP_GET, logHandler, nullptr},
       {"/log/sd", HTTP_GET, logSdHandler, nullptr},
       {"/camera", HTTP_POST, cameraPowerHandler, nullptr},
@@ -1628,6 +1662,8 @@ static void startServers() {
       {"/printer/pause", HTTP_POST, printerPauseHandler, nullptr},
       {"/printer/resume", HTTP_POST, printerResumeHandler, nullptr},
       {"/printer/stop", HTTP_POST, printerStopHandler, nullptr},
+      {"/printer/recover", HTTP_POST, printerRecoverHandler, nullptr},
+      {"/printer/recover/discard", HTTP_POST, printerDiscardHandler, nullptr},
       {"/printer/gcode", HTTP_POST, printerGcodeHandler, nullptr},
       {"/printer/sim", HTTP_POST, printerSimHandler, nullptr},
       {"/logs", HTTP_GET, logsListHandler, nullptr},
@@ -1898,6 +1934,10 @@ void setup() {
     logCleanupDue = true;  // no print can be running yet: the first log tick tidies up
   }
   logEvent("BOOT: %s, OTA-verified build %s %s, free heap %u KB, SD %s", resetReasonText.c_str(), __DATE__, __TIME__, (unsigned)(ESP.getFreeHeap() / 1024), sdStatus.c_str());
+  {  // what the crash before this boot was (crash.cpp): log lines are short, so it goes out in pieces
+    String cr = crashReport();
+    for (size_t i = 0; i < cr.length(); i += 90) logEvent("CRASH%s %s", i ? " (cont.)" : ":", cr.substring(i, i + 90).c_str());
+  }
   fpsWindowStart = millis();
   printerBegin();  // engine task; selects the USB link and connects by itself once the printer appears on USB
   dht11Begin(21);  // room sensor on GPIO 21 (moved from 14) - see docs/HANDOFF_ESP32_BRIDGE.md

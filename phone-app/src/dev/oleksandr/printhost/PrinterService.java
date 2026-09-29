@@ -50,6 +50,7 @@ public class PrinterService extends Service {
     private String espHost = "192.168.50.190";
     private PrintHostHttpServer httpServer;
     private MacNotifier macNotifier;
+    private AlertNotifier alertNotifier;
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
     private PollerThread pollerThread;
@@ -80,6 +81,7 @@ public class PrinterService extends Service {
         // The printer is always driven by the ESP32 board; this phone never opens USB.
         printerConnection = new EspPrinterConnection("http://" + espHost, "usb");
         macNotifier = new MacNotifier(this);
+        alertNotifier = new AlertNotifier(this, macNotifier);
         sdFilenameMap = new SdFilenameMap(new File(getFilesDir(), "sd_filename_map.json"));
         gcodeCacheSizeMap = new GcodeCacheSizeMap(new File(getFilesDir(), "gcode_cache_sizes.json"));
         tapoPlugController = new TapoPlugController(this);
@@ -930,6 +932,163 @@ public class PrinterService extends Service {
         }
     }
 
+    // ---- interrupted prints, alerts ----------------------------------------------------------------
+    // 2026-09-29: the board crashed at 30% of a print. Nobody was told, the printer kept the nozzle at 250 C on the part,
+    // and this phone even reported the print as finished. Now the board keeps a journal of the print and reports an
+    // "interrupted" print after a restart; this phone raises an alert and offers to resume it.
+
+    private String lastAlertKey = "";
+    private long heatersIdleSince = 0;
+    private boolean heatersAlerted = false;
+    private long lastBoardCheck = 0;
+    private String lastBootId = "";
+    private long unreachableSince = 0;
+
+    /** Raises an alert once per key: dashboard banner + every notification channel (see AlertNotifier). */
+    public void raiseAlert(String key, String message) {
+        synchronized (this) {
+            if (!key.equals("test") && key.equals(lastAlertKey)) return;
+            lastAlertKey = key;
+            state.alert = message;
+            state.alertAtMillis = System.currentTimeMillis();
+        }
+        alertNotifier.send(message);
+    }
+
+    public synchronized void dismissAlert() {
+        state.alert = "";
+        state.alertAtMillis = 0;
+    }
+
+    /** Dismiss from the dashboard: the user has seen it, so the board forgets its crash report too. */
+    public void dismissAlertByUser() {
+        dismissAlert();
+        state.boardCrash = "";
+        if (printerConnection instanceof EspPrinterConnection) ((EspPrinterConnection) printerConnection).clearCrash();
+    }
+
+    public void setNtfyTopic(String topic) {
+        alertNotifier.setNtfyTopic(topic);
+    }
+
+    /** Called about every 5 s (AutoConnectThread): picks up the board's interrupted print and crash report. */
+    private void checkBoard() {
+        long now = System.currentTimeMillis();
+        if (now - lastBoardCheck < 5000 || !(printerConnection instanceof EspPrinterConnection)) return;
+        lastBoardCheck = now;
+        JSONObject st = ((EspPrinterConnection) printerConnection).boardStatus();
+        if (st == null) return;
+        String boot = st.optString("bootId");
+        if (!boot.isEmpty() && !boot.equals(lastBootId)) {
+            // The board restarted (the plug was cycled, or it crashed): whatever print armed the auto shutoff is over.
+            if (!lastBootId.isEmpty() && autoShutoffArmed) {
+                autoShutoffArmed = false;
+                Log.i(TAG, "board restarted - auto shutoff disarmed");
+            }
+            lastBootId = boot;
+        }
+        JSONObject in = st.optJSONObject("interrupted");
+        state.interrupted = in;
+        state.boardCrash = st.optString("crash", "");
+        if (in != null) {
+            long total = in.optLong("total");
+            int pct = total > 0 ? (int) (in.optLong("bytes") * 100 / total) : 0;
+            String z = in.optBoolean("scanned") ? String.format(java.util.Locale.US, ", Z %.2f mm", in.optDouble("z")) : "";
+            raiseAlert("interrupted:" + in.optString("file") + ":" + in.optLong("bytes"),
+                    "Print interrupted at " + pct + "%" + z + ": " + in.optString("reason")
+                            + (state.boardCrash.isEmpty() ? "" : ". Board crash: " + state.boardCrash)
+                            + (in.optBoolean("crashLoop")
+                                ? ". The board restarts too often: all heaters are off and it will NOT resume by itself."
+                                : in.optBoolean("printerKept") && !in.optBoolean("autoResumeTried") && in.optInt("resumes") < 2
+                                    ? ". The board resumes it by itself in a moment."
+                                    : ". It can be resumed from the dashboard."));
+        } else if (!state.boardCrash.isEmpty()) {
+            raiseAlert("crash:" + st.optString("bootId"), "The printer board crashed and restarted: " + state.boardCrash);
+        }
+    }
+
+    /** Heaters on while nothing is printing, for a long time: someone forgot them, or a print died without a trace. */
+    private void checkHeatersLeftOn() {
+        PrinterState.Phase ph = state.phase;
+        boolean printing = ph == PrinterState.Phase.PRINTING || ph == PrinterState.Phase.PAUSED;
+        boolean heating = state.hotendTarget > 0 || state.bedTarget > 0;
+        if (printing || !heating || state.unloadingFilament || state.levelingBed) {
+            heatersIdleSince = 0;
+            heatersAlerted = false;
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (heatersIdleSince == 0) heatersIdleSince = now;
+        if (!heatersAlerted && now - heatersIdleSince > HEATERS_IDLE_ALERT_MS) {
+            heatersAlerted = true;
+            raiseAlert("heaters:" + heatersIdleSince, String.format(java.util.Locale.US,
+                    "Heaters are on (hotend %.0f/%.0f C, bed %.0f/%.0f C) but nothing has been printing for %d min",
+                    state.hotendTemp, state.hotendTarget, state.bedTemp, state.bedTarget, HEATERS_IDLE_ALERT_MS / 60000));
+        }
+    }
+
+    private static final long HEATERS_IDLE_ALERT_MS = 15 * 60 * 1000L;
+
+    /**
+     * Every change of the plug, whoever made it (its own button, the Tapo app, this phone), ends the "switch off once
+     * the printer has cooled after a print" watch: that watch belongs to the power session the print ran in. Before,
+     * it stayed armed: on 2026-09-29 the user switched the plug on by hand and the first cold reading switched it off.
+     */
+    private void notePlug(boolean on) {
+        Boolean prev = state.plugOn;
+        if (prev != null && prev.booleanValue() != on && autoShutoffArmed) {
+            autoShutoffArmed = false;
+            Log.i(TAG, "plug switched " + (on ? "on" : "off") + " - auto shutoff disarmed");
+        }
+        state.plugOn = on;
+    }
+
+    public UploadOutcome recoverPrint(long offset, String mode, double zNow) {
+        synchronized (commandLock) {
+            if (!(printerConnection instanceof EspPrinterConnection)) return new UploadOutcome(false, "Only the board can resume a print");
+            if (state.phase == PrinterState.Phase.PRINTING || state.phase == PrinterState.Phase.PAUSED) {
+                return new UploadOutcome(false, "Already printing");
+            }
+            JSONObject in = state.interrupted;
+            try {
+                if (!printerConnection.isOpen()) printerConnection.connect();
+                ((EspPrinterConnection) printerConnection).recoverPrint(offset, mode, zNow);
+            } catch (IOException e) {
+                Log.e(TAG, "recoverPrint failed", e);
+                state.lastError = String.valueOf(e.getMessage());
+                return new UploadOutcome(false, state.lastError);
+            }
+            if (in != null) {
+                state.currentFile = in.optString("file");
+                String display = sdFilenameMap.displayNameFor(state.currentFile);
+                state.currentFileDisplay = display != null ? display : state.currentFile;
+            }
+            state.interrupted = null;
+            state.fileReady = false;
+            state.phase = PrinterState.Phase.PRINTING;
+            state.lastError = "";
+            dismissAlert();
+            autoShutoffArmed = false;
+            updateNotification("Resuming " + state.currentFileDisplay);
+            startPoller();
+            return new UploadOutcome(true, "Resuming - heating up first");
+        }
+    }
+
+    public UploadOutcome discardInterrupted() {
+        synchronized (commandLock) {
+            if (!(printerConnection instanceof EspPrinterConnection)) return new UploadOutcome(false, "No board");
+            try {
+                ((EspPrinterConnection) printerConnection).discardInterrupted();
+            } catch (IOException e) {
+                return new UploadOutcome(false, String.valueOf(e.getMessage()));
+            }
+            state.interrupted = null;
+            dismissAlert();
+            return new UploadOutcome(true, "Interrupted print discarded");
+        }
+    }
+
     // ---- scheduled print ------------------------------------------------------------------------
     // Two kinds of job: a file already on the board's SD card (setScheduledPrint, started at the target
     // time), or a file kept on this phone because the board was off when it was scheduled
@@ -1015,7 +1174,7 @@ public class PrinterService extends Service {
         try {
             if (tapoPlugController.isOn()) return false;
             tapoPlugController.turnOn();
-            state.plugOn = true;
+            notePlug(true);
             return true;
         } catch (IOException e) {
             Log.w(TAG, "Scheduled print: couldn't turn on Tapo plug (non-fatal, trying anyway)", e);
@@ -1082,12 +1241,14 @@ public class PrinterService extends Service {
      *  alone. Checks both hotend and bed so it doesn't cut power while either is still cooling. */
     private void maybeAutoShutoff() {
         if (!autoShutoffArmed || !autoShutoffStore.isEnabled()) return;
+        // No real reading (the board is up but the printer is not, or has not answered yet): a thermistor never reads 0.
+        if (state.hotendTemp <= 0 && state.bedTemp <= 0) return;
         if (state.hotendTemp > AUTO_SHUTOFF_TEMP_C || state.bedTemp > AUTO_SHUTOFF_TEMP_C) return;
         autoShutoffArmed = false;
         if (!tapoPlugController.isConfigured()) return;
         try {
             tapoPlugController.turnOff();
-            state.plugOn = false;
+            notePlug(false);
             updateNotification("Plug off (cooled down)");
         } catch (IOException e) {
             Log.w(TAG, "auto shutoff: couldn't turn off Tapo plug", e);
@@ -1120,7 +1281,7 @@ public class PrinterService extends Service {
                 try {
                     if (!tapoPlugController.isOn()) {
                         tapoPlugController.turnOn();
-                        state.plugOn = true;
+                        notePlug(true);
                         // Give the printer's mainboard time to fully power up and finish its own
                         // boot sequence before trying to talk to it over USB - if this isn't
                         // quite enough for a cold boot, connectPrinter() below still fails
@@ -1401,6 +1562,7 @@ public class PrinterService extends Service {
                     // most callers only clear it at the START of their own next successful run -
                     // this background poll is what actually proves things are healthy again.
                     state.lastError = "";
+                    checkHeatersLeftOn();
                     maybeAutoShutoff();
                 } catch (InterruptedException e) {
                     break;
@@ -1483,7 +1645,7 @@ public class PrinterService extends Service {
                     Thread.sleep(PLUG_POLL_INTERVAL_MS);
                     if (stopRequested) break;
                     if (!tapoPlugController.isConfigured()) continue;
-                    state.plugOn = tapoPlugController.isOn();
+                    notePlug(tapoPlugController.isOn());
                 } catch (InterruptedException e) {
                     break;
                 } catch (Exception e) {
@@ -1519,6 +1681,7 @@ public class PrinterService extends Service {
                 try {
                     Thread.sleep(2000);
                     if (stopRequested) break;
+                    checkBoard();
                     Boolean p = state.plugOn;
                     boolean plug = p != null && p.booleanValue();
                     long now = System.currentTimeMillis();
@@ -1639,6 +1802,7 @@ public class PrinterService extends Service {
                     if (stopRequested) break;
                     pollOnce();
                     consecutiveFailures = 0;
+                    unreachableSince = 0;
                 } catch (InterruptedException e) {
                     break;
                 } catch (Exception e) {
@@ -1653,11 +1817,18 @@ public class PrinterService extends Service {
                             state.phase = PrinterState.Phase.ERROR;
                             state.lastError = msg;
                         }
-                        macNotifier.notifyAsync("error");
                         updateNotification("Print error");
+                        lastBoardCheck = 0;  // AutoConnectThread's next checkBoard() raises the alert with the board's details
+                        if (!msg.contains("interrupted")) raiseAlert("error:" + msg, "Print error: " + msg);
                         break;
                     }
                     if (consecutiveFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
+                        long now = System.currentTimeMillis();
+                        if (unreachableSince == 0) unreachableSince = now;
+                        if (now - unreachableSince > 120000) {
+                            raiseAlert("unreachable:" + unreachableSince,
+                                    "The printer board has not answered for 2 min during a print (it keeps printing from its SD card if it is alive)");
+                        }
                         // The board is out of reach (Wi-Fi gap, router restart...). The print runs on the board
                         // from its own SD card and does not need this phone, so never give up on it: keep the
                         // phase, say what is going on, and keep asking until the board answers again.
@@ -1846,7 +2017,7 @@ public class PrinterService extends Service {
     public UploadOutcome tapoPlugOn() {
         try {
             tapoPlugController.turnOn();
-            state.plugOn = true;
+            notePlug(true);
             return new UploadOutcome(true, "Plug on");
         } catch (IOException e) {
             Log.e(TAG, "tapoPlugOn failed", e);
@@ -1857,7 +2028,7 @@ public class PrinterService extends Service {
     public UploadOutcome tapoPlugOff() {
         try {
             tapoPlugController.turnOff();
-            state.plugOn = false;
+            notePlug(false);
             // The printer's power runs through this plug - cutting it kills the USB link too, so
             // reflect that immediately instead of leaving a stale "connected"/IDLE dashboard until
             // the poller eventually times out and notices on its own.

@@ -200,6 +200,42 @@ public class DashboardRouter implements RequestRouter {
         } else if (p.equals("/schedule/cancel") && req.method.equals("POST")) {
             service.cancelScheduledPrint();
             writeJson(out, 200, resultJson(true, service.getStateJson()));
+        } else if (p.equals("/print/recover") && req.method.equals("POST")) {
+            long offset = 0;
+            double zNow = 0;
+            try {
+                if (req.queryParam("offset") != null) offset = Long.parseLong(req.queryParam("offset"));
+                if (req.queryParam("zNow") != null) zNow = Double.parseDouble(req.queryParam("zNow"));
+            } catch (NumberFormatException e) {
+                writeJson(out, 400, errorJson("offset and zNow must be numbers"));
+                return;
+            }
+            String mode = req.queryParam("mode");
+            PrinterService.UploadOutcome outcome = service.recoverPrint(offset, mode == null ? "auto" : mode, zNow);
+            JSONObject json = resultJson(outcome.success, service.getStateJson());
+            try {
+                json.put("message", outcome.message);
+            } catch (Exception ignored) {
+            }
+            writeJson(out, outcome.success ? 200 : 409, json);
+        } else if (p.equals("/print/recover/discard") && req.method.equals("POST")) {
+            PrinterService.UploadOutcome outcome = service.discardInterrupted();
+            JSONObject json = resultJson(outcome.success, service.getStateJson());
+            try {
+                json.put("message", outcome.message);
+            } catch (Exception ignored) {
+            }
+            writeJson(out, outcome.success ? 200 : 409, json);
+        } else if (p.equals("/alert/dismiss") && req.method.equals("POST")) {
+            service.dismissAlertByUser();
+            writeJson(out, 200, resultJson(true, service.getStateJson()));
+        } else if (p.equals("/alerts/config") && req.method.equals("POST")) {
+            // ntfy=<topic> (push to the ntfy app), "" switches it off; GET-style query, nothing else to configure
+            service.setNtfyTopic(req.queryParam("ntfy"));
+            writeJson(out, 200, resultJson(true, service.getStateJson()));
+        } else if (p.equals("/alerts/test") && req.method.equals("POST")) {
+            service.raiseAlert("test", "PrintHost test alert - notifications work");
+            writeJson(out, 200, resultJson(true, service.getStateJson()));
         } else if (p.equals("/autoshutoff/set") && req.method.equals("POST")) {
             service.setAutoShutoffEnabled("true".equals(req.queryParam("enabled")));
             writeJson(out, 200, resultJson(true, service.getStateJson()));
@@ -230,7 +266,7 @@ public class DashboardRouter implements RequestRouter {
             boolean ok = service.resumePrint();
             writeJson(out, ok ? 200 : 409, resultJson(ok, service.getStateJson()));
         } else if (p.equals("/camera/relay") && req.method.equals("GET")) {
-            relayMjpeg(out);
+            relayMjpeg(out, "1".equals(req.queryParam("raw")));
         } else if (p.equals("/camera/relay/stats") && req.method.equals("GET")) {
             writeText(out, 200, "application/json", relay.statsJson());
         } else if (p.equals("/esp/logs/read") && req.method.equals("GET")) {
@@ -318,10 +354,12 @@ public class DashboardRouter implements RequestRouter {
     }
 
     /** Every viewer gets the newest frame the board sent; a viewer that cannot keep up skips frames on its own. */
-    private void relayMjpeg(OutputStream rawOut) throws IOException {
+    /** raw = the same bytes as application/octet-stream: WebKit (every iPhone browser) will not hand a
+     *  multipart/x-mixed-replace response to a page script piece by piece, so the dashboard reader asks for raw. */
+    private void relayMjpeg(OutputStream rawOut, boolean raw) throws IOException {
         java.io.BufferedOutputStream out = new java.io.BufferedOutputStream(rawOut, 65536);
         String head = "HTTP/1.1 200 OK\r\n"
-                + "Content-Type: multipart/x-mixed-replace; boundary=" + MJPEG_BOUNDARY + "\r\n"
+                + "Content-Type: " + (raw ? "application/octet-stream" : "multipart/x-mixed-replace; boundary=" + MJPEG_BOUNDARY) + "\r\n"
                 + "Connection: close\r\n"
                 + "Cache-Control: no-cache\r\n\r\n";
         out.write(head.getBytes(StandardCharsets.US_ASCII));

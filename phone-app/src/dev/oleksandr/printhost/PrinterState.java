@@ -53,6 +53,14 @@ public class PrinterState {
 
     public volatile boolean autoShutoffEnabled = false; // power off the plug once cooled after a print
 
+    /** The board's "interrupted" object (a print cut off by a board restart or an engine error), null = none. */
+    public volatile JSONObject interrupted = null;
+    /** The board's own description of its last crash ("" = none since it was powered up). */
+    public volatile String boardCrash = "";
+    /** Last alert raised (print interrupted, heaters left on...), shown as a banner; "" = none. */
+    public volatile String alert = "";
+    public volatile long alertAtMillis = 0;
+
     public synchronized JSONObject toJson() {
         JSONObject o = new JSONObject();
         try {
@@ -87,6 +95,10 @@ public class PrinterState {
             o.put("scheduledOnPhone", scheduledOnPhone);
             o.put("scheduledSendAtMillis", scheduledSendAtMillis);
             o.put("autoShutoffEnabled", autoShutoffEnabled);
+            o.put("interrupted", interrupted == null ? JSONObject.NULL : interrupted);
+            o.put("boardCrash", boardCrash);
+            o.put("alert", alert);
+            o.put("alertAtMillis", alertAtMillis);
 
             long remaining = 0;
             if (printProgressPercent > 0 && printProgressPercent < 100) {

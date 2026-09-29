@@ -44,6 +44,13 @@ bool printerStartPrint(const String &file, String &err, uint32_t dryLines = 0, u
 bool printerPause(String &err);
 bool printerResume(String &err);
 bool printerStop(String &err);
+// Interrupted print (the board restarted mid-print, or the engine gave up on an error): resume it from the last line
+// the printer acknowledged (offset 0) or from a given file offset. mode: 0 = auto, 1 = the printer kept its position,
+// 2 = it restarted (home X/Y, Z = zNow, default the height the board parked it at).
+bool printerRecover(uint32_t offset, int mode, float zNow, String &err);
+bool printerDiscardInterrupted(String &err);
+// Random per boot: a client that sees it change knows the board restarted.
+const char *printerBootId();
 // One-off command (not while printing). Returns the printer's answer text (ends with "ok").
 bool printerGcode(const String &cmd, uint32_t timeoutMs, String &reply, String &err);
 // Simulator tuning: motion lines per second, and inject a checksum error every N lines (0 = never).

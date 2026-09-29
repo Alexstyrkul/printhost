@@ -29,6 +29,12 @@ public class EspPrinterConnection extends EspStoreConnection {
     private JSONObject lastStatus = null;
     private long lastStatusAt = 0;
     private long finishedSeen = 0;
+    // The board picks a new random id at every boot: if it changes under a running print, the board restarted mid-print.
+    private String bootIdSeen = "";
+    // Set while this phone is stopping the print itself, so the board going idle is not reported as an interruption.
+    private volatile boolean stopping = false;
+    // This phone saw the board printing (or started a print) since the last end: only then can a print be "interrupted".
+    private boolean tracking = false;
     private String cachedFw = "";
     private String cachedZOffset = "echo:Z-0.000";
 
@@ -65,7 +71,9 @@ public class EspPrinterConnection extends EspStoreConnection {
             call("/printer/link?kind=" + linkKind, 8000);
             call("/printer/connect", CONNECT_TIMEOUT_MS);
         }
-        finishedSeen = statusFresh().optLong("finished");
+        JSONObject now = statusFresh();
+        finishedSeen = now.optLong("finished");
+        bootIdSeen = now.optString("bootId");
         open = true;
         return true;
     }
@@ -136,15 +144,66 @@ public class EspPrinterConnection extends EspStoreConnection {
         if (st.optBoolean("dry")) {
             return "Not SD printing\nok";
         }
+        // The board restarted under the print (2026-09-29: a crash at 30%). Its counters start from zero again, which
+        // used to look like "finished" here - the dashboard said done and the plug auto-shutoff got armed.
+        String boot = st.optString("bootId");
+        if (!boot.isEmpty() && !bootIdSeen.isEmpty() && !boot.equals(bootIdSeen)) {
+            bootIdSeen = boot;
+            finishedSeen = st.optLong("finished");
+            if (!tracking) return "Not SD printing\nok";
+            tracking = false;
+            throw new IOException("Printer bridge error: print interrupted - the board restarted during the print");
+        }
+        if (bootIdSeen.isEmpty()) bootIdSeen = boot;
         long finished = st.optLong("finished");
         if (finished != finishedSeen) {
             finishedSeen = finished;
+            tracking = false;
             return "Done printing file\nok";
         }
         if ("PRINTING".equals(state) || "PAUSED".equals(state)) {
+            tracking = true;
             return "SD printing byte " + st.optLong("bytesDone") + "/" + st.optLong("bytesTotal") + "\nok";
         }
+        // Not printing, and no finish was counted: the print did not end by itself. Only a Stop from here is normal.
+        if (tracking && !stopping && !"stopped".equals(st.optString("lastEnd"))) {
+            tracking = false;
+            String why = st.optString("error");
+            throw new IOException("Printer bridge error: print interrupted - the board is " + state + (why.isEmpty() ? "" : " (" + why + ")"));
+        }
         return "Not SD printing\nok";
+    }
+
+    /** The board's last /printer/status (fresh within a moment), or null when it cannot be reached. */
+    public synchronized JSONObject boardStatus() {
+        try {
+            return statusFresh();
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /** Resumes the board's interrupted print. mode: auto | kept | restarted; zNow only for "restarted". */
+    public synchronized void recoverPrint(long offset, String mode, double zNow) throws IOException {
+        stopping = false;
+        tracking = true;
+        StringBuilder q = new StringBuilder("/printer/recover?mode=").append(URLEncoder.encode(mode, "UTF-8"));
+        if (offset > 0) q.append("&offset=").append(offset);
+        if (zNow > 0) q.append("&zNow=").append(String.format(Locale.US, "%.2f", zNow));
+        call(q.toString(), 15000);
+        JSONObject now = statusFresh();
+        finishedSeen = now.optLong("finished");
+        bootIdSeen = now.optString("bootId");
+    }
+
+    /** Makes the board forget its recorded crash (best effort). */
+    public void clearCrash() {
+        tryCall("/crash/clear", 5000);
+        lastStatus = null;
+    }
+
+    public synchronized void discardInterrupted() throws IOException {
+        call("/printer/recover/discard", 10000);
     }
 
     @Override
@@ -167,12 +226,15 @@ public class EspPrinterConnection extends EspStoreConnection {
             throw new IOException("Printer rejected filename \"" + filename + "\": open failed");
         }
         selectedName = filename;
+        stopping = false;
+        tracking = true;
         call("/printer/print?file=" + URLEncoder.encode(filename, "UTF-8"), 15000);
         return "ok";
     }
 
     @Override
     public synchronized String stopPrint() throws IOException {
+        stopping = true;
         call("/printer/stop", 10000);
         return "ok";
     }

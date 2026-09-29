@@ -43,6 +43,10 @@
   .phase.DISCONNECTED { background: #333; color: var(--text-dim); }
 
   .msg { font-size: 11.5px; color: var(--danger); min-height: 15px; margin-bottom: 4px; }
+  .alert-box { display: none; background: var(--danger-dim); color: var(--danger); border-radius: 10px; padding: 10px 12px; margin-bottom: 10px; font-size: 13px; }
+  .alert-box.show { display: block; }
+  .alert-box .alert-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  .alert-box .alert-note { font-size: 11.5px; opacity: .85; margin-top: 6px; }
 
   button {
     background: var(--panel-2); color: var(--text); border: 1px solid var(--panel-border);
@@ -522,6 +526,16 @@
         <span class="switch"><input type="checkbox" id="camForceToggle"><span class="switch-slider"></span></span>
       </label>
     </div>
+  </div>
+</div>
+
+<div class="alert-box" id="alertBox">
+  <div id="alertText"></div>
+  <div class="alert-note" id="alertNote"></div>
+  <div class="alert-actions">
+    <button class="primary" id="recoverBtn" style="display:none">Resume print</button>
+    <button id="discardBtn" style="display:none">Discard</button>
+    <button id="alertDismissBtn">Dismiss</button>
   </div>
 </div>
 
@@ -1372,6 +1386,40 @@ function stopWsFallbackPoll() {
 }
 
 var lastState = null;
+// Alerts from the phone (print interrupted, heaters left on, board unreachable) and the board's interrupted print,
+// which can be resumed from the last line the printer acknowledged.
+function renderAlert(s) {
+  var inter = s.interrupted;
+  var text = s.alert || "";
+  if (!text && inter) text = "Print interrupted: " + inter.reason;
+  $("alertBox").classList.toggle("show", !!text);
+  $("alertText").textContent = text;
+  var note = "";
+  if (inter) {
+    var pct = inter.total > 0 ? Math.floor(inter.bytes * 100 / inter.total) : 0;
+    note = inter.file + " at " + pct + "%" + (inter.scanned ? ", Z " + inter.z.toFixed(2) + " mm" : "") + ". ";
+    if (inter.parked) note += "The board lifted the nozzle 5 mm and switched the hotend off" + (inter.bedOff ? " (bed off too)" : ", bed kept warm") + ". ";
+    note += inter.printerKept
+        ? "The printer kept its position: resume heats up, returns to the spot and continues."
+        : "The printer restarted since: resume homes X and Y only (keep the part on the bed, do not move Z by hand).";
+  }
+  $("alertNote").textContent = note;
+  $("recoverBtn").style.display = inter ? "" : "none";
+  $("discardBtn").style.display = inter ? "" : "none";
+  $("alertDismissBtn").style.display = s.alert && !inter ? "" : "none";
+}
+$("recoverBtn").onclick = function () {
+  if (!confirm("Resume the interrupted print? The printer will heat up and move.")) return;
+  post("/print/recover?mode=auto").then(function (r) {
+    showToast(r.success ? "success" : "error", r.message || (r.success ? "Resuming" : "Resume failed"));
+  });
+};
+$("discardBtn").onclick = function () {
+  if (!confirm("Discard the interrupted print? It can not be resumed afterwards.")) return;
+  post("/print/recover/discard").then(function (r) { showToast(r.success ? "success" : "error", r.message || ""); });
+};
+$("alertDismissBtn").onclick = function () { post("/alert/dismiss"); };
+
 function renderStatus(s) {
   lastState = s;
   checkForNotifiableTransition(s);
@@ -1380,6 +1428,7 @@ function renderStatus(s) {
   phaseEl.className = "phase " + s.phase;
   $("firmwareInfo").textContent = s.firmwareInfo || "";
   $("errorMsg").textContent = s.lastError || "";
+  renderAlert(s);
 
   var live = s.phase !== "DISCONNECTED" && s.phase !== "CONNECTING";
   // A printer-side error (upload failed, poll timed out, etc.) doesn't necessarily mean the
@@ -1829,7 +1878,8 @@ function startCamStream() {
   if (keepPicture) camStreamUp = true;
   camAbort = new AbortController();
   camLastFrameAt = Date.now();  // the watchdog counts from the start of this attempt
-  fetch(camStreamUrl + "?_=" + Date.now(), { cache: "no-store", signal: camAbort.signal }).then(function (r) {
+  // raw=1: the phone sends the same stream as plain bytes; WebKit (all iPhone browsers) holds a multipart one back from fetch.
+  fetch(camStreamUrl + (CAM_DIRECT ? "?_=" : "?raw=1&_=") + Date.now(), { cache: "no-store", signal: camAbort.signal }).then(function (r) {
     if (!r.ok || !r.body) throw new Error("HTTP " + r.status);
     var reader = r.body.getReader(), buf = new Uint8Array(256 * 1024), len = 0, dec = new TextDecoder("latin1");
     function pump() {
