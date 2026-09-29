@@ -1184,8 +1184,10 @@ static esp_err_t filesUploadHandler(httpd_req_t *req) {
       size_t inOfs = 0;
       for (;;) {
         size_t inBytes = n - inOfs, outBytes = TINFL_LZ_DICT_SIZE - dictOfs;
+        // Always "more input may follow": the stream marks its own end (DONE). Told "no more" on a cut stream, tinfl
+        // pads with zeros and emits garbage; this way a cut stream just stops short and is reported as ended early.
         tinfl_status st = tinfl_decompress(inf, buf + inOfs, &inBytes, dict, dict + dictOfs, &outBytes,
-                                           TINFL_FLAG_PARSE_ZLIB_HEADER | (rcvd < total ? TINFL_FLAG_HAS_MORE_INPUT : 0));
+                                           TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_HAS_MORE_INPUT);
         inOfs += inBytes;
         if (outBytes) {
           if (got + outBytes > wantSize) { fail = "unpacked file is bigger than the original"; break; }
@@ -1309,7 +1311,7 @@ static esp_err_t printerDisconnectHandler(httpd_req_t *req) {
 static esp_err_t printerPrintHandler(httpd_req_t *req) {
   String err;
   bool ok = printerStartPrint(queryValue(req, "file"), err, (uint32_t)queryValue(req, "dry").toInt(),
-                               (uint32_t)queryValue(req, "skip").toInt(), (uint32_t)queryValue(req, "badEvery").toInt());
+                               (uint32_t)queryValue(req, "skip").toInt());
   return printerReply(req, ok, err);
 }
 static esp_err_t printerPauseHandler(httpd_req_t *req) {

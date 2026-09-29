@@ -24,7 +24,7 @@ struct Cmd {
   String arg;
   uint32_t timeoutMs = 0;
   uint32_t arg2 = 0;  // C_START only: rehearsal skip target (file line number)
-  uint32_t arg3 = 0;  // C_START only: rehearsal resend-recovery test - corrupt every Nth sent line
+  uint32_t arg3 = 0;  // C_RECOVER: the resume mode
   float argF = 0;     // C_RECOVER only: zNow (cold resume), <= 0 = not given
   String reply;
   String err;
@@ -160,13 +160,10 @@ bool sendRaw(const char *s) {
 }
 
 // Marlin's line format: "N<number> <command>*<xor of everything before the '*'>"
-// corrupt: deliberately flips the checksum so Marlin rejects the line and asks for a resend -
-// resend-recovery testing only (see sendLine's `corrupt` parameter), never used outside a rehearsal.
-void buildNumbered(uint32_t n, const char *text, char *out, size_t cap, bool corrupt = false) {
+void buildNumbered(uint32_t n, const char *text, char *out, size_t cap) {
   int len = snprintf(out, cap, "N%u %s", (unsigned)n, text);
   uint8_t cs = 0;
   for (int i = 0; i < len; i++) cs ^= (uint8_t)out[i];
-  if (corrupt) cs ^= 0xff;
   snprintf(out + len, cap - len, "*%u\n", (unsigned)cs);
 }
 
@@ -681,12 +678,9 @@ bool ackHead(PrintRun &r, bool viaProbe) {
 }
 
 // Sends one numbered line (or a re-send). Returns false if the write failed.
-// corrupt: send this one transmission with a deliberately wrong checksum (resend-recovery testing
-// only - see buildNumbered). Only ever passed true for a fresh send, never for the resend itself,
-// so the line always lands correctly on the retry.
-bool sendLine(PrintRun &r, uint32_t no, const char *text, uint32_t after, bool fresh, bool corrupt = false) {
+bool sendLine(PrintRun &r, uint32_t no, const char *text, uint32_t after, bool fresh) {
   char out[256];
-  buildNumbered(no, text, out, sizeof(out), corrupt);
+  buildNumbered(no, text, out, sizeof(out));
   if (!sendRaw(out)) return false;
   Slot s;
   s.type = S_PRINT;
@@ -697,7 +691,7 @@ bool sendLine(PrintRun &r, uint32_t no, const char *text, uint32_t after, bool f
   s.sentMs = millis();
   // Log every command that is not a plain move (M*, G28, G29, G92...) and the first 40 lines, with its ack.
   s.traced = no <= 40 || !isMoveCmd(text);
-  if (s.traced) logEvent("TX N%u %s%s%s", (unsigned)no, text, fresh ? "" : " (resend)", corrupt ? " (CORRUPTED for test)" : "");
+  if (s.traced) logEvent("TX N%u %s%s", (unsigned)no, text, fresh ? "" : " (resend)");
   fifoPush(r, s);
   noteSend(r, s.len);
   return true;
@@ -822,7 +816,7 @@ bool resumePreamble(const ResumeSpec &rs, const ResumeState &st, String &err) {
   return true;
 }
 
-void runPrint(const String &path, uint32_t dryLines, uint32_t skipLines, uint32_t badEvery, const ResumeSpec *rs = nullptr) {
+void runPrint(const String &path, uint32_t dryLines, uint32_t skipLines, const ResumeSpec *rs = nullptr) {
   static PrintRun *rp = nullptr;
   if (!rp) rp = new PrintRun();
   PrintRun &r = *rp;
@@ -1124,7 +1118,7 @@ void runPrint(const String &path, uint32_t dryLines, uint32_t skipLines, uint32_
       }
       // If the M400 end-of-file marker was in flight, fifoClear() just wiped the only thing that
       // would ever have matched its "ok" - without this, a resync landing right at the end of a
-      // print (rare, but real: reproduced with badEvery testing) leaves the engine waiting
+      // print (rare, but real: reproduced with injected checksum errors) leaves the engine waiting
       // forever for a completion that already happened on the wire. Letting `r.eof && !finishSent`
       // fire again below resends M400 and re-tracks it properly. Sending M400 twice is harmless.
       if (r.finishSent) r.finishSent = false;
@@ -1230,11 +1224,7 @@ void runPrint(const String &path, uint32_t dryLines, uint32_t skipLines, uint32_
         strlcpy(h.text, r.pend, sizeof(h.text));
         h.st = r.cur;
         r.pendValid = false;
-        // Resend-recovery test only (dry runs, badEvery>0): deliberately corrupt every Nth fresh
-        // line's checksum so real Marlin rejects it and asks for a resend - proves the FIFO resync
-        // path against real firmware, not just the simulator.
-        bool corruptThis = dryLines && badEvery && (r.lineNo % badEvery == 0);
-        if (!sendLine(r, h.n, h.text, h.after, true, corruptThis)) {
+        if (!sendLine(r, h.n, h.text, h.after, true)) {
           safeShutdown();
           setError("write to printer failed");
           goto done;
@@ -1490,7 +1480,7 @@ void interruptedTick() {
     unlock();
     gJobResumes = in.resumes + 1;
     ResumeSpec rs = {in.bytes, false, 0, in.haveState ? &in.st : nullptr};
-    runPrint(path, 0, 0, 0, &rs);
+    runPrint(path, 0, 0, &rs);
     return;
   }
 
@@ -1635,9 +1625,8 @@ void handleCmd(Cmd *c) {
       c->ok = true;
       uint32_t dry = c->timeoutMs;  // rehearsal length, read before the command is released
       uint32_t skip = c->arg2;      // rehearsal skip target, same
-      uint32_t badEvery = c->arg3;  // rehearsal resend-recovery test, same
       finishCmd(c);  // answer the HTTP request now; the print itself runs below
-      runPrint(path, dry, skip, badEvery);
+      runPrint(path, dry, skip);
       return;
     }
     case C_RECOVER: {
@@ -1684,7 +1673,7 @@ void handleCmd(Cmd *c) {
       finishCmd(c);
       gJobResumes = in.resumes + 1;
       ResumeSpec rs = {offset, cold, zNow, in.haveState && offset == in.bytes ? &in.st : nullptr};
-      runPrint(path, 0, 0, 0, &rs);
+      runPrint(path, 0, 0, &rs);
       return;
     }
     case C_DISCARD: {
@@ -1828,12 +1817,12 @@ void printerBegin() {
 bool printerSelectLink(const String &kind, String &err) { return post(C_SELECT, kind, 0, nullptr, err, 5000); }
 bool printerConnect(String &err) { return post(C_CONNECT, "", 0, nullptr, err, 20000); }
 bool printerDisconnect(String &err) { return post(C_DISCONNECT, "", 0, nullptr, err, 5000); }
-bool printerStartPrint(const String &file, String &err, uint32_t dryLines, uint32_t skipLines, uint32_t badEvery) {
+bool printerStartPrint(const String &file, String &err, uint32_t dryLines, uint32_t skipLines) {
   if (!fileNameOk(file)) {
     err = "bad file name";
     return false;
   }
-  return post(C_START, file, dryLines, nullptr, err, 8000, skipLines, badEvery);
+  return post(C_START, file, dryLines, nullptr, err, 8000, skipLines);
 }
 bool printerPause(String &err) { return post(C_PAUSE, "", 0, nullptr, err, 5000); }
 bool printerResume(String &err) { return post(C_RESUME, "", 0, nullptr, err, 5000); }
