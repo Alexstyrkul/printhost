@@ -100,6 +100,15 @@ Tasks:
   pieces, one request) so a 10 MB log takes seconds, not half an hour.
 - [ ] Board gap max of ~1.41-1.43 s shows up again and again (avg 14 ms); find what stalls the feed for 1.4 s.
 
+## 2026-09-29
+- [x] Dashboard layout A (branch `feature/dashboard-layout-a`), simulated in all states, installed on the phone.
+- [x] Packed uploads (zlib, CRC32 + adler32 checked on the board, CRC32 again on the phone): 24.7 MB in ~35 s.
+- [x] Honest upload progress, 90 s stall watchdog, working Cancel.
+- [x] Preview shows with the printer off; file list no longer waits behind a printer connect; auto-connect stops after 3 failed tries; log Copy works over http.
+- [ ] Merge `feature/dashboard-layout-a` into `feature/esp32-bridge` once the user has used it for a while.
+- [ ] Watch the new `files: longest wait` log line when an upload is slow (network vs card).
+- [ ] Error text for a cut packed stream says "bigger than the original"; make it "packed data ended early".
+
 ## Older open items (from the handoff)
 - [-] SKIPPED (user, 2026-09-24): Pause/stop: park the nozzle away from the part (today stop turns the heaters and fan off; the nozzle stays over the print).
 - [-] SKIPPED (user, 2026-09-24): Long file names instead of the 8.3 scheme (`SdFilenameMap`), now that storage is on the board.

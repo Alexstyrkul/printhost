@@ -231,3 +231,43 @@ The failure loop this produced was self-obscuring: a connect attempt would actua
 
 **Verified:** watchdog, rejoin, setup fallback, viewer replacement, the phone re-attaching to a simulator print and surviving a 30 s board outage, log reads under stream load.
 **Not yet verified:** all of the above during a real print.
+
+# UPDATE 2026-09-29 - memory fix, crash recovery, dashboard layout A, packed uploads (branch `feature/dashboard-layout-a`)
+
+**Branches:** `feature/esp32-bridge` has everything up to the crash recovery (212c3a2). `feature/dashboard-layout-a`
+merges it and adds the dashboard redesign, packed uploads and the fixes below. The phone and the board run this branch.
+
+**Board (esp32-firmware):**
+- **lwIP buffers now really live in PSRAM** (`CMakeLists.txt`): IDF 4.4 on the S3 never passed
+  `SPIRAM_TRY_ALLOCATE_WIFI_LWIP` to lwIP (it checks the old name `CONFIG_WIFI_LWIP_ALLOCATION_FROM_SPIRAM_FIRST`), so
+  every stream packet sat in internal RAM (it fell to 9 KB during a 13 h print). Streaming now keeps ~110-130 KB free.
+- **Crash recovery** (212c3a2): crash capture to RTC/SD/`/status`, the `/print.job` journal, auto-resume (at most twice
+  per print), crash-loop guard, manual `/printer/recover`. See that commit message.
+- **Packed uploads:** `POST /files?name=&z=1&size=<bytes>&crc=<crc32 hex>` with a zlib body. Unpacked on the fly with
+  the ROM `tinfl_decompress`; the file is kept only if the zlib adler32 holds AND the unpacked size and CRC32 equal
+  the original's. `/status` says `"uploadZ":1`. The 32 KB unpack window must be DMA-capable internal RAM: written
+  from PSRAM the SD driver goes through a bounce buffer and was ~3x slower. Tested: good file kept; one flipped
+  byte, a wrong CRC and a cut stream all rejected, nothing stored.
+- Every upload logs `files: longest wait: network N ms, card N ms` (where a slow upload waited).
+- **Measured and rejected (do not retry):** TCP window 64 KB + DYNAMIC_RX 32 + RX_BA_WIN 32 (uploads fell to 27-60 KB/s
+  with 15 s stalls); pre-allocating the file on the card (seek to the end) and 64 KB card writes from PSRAM (both
+  halved the speed). Raw uploads are ~450-530 KB/s; packed ~800 KB/s of file data (the SD card is now the limit).
+
+**Phone app:**
+- Uploads go over a plain socket with a 64 KB send buffer, so the progress follows what the board really took (the
+  default multi-MB buffer made the bar jump to ~60 % and sit). Stall watchdog 90 s (longer than the board's own 60 s),
+  Cancel closes the connection at once. Packed when the board says `uploadZ`, else raw as before.
+- 24.7 MB file: ~35 s end to end packed (was ~50-55 s raw, ~150 s in the bad case).
+- The file list from the board no longer waits behind the printer command lock (a connect attempt made it take 12 s).
+- Automatic printer connect gives up after 3 failed tries in a row ("press Connect"); Connect by hand, the plug going
+  on again or a scheduled print re-arms it. Not limited while the board reports PRINTING/PAUSED.
+- Camera relay `?raw=1` (application/octet-stream): WebKit (every iPhone browser) does not hand a
+  multipart/x-mixed-replace response to fetch(), so the page asks for raw bytes.
+
+**Dashboard (layout A):** camera + print progress (file, layer, %, elapsed, remaining, finishes at, buttons) on the
+left; temperatures 2x2, 3D preview, files (list, Choose File, Scheduled print, Auto power off) and the schedule card
+on the right; board vitals in one bottom line; the log in a pop-up (Copy/Download only); Plug/Printer/Camera switches
+in the header; the alert box (interrupted print: Resume/Discard; other alerts: Dismiss) under it. One screen from
+520 px of window height; stacks on a phone (no 3D preview there). The preview now shows whenever a file is chosen,
+also with the printer off. Copy works over plain http (textarea + execCommand fallback). All states and buttons
+were run in a browser simulation (network stubbed, no printer).
