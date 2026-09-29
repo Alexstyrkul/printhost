@@ -71,8 +71,6 @@ Tasks:
 
 ## Upload speed check (after the current print)
 - [x] Upload speed: not a regression. The phone's re-upload of an 18.6 MB file ran at **442 KB/s** with DYNAMIC_RX 20 (the log `files: upload ok ... (442 KB/s)`). It looked slow only because the board lost power mid-upload and the upload restarted. The Mac->board test (~200 KB/s) was during evening congestion.
-- [ ] Board reset reason POWERON during an upload on 2026-09-24 (power loss, not a crash): ask/confirm whether the board is powered from the printer's smart plug.
-
 ## Finding the phone without a fixed IP
 - [x] `http://OnePlus-6T:8899/` (the ASUS resolves the phone's DHCP name) and `http://printhost-cam.local/app` (the board redirects to the phone's last-seen IP, learned from its Dalvik requests). Both verified from the Mac.
 
@@ -95,9 +93,6 @@ Tasks:
   Fixed in `esp32-firmware/CMakeLists.txt`, flashed (build 2026-09-28 20:45). Streaming: avg 94 -> 123 KB free,
   min 49 -> 110 KB, min since boot 35 -> 88 KB.
 - [x] Remote access: Tailscale on the phone (100.101.233.103). Check that "Always-on VPN" is enabled on the phone.
-- [ ] Log download is ~100x slower than upload (1.5-5 KB/s vs 270-460 KB/s): `/logs/read` caps a request at 32 KB and
-  sends 4 KB pieces with a heap wait before each. When no print runs, allow a whole-file streamed download (bigger
-  pieces, one request) so a 10 MB log takes seconds, not half an hour.
 - [ ] Board gap max of ~1.41-1.43 s shows up again and again (avg 14 ms); find what stalls the feed for 1.4 s.
 
 ## 2026-09-29
@@ -105,13 +100,13 @@ Tasks:
 - [x] Packed uploads (zlib, CRC32 + adler32 checked on the board, CRC32 again on the phone): 24.7 MB in ~35 s.
 - [x] Honest upload progress, 90 s stall watchdog, working Cancel.
 - [x] Preview shows with the printer off; file list no longer waits behind a printer connect; auto-connect stops after 3 failed tries; log Copy works over http.
-- [ ] Merge `feature/dashboard-layout-a` into `feature/esp32-bridge` once the user has used it for a while.
+- [x] Merged into `master` (fast-forward), which is now the main version.
 - [ ] Watch the new `files: longest wait` log line when an upload is slow (network vs card).
-- [ ] Error text for a cut packed stream says "bigger than the original"; make it "packed data ended early".
+- [x] A cut packed stream now reports "packed data ended early" (tinfl is always told more input may follow).
 
 ## Older open items (from the handoff)
 - [-] SKIPPED (user, 2026-09-24): Pause/stop: park the nozzle away from the part (today stop turns the heaters and fan off; the nozzle stays over the print).
 - [-] SKIPPED (user, 2026-09-24): Long file names instead of the 8.3 scheme (`SdFilenameMap`), now that storage is on the board.
 - [-] SKIPPED for now (user: skip everything router-side): Router DHCP reservations for the board (.190) and the phone (.37): the user does this in the ASUS UI.
-- [ ] Remove the `badEvery=` resend-injection test parameter when it is no longer needed.
+- [x] Removed the `badEvery=` resend-injection test parameter (2026-09-29).
 - [x] Update `HANDOFF_ESP32_BRIDGE.md` (done 2026-09-24): the phone IP, the signal at the board, today's findings, a link to this file and to `IDF5_MIGRATION.md`.
