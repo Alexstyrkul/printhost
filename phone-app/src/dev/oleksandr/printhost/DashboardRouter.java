@@ -230,7 +230,7 @@ public class DashboardRouter implements RequestRouter {
             boolean ok = service.resumePrint();
             writeJson(out, ok ? 200 : 409, resultJson(ok, service.getStateJson()));
         } else if (p.equals("/camera/relay") && req.method.equals("GET")) {
-            relayMjpeg(out);
+            relayMjpeg(out, "1".equals(req.queryParam("raw")));
         } else if (p.equals("/camera/relay/stats") && req.method.equals("GET")) {
             writeText(out, 200, "application/json", relay.statsJson());
         } else if (p.equals("/esp/logs/read") && req.method.equals("GET")) {
@@ -318,10 +318,12 @@ public class DashboardRouter implements RequestRouter {
     }
 
     /** Every viewer gets the newest frame the board sent; a viewer that cannot keep up skips frames on its own. */
-    private void relayMjpeg(OutputStream rawOut) throws IOException {
+    /** raw = the same bytes as application/octet-stream: WebKit (every iPhone browser) will not hand a
+     *  multipart/x-mixed-replace response to a page script piece by piece, so the dashboard reader asks for raw. */
+    private void relayMjpeg(OutputStream rawOut, boolean raw) throws IOException {
         java.io.BufferedOutputStream out = new java.io.BufferedOutputStream(rawOut, 65536);
         String head = "HTTP/1.1 200 OK\r\n"
-                + "Content-Type: multipart/x-mixed-replace; boundary=" + MJPEG_BOUNDARY + "\r\n"
+                + "Content-Type: " + (raw ? "application/octet-stream" : "multipart/x-mixed-replace; boundary=" + MJPEG_BOUNDARY) + "\r\n"
                 + "Connection: close\r\n"
                 + "Cache-Control: no-cache\r\n\r\n";
         out.write(head.getBytes(StandardCharsets.US_ASCII));

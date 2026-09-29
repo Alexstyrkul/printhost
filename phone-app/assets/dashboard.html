@@ -1662,7 +1662,8 @@ function startCamStream() {
   if (keepPicture) camStreamUp = true;
   camAbort = new AbortController();
   camLastFrameAt = Date.now();  // the watchdog counts from the start of this attempt
-  fetch(camStreamUrl + "?_=" + Date.now(), { cache: "no-store", signal: camAbort.signal }).then(function (r) {
+  // raw=1: the phone sends the same stream as plain bytes; WebKit (all iPhone browsers) holds a multipart one back from fetch.
+  fetch(camStreamUrl + (CAM_DIRECT ? "?_=" : "?raw=1&_=") + Date.now(), { cache: "no-store", signal: camAbort.signal }).then(function (r) {
     if (!r.ok || !r.body) throw new Error("HTTP " + r.status);
     var reader = r.body.getReader(), buf = new Uint8Array(256 * 1024), len = 0, dec = new TextDecoder("latin1");
     function pump() {
