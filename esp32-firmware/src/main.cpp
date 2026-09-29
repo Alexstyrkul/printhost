@@ -12,6 +12,7 @@
 #include "esp_http_server.h"
 #include <driver/temp_sensor.h>
 #include <esp_crc.h>
+#include "esp32s3/rom/miniz.h"  // tinfl_decompress (in ROM): unpacks packed file uploads
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_system.h>
@@ -1079,11 +1080,29 @@ static esp_err_t sendJsonStatus(httpd_req_t *req, const char *status, const Stri
 
 // POST /files?name=<file name>  body = raw file bytes. Writes to /gcode/<name> via a temp file, so a
 // dropped connection never leaves a half-written file under the real name.
+// POST /files?name=<n>&z=1&size=<bytes>&crc=<crc32 hex>  body = the file as a zlib stream (lossless). The board
+// unpacks it on the fly and keeps the file only if the zlib checksum holds AND the unpacked size and CRC32 equal the
+// original's (sent by the phone, computed on the original before packing). /status says "uploadZ":1 when supported.
 static esp_err_t filesUploadHandler(httpd_req_t *req) {
   String name;
   if (!nameParam(req, name)) return sendJsonStatus(req, "400 Bad Request", "{\"ok\":false,\"error\":\"bad or missing name\"}");
-  size_t total = req->content_len;
+  size_t total = req->content_len;  // bytes on the wire (packed when z=1)
   if (total == 0) return sendJsonStatus(req, "400 Bad Request", "{\"ok\":false,\"error\":\"empty body\"}");
+  bool packed = false;
+  size_t wantSize = total;
+  uint32_t wantCrc = 0;
+  {
+    char q[400], v[24];
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK && httpd_query_key_value(q, "z", v, sizeof(v)) == ESP_OK && !strcmp(v, "1")) {
+      char sz[24], cr[16];
+      if (httpd_query_key_value(q, "size", sz, sizeof(sz)) != ESP_OK || httpd_query_key_value(q, "crc", cr, sizeof(cr)) != ESP_OK)
+        return sendJsonStatus(req, "400 Bad Request", "{\"ok\":false,\"error\":\"packed upload needs size and crc\"}");
+      packed = true;
+      wantSize = (size_t)strtoul(sz, nullptr, 10);
+      wantCrc = (uint32_t)strtoul(cr, nullptr, 16);
+      if (wantSize == 0) return sendJsonStatus(req, "400 Bad Request", "{\"ok\":false,\"error\":\"bad size\"}");
+    }
+  }
   if (sdStatus == "not detected") return sendJsonStatus(req, "503 Service Unavailable", "{\"ok\":false,\"error\":\"no SD card\"}");
   if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(3000)) != pdTRUE) return sendJsonStatus(req, "409 Conflict", "{\"ok\":false,\"error\":\"card busy\"}");
 
@@ -1105,7 +1124,7 @@ static esp_err_t filesUploadHandler(httpd_req_t *req) {
   } give;
 
   uint64_t freeB = SD_MMC.totalBytes() - SD_MMC.usedBytes();
-  if ((uint64_t)total + 1048576ULL > freeB) return sendJsonStatus(req, "507 Insufficient Storage", "{\"ok\":false,\"error\":\"not enough space on the SD card\"}");
+  if ((uint64_t)wantSize + 1048576ULL > freeB) return sendJsonStatus(req, "507 Insufficient Storage", "{\"ok\":false,\"error\":\"not enough space on the SD card\"}");
   if (!SD_MMC.exists(GCODE_DIR)) SD_MMC.mkdir(GCODE_DIR);
   String tmp = String(GCODE_DIR) + "/upload.tmp", dst = String(GCODE_DIR) + "/" + name;
   File f = SD_MMC.open(tmp, FILE_WRITE);
@@ -1113,39 +1132,86 @@ static esp_err_t filesUploadHandler(httpd_req_t *req) {
 
   const size_t CH = 8192;
   uint8_t *buf = (uint8_t *)malloc(CH);
-  if (!buf) {
+  // Unpacking state: the decompressor (PSRAM, only the CPU touches it) and its 32 KB window, which is also where
+  // unpacked bytes come out and go to the card straight from. The window must be DMA-capable internal RAM: from PSRAM
+  // the SD driver copies through a small bounce buffer, which made card writes several times slower.
+  tinfl_decompressor *inf = packed ? (tinfl_decompressor *)heap_caps_malloc(sizeof(tinfl_decompressor), MALLOC_CAP_SPIRAM) : nullptr;
+  uint8_t *dict = packed ? (uint8_t *)heap_caps_malloc(TINFL_LZ_DICT_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL) : nullptr;
+  if (!buf || (packed && (!inf || !dict))) {
+    free(buf);
+    free(inf);
+    free(dict);
     f.close();
     SD_MMC.remove(tmp);
     return sendJsonStatus(req, "500 Internal Server Error", "{\"ok\":false,\"error\":\"out of memory\"}");
   }
+  if (packed) tinfl_init(inf);
   give.release();  // the setup is done; each chunk below takes the lock again
-  size_t got = 0;
-  uint32_t crc = 0;
+  size_t got = 0, rcvd = 0, dictOfs = 0;  // got = bytes written to the card, rcvd = bytes off the network
+  uint32_t crc = 0, maxGapMs = 0, maxWriteMs = 0;  // diagnostics: the longest wait for the network / for the card
   int stalls = 0;
+  bool unpackDone = false;
   const char *fail = nullptr;
-  logEvent("files: upload '%s' %u bytes", name.c_str(), (unsigned)total);
-  uint32_t t0 = millis();
-  while (got < total) {
-    int n = httpd_req_recv(req, (char *)buf, min(CH, total - got));
+  logEvent(packed ? "files: upload '%s' %u bytes packed to %u" : "files: upload '%s' %u bytes", name.c_str(), (unsigned)wantSize, (unsigned)total);
+  uint32_t t0 = millis(), lastAt = t0;
+  // Writes one piece of the file to the card (with the CRC and the diagnostics).
+  auto writeOut = [&](const uint8_t *p, size_t n) -> bool {
+    uint32_t now = millis();
+    if (!give.take()) { fail = "SD card busy"; return false; }
+    size_t wrote = f.write(p, n);
+    give.release();
+    uint32_t w = millis() - now;
+    if (w > maxWriteMs) maxWriteMs = w;
+    if (wrote != n) { fail = "SD write failed"; return false; }
+    crc = esp_crc32_le(crc, p, n);
+    got += n;
+    return true;
+  };
+  while (rcvd < total && !fail) {
+    int n = httpd_req_recv(req, (char *)buf, min(CH, total - rcvd));
     if (n == HTTPD_SOCK_ERR_TIMEOUT) {
       if (++stalls > 12) { fail = "receive timed out"; break; }
       continue;
     }
     if (n <= 0) { fail = "connection lost"; break; }
     stalls = 0;
-    if (!give.take()) { fail = "SD card busy"; break; }
-    size_t wrote = f.write(buf, n);
-    give.release();
-    if (wrote != (size_t)n) { fail = "SD write failed"; break; }
-    crc = esp_crc32_le(crc, buf, n);
-    got += n;
+    uint32_t now = millis();
+    if (now - lastAt > maxGapMs) maxGapMs = now - lastAt;
+    rcvd += n;
+    if (!packed) {
+      writeOut(buf, n);
+    } else {
+      size_t inOfs = 0;
+      for (;;) {
+        size_t inBytes = n - inOfs, outBytes = TINFL_LZ_DICT_SIZE - dictOfs;
+        tinfl_status st = tinfl_decompress(inf, buf + inOfs, &inBytes, dict, dict + dictOfs, &outBytes,
+                                           TINFL_FLAG_PARSE_ZLIB_HEADER | (rcvd < total ? TINFL_FLAG_HAS_MORE_INPUT : 0));
+        inOfs += inBytes;
+        if (outBytes) {
+          if (got + outBytes > wantSize) { fail = "unpacked file is bigger than the original"; break; }
+          if (!writeOut(dict + dictOfs, outBytes)) break;
+          dictOfs = (dictOfs + outBytes) & (TINFL_LZ_DICT_SIZE - 1);
+        }
+        if (st < TINFL_STATUS_DONE) { fail = "packed data is damaged (zlib check failed)"; break; }
+        if (st == TINFL_STATUS_DONE) { unpackDone = true; break; }
+        if (st == TINFL_STATUS_NEEDS_MORE_INPUT) break;  // this network piece is used up
+        // TINFL_STATUS_HAS_MORE_OUTPUT: the window filled up; go round again with the rest of this piece
+      }
+    }
+    lastAt = millis();
   }
   free(buf);
+  free(inf);
+  free(dict);
+  if (!fail && packed && !unpackDone) fail = "packed data ended early";
+  if (!fail && got != wantSize) fail = "unpacked size differs from the original";
+  if (!fail && packed && crc != wantCrc) fail = "unpacked file differs from the original (CRC32)";
   give.take();
   f.close();
   if (fail) {
     SD_MMC.remove(tmp);
-    logEvent("files: upload FAILED (%s) after %u of %u bytes", fail, (unsigned)got, (unsigned)total);
+    logEvent("files: upload FAILED (%s) after %u of %u bytes", fail, (unsigned)got, (unsigned)wantSize);
+    logEvent("files: longest wait: network %u ms, card %u ms", (unsigned)maxGapMs, (unsigned)maxWriteMs);
     return sendJsonStatus(req, "500 Internal Server Error", String("{\"ok\":false,\"error\":\"") + fail + "\"}");
   }
   SD_MMC.remove(dst);
@@ -1155,9 +1221,11 @@ static esp_err_t filesUploadHandler(httpd_req_t *req) {
   }
   uint32_t ms = millis() - t0;
   logEvent("files: upload ok '%s' %u bytes in %.1fs (%.0f KB/s)", name.c_str(), (unsigned)got, ms / 1000.0f, got / 1.024f / (ms ? ms : 1));
+  logEvent("files: longest wait: network %u ms, card %u ms%s", (unsigned)maxGapMs, (unsigned)maxWriteMs, packed ? ", sent packed" : "");
   char crcHex[12];
   snprintf(crcHex, sizeof(crcHex), "%08x", (unsigned)crc);
-  return sendJsonStatus(req, "200 OK", String("{\"ok\":true,\"name\":\"") + name + "\",\"bytes\":" + String((unsigned long)got) + ",\"crc32\":\"" + crcHex + "\"}");
+  return sendJsonStatus(req, "200 OK", String("{\"ok\":true,\"name\":\"") + name + "\",\"bytes\":" + String((unsigned long)got) + ",\"crc32\":\"" + crcHex +
+                                           "\",\"packed\":" + String((unsigned long)(packed ? total : 0)) + "}");
 }
 
 static esp_err_t filesListHandler(httpd_req_t *req) {
@@ -1374,7 +1442,7 @@ static esp_err_t statusHandler(httpd_req_t *req) {
   esp_wifi_get_channel(&wch, &wsec);
   char buf[1900];
   snprintf(buf, sizeof(buf),
-           "{\"fps\":%.2f,\"frameBytes\":%u,\"mode\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,"
+           "{\"uploadZ\":1,\"fps\":%.2f,\"frameBytes\":%u,\"mode\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,"
            "\"freePsram\":%u,\"sd\":\"%s\",\"uptime\":%lu,\"latencyMs\":%u,\"profile\":\"%s\",\"getMs\":%u,\"sendMs\":%u,\"wifiDrops\":%lu,\"reset\":\"%s\",\"tempC\":%.1f,\"cpu0\":%u,\"cpu1\":%u,\"cameraOn\":%s,\"quality\":%d,\"freeHeapKB\":%u,\"minHeapKB\":%u,\"totalHeapKB\":%u,"
            "\"envOk\":%s,\"envTempC\":%.1f,\"envHum\":%.0f,\"channel\":%u,\"bootId\":\"%s\",\"crashes\":%u,\"crash\":\"%s\"}",
            currentFps, (unsigned)lastFrameBytes, staMode ? "sta" : "ap", WiFi.SSID().c_str(),
