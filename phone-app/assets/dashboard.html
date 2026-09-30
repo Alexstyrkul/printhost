@@ -516,15 +516,15 @@
       </span>
     </div>
     <div class="status-toggles">
-      <label class="switch-item" title="Turn the Tapo smart plug on or off">
+      <label class="switch-item" title="Smart plug">
         <span class="switch-label">Plug</span>
         <span class="switch"><input type="checkbox" id="plugToggle"><span class="switch-slider"></span></span>
       </label>
-      <label class="switch-item" title="Connect or disconnect the printer (after switching it off and on by hand)">
+      <label class="switch-item" title="Printer connection">
         <span class="switch-label">Printer</span>
         <span class="switch"><input type="checkbox" id="connectToggle"><span class="switch-slider"></span></span>
       </label>
-      <label class="switch-item" title="Switch the camera on or off (also during a print)">
+      <label class="switch-item" title="Camera">
         <span class="switch-label">Camera</span>
         <span class="switch"><input type="checkbox" id="camForceToggle"><span class="switch-slider"></span></span>
       </label>
@@ -593,7 +593,7 @@
       <div class="temp-tile"><span class="tile-label">Nozzle</span><b class="num hot" id="hotendTemp">-</b><span class="tile-sub num">/ <span id="hotendTarget">-</span>&deg;</span></div>
       <div class="temp-tile"><span class="tile-label">Bed</span><b class="num bed" id="bedTemp">-</b><span class="tile-sub num">/ <span id="bedTarget">-</span>&deg;</span></div>
       <div class="temp-tile"><span class="tile-label">Fan</span><b class="num" id="fanVal">-</b></div>
-      <div class="temp-tile" title="Room temperature and humidity (DHT11 sensor on the board)"><span class="tile-label">Room</span><b class="num" id="roomTemp">-</b><b class="num" id="roomHum">-</b></div>
+      <div class="temp-tile" title="Room"><span class="tile-label">Room</span><b class="num" id="roomTemp">-</b><b class="num" id="roomHum">-</b></div>
     </div>
 
     <div class="card preview-card">
@@ -638,11 +638,11 @@
 
       <div>
         <div class="toggle-pair">
-          <label class="toggle-row" id="scheduleRow" title="Start the print at a chosen date and time instead of right now">
+          <label class="toggle-row" id="scheduleRow">
             <span class="grow">Scheduled print</span>
             <span class="switch"><input type="checkbox" id="scheduleToggle"><span class="switch-slider"></span></span>
           </label>
-          <label class="toggle-row" title="Turn off the smart plug once the printer has cooled down (&le;50&deg;C) after a print finishes or is stopped">
+          <label class="toggle-row" title="Plug off after the print, below 50&deg;C">
             <span class="grow">Auto power off</span>
             <span class="switch"><input type="checkbox" id="autoShutoffToggle"><span class="switch-slider"></span></span>
           </label>
@@ -673,7 +673,7 @@
           <div class="sched-name" id="schedName">-</div>
           <div class="sched-sub" id="scheduleInfo">Scheduled</div>
         </div>
-        <button id="reschedBtn" class="sched-link" title="Move the scheduled print to another date or time (same file)">Change time</button>
+        <button id="reschedBtn" class="sched-link" title="Change time">Change time</button>
         <button id="scheduleCancelBtn" class="sched-x" aria-label="Cancel the scheduled print" title="Cancel the scheduled print">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
         </button>
@@ -709,10 +709,10 @@
     <span class="cam-stat" id="stTemp"><b>&ndash;</b><span>Chip temp</span></span>
     <span class="cam-stat" id="stCpu"><b>&ndash;</b><span>CPU</span></span>
     <span class="cam-stat" id="stWifi"><b>&ndash;</b><span>Wi-Fi</span></span>
-    <span class="cam-stat" id="stMem" title="Free working memory of the board."><b>&ndash;</b><span>Free RAM</span></span>
-    <span class="cam-stat" id="stPause" title="Time the board takes between the printer's ok and the next line. Yellow from 20 ms, red from 100 ms on average."><b>&ndash;</b><span>Board delay</span></span>
-    <span class="cam-stat" id="stAck" title="How fast the printer answers each line. Long is normal."><b>&ndash;</b><span>Printer reply</span></span>
-    <span class="cam-stat" id="stResend" title="Lines resent after the printer got them damaged."><b>&ndash;</b><span>Resends</span></span>
+    <span class="cam-stat" id="stMem" title="Free RAM"><b>&ndash;</b><span>Free RAM</span></span>
+    <span class="cam-stat" id="stPause" title="Board delay between ok and next line"><b>&ndash;</b><span>Board delay</span></span>
+    <span class="cam-stat" id="stAck" title="Printer reply time"><b>&ndash;</b><span>Printer reply</span></span>
+    <span class="cam-stat" id="stResend" title="Resent lines"><b>&ndash;</b><span>Resends</span></span>
   </div>
   <button class="board-log" id="camLogBtn" aria-expanded="false">Log</button>
 </footer>
@@ -728,7 +728,6 @@
         <div class="cam-kv"><span>Uptime</span><b id="lgUp">&ndash;</b></div>
         <div class="cam-tabs"><button id="camTabEvents" class="on">Events</button><button id="camTabFiles">Files</button></div>
         <div id="camLogEventsPane">
-          <div class="cam-hint">Recent important events (kept in RAM, lost on restart).</div>
           <pre class="cam-events" id="camEventsText">Loading&hellip;</pre>
           <div class="cam-modal-actions"><button id="camEventsCopy">Copy</button></div>
         </div>
@@ -1028,7 +1027,7 @@ function renderSchedule(s) {
       info.style.color = "";
     }
     info.title = s.scheduledOnPhone && !failed
-        ? "The file is on the phone; the printer powers on and gets it at "
+        ? "Goes to the board at "
           + pad2(new Date(s.scheduledSendAtMillis).getHours()) + ":" + pad2(new Date(s.scheduledSendAtMillis).getMinutes())
         : "";
   }
@@ -1064,7 +1063,7 @@ $("scheduleToggle").onchange = function () {
     // Scheduling given up: with the plug on, the held file goes to the board now like any chosen file.
     var f = scheduleHeldFile;
     if (lastState && lastState.plugOn !== false) { scheduleHeldFile = null; chooseFile(f); }
-    else showToast("error", "The printer is off, so this file can only be scheduled");
+    else showToast("error", "Printer is off");
   }
   updateStartLabel();
   if (lastState) renderStatus(lastState);
@@ -1163,7 +1162,7 @@ function scheduleHeldToPhone(file, atMillis) {
     $("scheduleToggle").checked = false;
     $("scheduleFields").style.display = "none";
     updateStartLabel();
-    showToast("success", "Print scheduled - the phone sends the file to the board before the start");
+    showToast("success", "Print scheduled");
   }
   xhr.onload = function () {
     var r = {};
@@ -1418,11 +1417,11 @@ function renderAlert(s) {
   if (inter) {
     var pct = inter.total > 0 ? Math.floor(inter.bytes * 100 / inter.total) : 0;
     note = inter.file + " at " + pct + "%" + (inter.scanned ? ", Z " + inter.z.toFixed(2) + " mm" : "") + ". ";
-    if (inter.parked) note += "The board lifted the nozzle 5 mm and switched the hotend off" + (inter.bedOff ? " (bed off too)" : ", bed kept warm") + ". ";
+    if (inter.parked) note += "Nozzle lifted 5 mm, hotend off" + (inter.bedOff ? ", bed off" : ", bed warm") + ". ";
     note += inter.printerKept
-        ? "The printer kept its position: resume heats up, returns to the spot and continues."
-        : "The printer restarted since: resume homes X and Y only (keep the part on the bed, do not move Z by hand).";
-    if (inter.crashLoop) note += " The board kept restarting, so it switched the heaters off and will not resume by itself: check it before resuming.";
+        ? "Printer kept its position."
+        : "Printer restarted: resume homes X/Y only, don't move Z.";
+    if (inter.crashLoop) note += " Board kept restarting: heaters off, no auto-resume.";
   }
   $("alertNote").textContent = note;
   $("recoverBtn").style.display = inter ? "" : "none";
@@ -1430,14 +1429,14 @@ function renderAlert(s) {
   $("alertDismissBtn").style.display = s.alert && !inter ? "" : "none";
 }
 $("recoverBtn").onclick = function () {
-  if (!confirm("Resume the interrupted print? The printer will heat up and move.")) return;
+  if (!confirm("Resume the print?")) return;
   post("/print/recover?mode=auto").then(function (r) {
     if (r.state) renderStatus(r.state);
     showToast(r.success ? "success" : "error", r.message || (r.success ? "Resuming" : "Resume failed"));
   });
 };
 $("discardBtn").onclick = function () {
-  if (!confirm("Discard the interrupted print? It can not be resumed afterwards.")) return;
+  if (!confirm("Discard the interrupted print?")) return;
   post("/print/recover/discard").then(function (r) { if (r.state) renderStatus(r.state); showToast(r.success ? "success" : "error", r.message || ""); });
 };
 $("alertDismissBtn").onclick = function () { post("/alert/dismiss").then(function (r) { if (r.state) renderStatus(r.state); }); };
@@ -1566,7 +1565,7 @@ var uploadBlocked = false;
 $("plugToggle").onchange = function () {
   var turnOn = this.checked;
   var toggle = this;
-  if (!turnOn && !confirm("Turn off the plug? This cuts the printer's power.")) {
+  if (!turnOn && !confirm("Turn off the plug?")) {
     toggle.checked = true;
     return;
   }
@@ -1583,7 +1582,7 @@ $("connectToggle").onchange = function () {
   var wantConnected = this.checked;
   var printing = lastPhase === "PRINTING" || lastPhase === "PAUSED";
   if (!wantConnected && !confirm(printing
-      ? "Stop watching the printer? The print keeps running on the ESP32 board."
+      ? "Disconnect? The print keeps running on the board."
       : "Disconnect the printer?")) {
     this.checked = true;
     return;
@@ -1629,7 +1628,7 @@ $("sidebarClose").onclick = closeSidebar;
 $("sidebarScrim").onclick = closeSidebar;
 
 $("unloadFilamentBtn").onclick = function () {
-  if (!confirm("Heat the nozzle to 240°C and unload the filament? Make sure nothing is printing.")) return;
+  if (!confirm("Unload filament (heats to 240°C)?")) return;
   var btn = this;
   btn.disabled = true;
   post("/filament/unload").then(function (r) {
@@ -1640,7 +1639,7 @@ $("unloadFilamentBtn").onclick = function () {
 };
 
 $("levelBedBtn").onclick = function () {
-  if (!confirm("Run auto bed leveling? This probes the bed with the BLTouch and saves the result.")) return;
+  if (!confirm("Run bed leveling?")) return;
   var btn = this;
   btn.disabled = true;
   post("/level").then(function (r) {
@@ -1722,7 +1721,7 @@ $("pauseBtn").onclick = function () {
 };
 $("resumeBtn").onclick = function () { post("/resume").then(function(r){ renderStatus(r.state); }); };
 $("stopBtn").onclick = function () {
-  if (confirm("Stop the print? This cannot be resumed.")) {
+  if (confirm("Stop the print?")) {
     post("/stop").then(function(r){ renderStatus(r.state); });
   }
 };
@@ -1735,11 +1734,11 @@ function chooseFile(file) {
   var plugOff = lastState && lastState.plugOn === false;
   if (file && ($("scheduleToggle").checked || plugOff)) {
     holdForSchedule(file);
-    if (plugOff && !$("scheduleToggle").checked) showToast("success", "The printer is off: pick a date and time to schedule this file");
+    if (plugOff && !$("scheduleToggle").checked) showToast("success", "Printer is off - pick a start time");
     return;
   }
   if (file && uploadBlocked) {  // the button was pressed just before the print started
-    showToast("error", "Not while printing - schedule it, or upload after the print");
+    showToast("error", "Not while printing");
     selectedFile = null;
     $("chosenFileName").textContent = "No file selected";
     $("fileInput").value = "";
@@ -1751,7 +1750,7 @@ function chooseFile(file) {
 $("chooseFileBtn").onclick = function () { $("fileInput").click(); };
 $("fileInput").onchange = function () { chooseFile(this.files[0] || null); };
 $("cancelUploadBtn").onclick = function () {
-  if (!confirm("Cancel the upload? The partial file will be deleted from the SD card.")) return;
+  if (!confirm("Cancel the upload?")) return;
   // Doesn't wait on the in-flight /upload request - a *separate* connection/thread handles
   // this one and just flips a flag the upload loop is already polling (see
   // PrinterService.cancelUpload's own comment on why that's safe without commandLock). The
@@ -1980,7 +1979,7 @@ function camRestartIfWanted() {
 document.addEventListener("visibilitychange", function () {
   if (document.hidden) {
     if (camWanted || camStreamUp) stopCamStream();
-    showCamStream(false, "Paused while the page is in the background");
+    showCamStream(false, "Paused");
   } else {
     camRestartIfWanted();
   }
@@ -2061,8 +2060,7 @@ function renderHealth() {
     var resendRate = p.lines > 0 ? p.resends * 10000 / p.lines : 0;
     lResend = resendRate > 10 ? "bad" : (resendRate >= 1 ? "warn" : "");
     setCamStat("stPause", Math.round(p.gapAvgMs) + " ms", lPause);
-    $("stPause").title = "Time the board takes between the printer's ok and the next line. Average " + Math.round(p.gapAvgMs) +
-        " ms, longest " + Math.round(p.gapMaxMs) + " ms (last ~10 s). Normal: under 20 ms on average; single spikes are harmless.";
+    $("stPause").title = "Avg " + Math.round(p.gapAvgMs) + " ms, max " + Math.round(p.gapMaxMs) + " ms (10 s)";
     setCamStat("stResend", String(p.resends), lResend);
     setCamStat("stAck", Math.round(p.ackAvgMs) + " ms", "");
   } else {

@@ -479,7 +479,7 @@ public class PrinterService extends Service {
     /** Counts a failed automatic attempt; true once the limit is reached (and says so in the dashboard). */
     private boolean autoConnectFailed() {
         if (++autoConnectFails >= AUTO_CONNECT_MAX_FAILS) {
-            state.lastError = "The printer did not connect after " + AUTO_CONNECT_MAX_FAILS + " tries - press Connect to try again";
+            state.lastError = "Printer did not connect - press Connect";
             Log.w(TAG, "auto connect: giving up after " + AUTO_CONNECT_MAX_FAILS + " failed tries");
             return true;
         }
@@ -706,7 +706,7 @@ public class PrinterService extends Service {
                 ? ((EspPrinterConnection) printerConnection).boardState() : "";
         if (state.phase == PrinterState.Phase.PRINTING || state.phase == PrinterState.Phase.PAUSED
                 || state.phase == PrinterState.Phase.UPLOADING || board.equals("PRINTING") || board.equals("PAUSED")) {
-            return new UploadOutcome(false, "Cannot upload while printing - upload after the print or schedule it");
+            return new UploadOutcome(false, "Not while printing");
         }
         String safeFilename = toSafeSdFilename(filename);
         state.phase = PrinterState.Phase.UPLOADING;
@@ -752,7 +752,7 @@ public class PrinterService extends Service {
                         + " (from " + filename + "), verified " + result.bytesSent + " bytes");
             } else {
                 state.phase = fileErrorPhase();
-                state.lastError = "Upload verification failed (size mismatch on SD card)";
+                state.lastError = "Upload failed: size mismatch on the SD card";
                 updateNotification("Upload FAILED verification");
                 return new UploadOutcome(false, state.lastError);
             }
@@ -947,7 +947,7 @@ public class PrinterService extends Service {
                 return false;
             }
             if (!printerConnection.isOpen()) {
-                state.lastError = "Printer is not connected - switch Printer on first";
+                state.lastError = "Printer is not connected";
                 return false;
             }
             try {
@@ -1246,7 +1246,7 @@ public class PrinterService extends Service {
             return new UploadOutcome(false, "Couldn't store the file on the phone");
         }
         scheduledPrintStore.setWithLocalFile(toSafeSdFilename(displayName), displayName, atMillis, dest.getAbsolutePath(), dest.length());
-        return new UploadOutcome(true, "Scheduled; the file goes to the board before the start");
+        return new UploadOutcome(true, "Scheduled");
     }
 
     /** "Change time": same file, new time; a failed job becomes pending again. */
@@ -1858,7 +1858,7 @@ public class PrinterService extends Service {
                         windowEnd = 0;
                     } else if (now + AUTO_CONNECT_RETRY_MS > windowEnd) {
                         windowEnd = 0;
-                        state.lastError = "The printer did not answer within 2 minutes after the plug turned on - press Connect to try again";
+                        state.lastError = "Printer did not connect - press Connect";
                     }
                 } catch (InterruptedException e) {
                     break;
@@ -1963,7 +1963,7 @@ public class PrinterService extends Service {
                         // from its own SD card and does not need this phone, so never give up on it: keep the
                         // phase, say what is going on, and keep asking until the board answers again.
                         synchronized (PrinterService.this) {
-                            state.lastError = "Board not reachable - the print keeps running on the board; reconnecting...";
+                            state.lastError = "Board not reachable - reconnecting...";
                         }
                         if (consecutiveFailures == MAX_CONSECUTIVE_POLL_FAILURES) updateNotification("Board not reachable - retrying");
                         try {
