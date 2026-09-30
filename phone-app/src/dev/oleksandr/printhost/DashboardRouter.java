@@ -230,11 +230,34 @@ public class DashboardRouter implements RequestRouter {
             service.dismissAlertByUser();
             writeJson(out, 200, resultJson(true, service.getStateJson()));
         } else if (p.equals("/alerts/config") && req.method.equals("POST")) {
-            // ntfy=<topic> (push to the ntfy app), "" switches it off; GET-style query, nothing else to configure
-            service.setNtfyTopic(req.queryParam("ntfy"));
-            writeJson(out, 200, resultJson(true, service.getStateJson()));
+            // Only the keys given change: ntfy=<topic> (push to the ntfy app), tgToken=<bot token from @BotFather>,
+            // tgChat=<chat id>, dashUrl=<link put in every push, default: this phone on Wi-Fi>; "" switches one off. No keys: just reports what is set up (never the token).
+            if (req.query.containsKey("ntfy")) service.setNtfyTopic(req.queryParam("ntfy"));
+            if (req.query.containsKey("dashUrl")) service.setDashboardUrl(req.queryParam("dashUrl"));
+            if (req.query.containsKey("tgToken") || req.query.containsKey("tgChat")) {
+                service.setTelegram(req.query.containsKey("tgToken") ? req.queryParam("tgToken") : null,
+                        req.query.containsKey("tgChat") ? req.queryParam("tgChat") : null);
+            }
+            JSONObject json = resultJson(true, service.getStateJson());
+            try {
+                json.put("alerts", service.alertsConfig());
+            } catch (Exception ignored) {
+            }
+            writeJson(out, 200, json);
+        } else if (p.equals("/alerts/telegram/link") && req.method.equals("POST")) {
+            // After the user wrote to the bot: take the chat id from the bot's updates, send a confirmation there.
+            String msg = service.linkTelegramChat();
+            JSONObject json = resultJson(service.alertsConfig().optString("telegramChat").length() > 0, service.getStateJson());
+            try {
+                json.put("message", msg);
+                json.put("alerts", service.alertsConfig());
+            } catch (Exception ignored) {
+            }
+            writeJson(out, 200, json);
         } else if (p.equals("/alerts/test") && req.method.equals("POST")) {
-            service.raiseAlert("test", "PrintHost test alert - notifications work");
+            // demo=1: the 25/50/75 % and "successful" print pushes instead of the alert
+            if ("1".equals(req.queryParam("demo"))) service.sendDemoPrintPushes();
+            else service.raiseAlert("test", "PrintHost test alert - notifications work");
             writeJson(out, 200, resultJson(true, service.getStateJson()));
         } else if (p.equals("/autoshutoff/set") && req.method.equals("POST")) {
             service.setAutoShutoffEnabled("true".equals(req.queryParam("enabled")));

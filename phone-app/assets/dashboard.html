@@ -1555,7 +1555,13 @@ function renderControls(phase, fileReady, scheduled) {
   $("pauseBtn").style.display = phase === "PRINTING" ? "" : "none";
   $("resumeBtn").style.display = phase === "PAUSED" ? "" : "none";
   $("stopBtn").style.display = (phase === "PRINTING" || phase === "PAUSED") ? "" : "none";
+  // No upload to the board while it prints: it would take the board's card and HTTP server, hold up Stop, and
+  // could replace the very file being printed. A file for a scheduled print can still be chosen (it waits here).
+  uploadBlocked = phase === "PRINTING" || phase === "PAUSED" || phase === "UPLOADING" || boardBusy;
+  $("chooseFileBtn").disabled = uploadBlocked && !$("scheduleToggle").checked;
+  $("chooseFileBtn").title = $("chooseFileBtn").disabled ? "Not while printing" : "";
 }
+var uploadBlocked = false;
 
 $("plugToggle").onchange = function () {
   var turnOn = this.checked;
@@ -1730,6 +1736,13 @@ function chooseFile(file) {
   if (file && ($("scheduleToggle").checked || plugOff)) {
     holdForSchedule(file);
     if (plugOff && !$("scheduleToggle").checked) showToast("success", "The printer is off: pick a date and time to schedule this file");
+    return;
+  }
+  if (file && uploadBlocked) {  // the button was pressed just before the print started
+    showToast("error", "Not while printing - schedule it, or upload after the print");
+    selectedFile = null;
+    $("chosenFileName").textContent = "No file selected";
+    $("fileInput").value = "";
     return;
   }
   refreshStatus();

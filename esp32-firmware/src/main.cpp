@@ -964,9 +964,11 @@ static esp_err_t logsReadHandler(httpd_req_t *req) {
     res = httpd_resp_send_chunk(req, (const char *)buf, got);
     left -= (size_t)got;
   }
-  xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1500));
-  f.close();
-  xSemaphoreGive(sdMutex);
+  {  // give the lock back only if it was got: giving a mutex another task holds trips a FreeRTOS assert (abort)
+    bool held = xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1500)) == pdTRUE;
+    f.close();
+    if (held) xSemaphoreGive(sdMutex);
+  }
   free(buf);
   if (res != ESP_OK) return res;
   return httpd_resp_send_chunk(req, nullptr, 0);
@@ -1018,9 +1020,11 @@ static esp_err_t logSdHandler(httpd_req_t *req) {
     }
     if (n > 0) res = httpd_resp_send_chunk(req, (const char *)p, n);
   }
-  xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1500));
-  f.close();
-  xSemaphoreGive(sdMutex);
+  {  // see logsReadHandler
+    bool held = xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1500)) == pdTRUE;
+    f.close();
+    if (held) xSemaphoreGive(sdMutex);
+  }
   free(buf);
   if (res != ESP_OK) return res;
   return httpd_resp_send_chunk(req, nullptr, 0);
@@ -1086,6 +1090,9 @@ static esp_err_t sendJsonStatus(httpd_req_t *req, const char *status, const Stri
 static esp_err_t filesUploadHandler(httpd_req_t *req) {
   String name;
   if (!nameParam(req, name)) return sendJsonStatus(req, "400 Bad Request", "{\"ok\":false,\"error\":\"bad or missing name\"}");
+  // Never replace the file being printed or waiting to be resumed: the engine reads it by offset, and the card space of
+  // a deleted open file gets reused (the printer would be fed whatever lands there).
+  if (printerFileInUse(name)) return sendJsonStatus(req, "409 Conflict", "{\"ok\":false,\"error\":\"that file is being printed or waits to be resumed\"}");
   size_t total = req->content_len;  // bytes on the wire (packed when z=1)
   if (total == 0) return sendJsonStatus(req, "400 Bad Request", "{\"ok\":false,\"error\":\"empty body\"}");
   bool packed = false;
@@ -1208,6 +1215,7 @@ static esp_err_t filesUploadHandler(httpd_req_t *req) {
   if (!fail && packed && !unpackDone) fail = "packed data ended early";
   if (!fail && got != wantSize) fail = "unpacked size differs from the original";
   if (!fail && packed && crc != wantCrc) fail = "unpacked file differs from the original (CRC32)";
+  if (!fail && printerFileInUse(name)) fail = "that file started printing meanwhile - not replaced";
   give.take();
   f.close();
   if (fail) {
@@ -1476,6 +1484,10 @@ static String formValue(const String &body, const char *key) {
 }
 
 static esp_err_t wifiHandler(httpd_req_t *req) {
+  PrinterSnap ps;
+  printerSnapshot(ps);
+  if (ps.state == PS_PRINTING || ps.state == PS_PAUSED)  // saving restarts the board, which would cut the print
+    return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "printing - change the Wi-Fi after the print");
   char body[256] = {0};
   int n = httpd_req_recv(req, body, min((size_t)(sizeof(body) - 1), req->content_len));
   if (n <= 0) return httpd_resp_send_500(req);
@@ -2010,6 +2022,9 @@ void setup() {
   }
   fpsWindowStart = millis();
   printerBegin();  // engine task; selects the USB link and connects by itself once the printer appears on USB
+  // The BOOT and CRASH lines go to the card now: loop() writes only after the Wi-Fi join (up to ~15 s), and the scan
+  // logs a line per network seen - with many around, the 64-line RAM ring pushed the crash report out before that.
+  logTick(millis());
   dht11Begin(21);  // room sensor on GPIO 21 (moved from 14) - see docs/HANDOFF_ESP32_BRIDGE.md
   startNetwork();
   startServers();
@@ -2021,11 +2036,17 @@ void loop() {
   uint32_t now = millis();
   wifiKeepAlive(now);
   static uint32_t lastTick = 0;
+  static bool printing = false;
   if (now - lastTick >= 1000) {
     lastTick = now;
     sampleVitals();
     logTick(lastTick);
+    PrinterSnap ps;
+    printerSnapshot(ps);
+    printing = ps.state == PS_PRINTING || ps.state == PS_PAUSED;
   }
-  if (staServicesUp) ArduinoOTA.handle();
+  // No OTA while a print runs: the update ends in a reboot, which would cut the print. An upload attempt meanwhile just
+  // times out on the sender's side.
+  if (staServicesUp && !printing) ArduinoOTA.handle();
   delay(20);
 }

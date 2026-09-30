@@ -1274,9 +1274,10 @@ void runPrint(const String &path, uint32_t dryLines, uint32_t skipLines, const R
 
 done:
   if (r.rd.f) {
-    xSemaphoreTake(sdMutex, pdMS_TO_TICKS(3000));
+    // Give the card lock back only if it was got: giving a mutex another task holds trips a FreeRTOS assert (abort).
+    bool held = xSemaphoreTake(sdMutex, pdMS_TO_TICKS(3000)) == pdTRUE;
     r.rd.f.close();
-    xSemaphoreGive(sdMutex);
+    if (held) xSemaphoreGive(sdMutex);
   }
   logEvent("printer: summary - %u lines sent, %u resends, %u s", (unsigned)r.lineNo, (unsigned)r.resends, (unsigned)((millis() - gStartMs) / 1000));
   if (journal) {
@@ -1395,9 +1396,9 @@ void interruptedTick() {
       xSemaphoreGive(sdMutex);
       ok = lr->f && scanTo(*lr, in.bytes, rs, err, false) != 0;
       if (lr->f) {
-        xSemaphoreTake(sdMutex, pdMS_TO_TICKS(3000));
+        bool held = xSemaphoreTake(sdMutex, pdMS_TO_TICKS(3000)) == pdTRUE;  // see runPrint's end
         lr->f.close();
-        xSemaphoreGive(sdMutex);
+        if (held) xSemaphoreGive(sdMutex);
       }
     }
     delete lr;

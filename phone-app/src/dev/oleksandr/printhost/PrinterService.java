@@ -82,6 +82,9 @@ public class PrinterService extends Service {
         printerConnection = new EspPrinterConnection("http://" + espHost, "usb");
         macNotifier = new MacNotifier(this);
         alertNotifier = new AlertNotifier(this, macNotifier);
+        for (String k : getSharedPreferences("printhost", MODE_PRIVATE).getString("alerted_keys", "").split("\n")) {
+            if (!k.isEmpty()) alertedKeys.add(k);
+        }
         sdFilenameMap = new SdFilenameMap(new File(getFilesDir(), "sd_filename_map.json"));
         gcodeCacheSizeMap = new GcodeCacheSizeMap(new File(getFilesDir(), "gcode_cache_sizes.json"));
         tapoPlugController = new TapoPlugController(this);
@@ -697,6 +700,14 @@ public class PrinterService extends Service {
         if (filename == null || filename.trim().isEmpty()) {
             return new UploadOutcome(false, "Missing filename");
         }
+        // Not while the board prints (also a print this phone is not following right now): the upload takes the board's
+        // card and its HTTP server for up to a minute, holds up Stop, and could replace the file being printed.
+        String board = printerConnection instanceof EspPrinterConnection
+                ? ((EspPrinterConnection) printerConnection).boardState() : "";
+        if (state.phase == PrinterState.Phase.PRINTING || state.phase == PrinterState.Phase.PAUSED
+                || state.phase == PrinterState.Phase.UPLOADING || board.equals("PRINTING") || board.equals("PAUSED")) {
+            return new UploadOutcome(false, "Cannot upload while printing - upload after the print or schedule it");
+        }
         String safeFilename = toSafeSdFilename(filename);
         state.phase = PrinterState.Phase.UPLOADING;
         state.currentFile = safeFilename;
@@ -802,36 +813,33 @@ public class PrinterService extends Service {
     }
 
     /**
-     * This firmware's M28 (SD write) only creates classic 8.3 short names - confirmed on real
-     * hardware: it rejects anything longer with "open failed", even though it can browse/list
-     * long names written by other tools (e.g. copying the file onto the card directly via a
-     * reader). Slicers name files descriptively (long, with spaces/hyphens), so we shorten
-     * automatically here rather than making the user rename every file by hand before upload.
-     * Names that already fit 8.3 pass through unchanged.
+     * The name a file gets on the board's SD card. The board keeps long names (up to 120 characters) but only in plain
+     * ASCII (FAT code page 437), so the slicer's name is kept as it is where it can be: letters, digits, "._-" stay,
+     * anything else becomes "_". When something had to be replaced, 8 hex digits of the original name's hash are added,
+     * so two names that differ only in replaced characters (spaces, Cyrillic) never land on the same file. The same
+     * source name always maps to the same board name: uploading a file again replaces it.
+     * (It used to be an 8.3 name, 5 letters + 1 byte of hash: every "skadis-..." file became SKADI~XX, and two of them
+     * had a 1-in-256 chance of silently overwriting each other.)
      */
-    private static String toSafeSdFilename(String original) {
+    static String toSafeSdFilename(String original) {
         String name = original;
         int slash = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
         if (slash >= 0) name = name.substring(slash + 1);
         int dot = name.lastIndexOf('.');
-        String base = dot >= 0 ? name.substring(0, dot) : name;
-        String ext = dot >= 0 ? name.substring(dot + 1) : "";
+        String base = dot > 0 ? name.substring(0, dot) : name;
+        String ext = dot > 0 ? name.substring(dot + 1) : "";
 
-        String cleanBase = base.toUpperCase(java.util.Locale.US).replaceAll("[^A-Z0-9_]", "");
-        String cleanExt = ext.toUpperCase(java.util.Locale.US).replaceAll("[^A-Z0-9]", "");
-        if (cleanExt.isEmpty()) cleanExt = "GCO";
-        if (cleanExt.length() > 3) cleanExt = cleanExt.substring(0, 3);
-
-        if (!cleanBase.isEmpty() && cleanBase.length() <= 8) {
-            return cleanBase + "." + cleanExt;
+        // No "..", no dot at either end: the board refuses ".." anywhere in a name.
+        String cleanBase = base.replaceAll("[^A-Za-z0-9._-]", "_").replaceAll("\\.{2,}", ".").replaceAll("^[._]+|[._]+$", "");
+        String cleanExt = ext.replaceAll("[^A-Za-z0-9]", "");
+        if (cleanExt.isEmpty()) cleanExt = "gcode";
+        if (cleanExt.length() > 8) cleanExt = cleanExt.substring(0, 8);
+        if (cleanBase.length() > 90) cleanBase = cleanBase.substring(0, 90);
+        if (!cleanBase.equals(base)) {
+            cleanBase = (cleanBase.isEmpty() ? "file" : cleanBase) + "_"
+                    + String.format(java.util.Locale.US, "%08x", original.hashCode());
         }
-        // Doesn't fit - shorten deterministically (same source name always maps to the same
-        // short name, so re-uploading the same file overwrites rather than piling up aliases).
-        int hash = 0;
-        for (int i = 0; i < original.length(); i++) hash = 31 * hash + original.charAt(i);
-        String hex = String.format(java.util.Locale.US, "%02X", hash & 0xFF);
-        String prefix = cleanBase.isEmpty() ? "FILE" : cleanBase.substring(0, Math.min(5, cleanBase.length()));
-        return prefix + "~" + hex + "." + cleanExt;
+        return cleanBase + "." + cleanExt;
     }
 
     private static void saveToLocalFile(InputStream in, File dest) throws IOException {
@@ -867,9 +875,8 @@ public class PrinterService extends Service {
         return f.exists() ? f : null;
     }
 
-    /** Printer filenames are already constrained to classic 8.3 short names (see
-     *  toSafeSdFilename's own comment on why), so this never actually strips anything in
-     *  practice - just refuses to let a filename from the wire be used as a raw path. */
+    /** Board filenames are already limited to letters, digits and "._-" (see toSafeSdFilename), so this never
+     *  actually strips anything in practice - just refuses to let a filename from the wire be used as a raw path. */
     private static String sanitizeCacheFilename(String printerFilename) {
         return printerFilename.replaceAll("[^A-Za-z0-9._-]", "_");
     }
@@ -945,6 +952,9 @@ public class PrinterService extends Service {
             }
             try {
                 printerConnection.startPrint(state.currentFile);
+                // A new print is a new power session: "switch off once cooled" left over from the previous print (started
+                // again while still warm) must not cut the plug if this one ends in an error.
+                autoShutoffArmed = false;
                 state.fileReady = false;
                 state.phase = PrinterState.Phase.PRINTING;
                 state.printProgressPercent = 0;
@@ -967,7 +977,12 @@ public class PrinterService extends Service {
     // and this phone even reported the print as finished. Now the board keeps a journal of the print and reports an
     // "interrupted" print after a restart; this phone raises an alert and offers to resume it.
 
-    private String lastAlertKey = "";
+    // Keys already alerted (newest last), kept in prefs ("alerted_keys"): the board keeps its crash report after a dismiss,
+    // so its alert must come back neither after another alert nor after this app restarts.
+    private final java.util.LinkedHashSet<String> alertedKeys = new java.util.LinkedHashSet<String>();
+    // "error:<message>" keys are not unique per event (the same error can come back on a later print): only a repeat in a
+    // row is dropped for them.
+    private String lastErrorKey = "";
     private long heatersIdleSince = 0;
     private boolean heatersAlerted = false;
     private long lastBoardCheck = 0;
@@ -977,8 +992,16 @@ public class PrinterService extends Service {
     /** Raises an alert once per key: dashboard banner + every notification channel (see AlertNotifier). */
     public void raiseAlert(String key, String message) {
         synchronized (this) {
-            if (!key.equals("test") && key.equals(lastAlertKey)) return;
-            lastAlertKey = key;
+            if (key.startsWith("error:")) {
+                if (key.equals(lastErrorKey)) return;
+                lastErrorKey = key;
+            } else if (!key.equals("test")) {
+                if (!alertedKeys.add(key)) return;
+                if (alertedKeys.size() > 100) alertedKeys.remove(alertedKeys.iterator().next());
+                StringBuilder keys = new StringBuilder();
+                for (String k : alertedKeys) keys.append(k).append('\n');
+                getSharedPreferences("printhost", MODE_PRIVATE).edit().putString("alerted_keys", keys.toString()).apply();
+            }
             state.alert = message;
             state.alertAtMillis = System.currentTimeMillis();
         }
@@ -990,15 +1013,82 @@ public class PrinterService extends Service {
         state.alertAtMillis = 0;
     }
 
-    /** Dismiss from the dashboard: the user has seen it, so the board forgets its crash report too. */
+    /** Dismiss from the dashboard: hides the banner only. The board keeps its crash report and the logs keep everything. */
     public void dismissAlertByUser() {
         dismissAlert();
-        state.boardCrash = "";
-        if (printerConnection instanceof EspPrinterConnection) ((EspPrinterConnection) printerConnection).clearCrash();
     }
 
     public void setNtfyTopic(String topic) {
         alertNotifier.setNtfyTopic(topic);
+    }
+
+    /** null leaves a value as it is. */
+    public void setTelegram(String token, String chat) {
+        alertNotifier.setTelegram(token, chat);
+    }
+
+    public String linkTelegramChat() {
+        return alertNotifier.linkTelegramChat();
+    }
+
+    public JSONObject alertsConfig() {
+        return alertNotifier.config();
+    }
+
+    public void setDashboardUrl(String url) {
+        alertNotifier.setDashboardUrl(url);
+    }
+
+    // Progress pushes (25/50/75 %) already sent for the print of progressPushFile; guarded by PrinterService.this.
+    private String progressPushFile = null;
+    private int progressPushSent = 0;
+
+    private static int progressMilestone(int percent) {
+        return percent >= 75 ? 75 : percent >= 50 ? 50 : percent >= 25 ? 25 : 0;
+    }
+
+    static String progressMessage(int milestone, String file) {
+        return "Print " + milestone + "%: " + file;
+    }
+
+    static String successMessage(String file, long elapsedSeconds) {
+        String took = elapsedSeconds > 0 ? " (" + (elapsedSeconds / 3600) + "h " + (elapsedSeconds / 60 % 60) + "m)" : "";
+        return "\u2705 Print successful: " + file + took;
+    }
+
+    /**
+     * Called on every progress poll of a running print. A milestone already behind when the app first sees the print
+     * (app restarted mid-print) is not sent again; progress going back down means a new print of the same file.
+     */
+    private void pushProgressMilestone() {
+        int m = progressMilestone(state.printProgressPercent);
+        if (!state.currentFile.equals(progressPushFile) || m < progressPushSent) {
+            progressPushFile = state.currentFile;
+            progressPushSent = state.printProgressPercent < 25 ? 0 : m;
+            return;
+        }
+        if (m > progressPushSent) {
+            progressPushSent = m;
+            alertNotifier.push(progressMessage(m, state.currentFileDisplay));
+        }
+    }
+
+    /** POST /alerts/test?demo=1: the four print pushes as a real print would send them, through the same code. */
+    public void sendDemoPrintPushes() {
+        final String file = "[TEST] " + (state.currentFileDisplay.isEmpty() ? "demo.gcode" : state.currentFileDisplay);
+        new Thread("PrintHostDemoPush") {
+            @Override
+            public void run() {
+                try {
+                    for (int m = 25; m <= 75; m += 25) {
+                        alertNotifier.push(progressMessage(m, file));
+                        Thread.sleep(1500);
+                    }
+                    alertNotifier.push(successMessage(file, 3 * 3600 + 43 * 60));
+                } catch (InterruptedException ignored) {
+                }
+            }
+        }.start();
     }
 
     /** Called about every 5 s (AutoConnectThread): picks up the board's interrupted print and crash report. */
@@ -1923,9 +2013,11 @@ public class PrinterService extends Service {
                     state.printProgressPercent = 100;
                     updateNotification("Print finished: " + state.currentFileDisplay);
                     macNotifier.notifyAsync("done");
+                    alertNotifier.push(successMessage(state.currentFileDisplay, state.elapsedSeconds));
                     autoShutoffArmed = true;
                     stopRequested = true;
                 }
+                if (!done && state.phase == PrinterState.Phase.PRINTING) pushProgressMilestone();
             }
         }
     }

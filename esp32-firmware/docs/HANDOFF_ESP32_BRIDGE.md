@@ -45,9 +45,15 @@ fan/modes). After a restart mid-print the board lifts the nozzle 5 mm and resume
 twice per print; if it restarts again within 10 min (crash loop) it switches all heaters off and waits. Manual:
 phone `POST /print/recover?mode=auto|kept|restarted` (board `/printer/recover`) and `/print/recover/discard`.
 
-**Alerts (phone).** Interrupted print, board crash, heaters on 15 min without a print, board unreachable 2 min:
-phone notification, Mac listener, optional ntfy topic; shown in the dashboard alert box (Resume/Discard for an
-interrupted print, Dismiss otherwise). `/status` fields: `alert`, `alertAtMillis`, `interrupted{...}`, `boardCrash`.
+**Alerts and pushes (phone).** Alerts - interrupted print, board crash, print error, heaters on 15 min without a
+print, board unreachable 2 min during a print - go to the user's Telegram bot, the Mac listener, an optional ntfy topic
+and the dashboard alert box (Resume/Discard for an interrupted print, Dismiss otherwise; Dismiss only hides the box,
+the board keeps its crash report). Each alert once: sent keys are kept in prefs (`alerted_keys`). Pushes (Telegram
+only): 25/50/75 % and "Print successful". Every message ends with a dashboard link: the phone's Tailscale address,
+else its Wi-Fi address (override: `POST /alerts/config?dashUrl=`). No notification on the phone itself (headless).
+Setup: `POST /alerts/config?tgToken=&tgChat=` (the token lives only in the phone's prefs, never in git or answers),
+`POST /alerts/test` (`?demo=1`: the four print pushes). `/status` fields: `alert`, `alertAtMillis`, `interrupted{...}`,
+`boardCrash`.
 
 **Uploads.** Browser -> phone (kept as the preview copy) -> board. Phone -> board goes over a plain socket with a
 64 KB send buffer (the progress bar follows what the board took), a 90 s stall watchdog and a Cancel that closes the

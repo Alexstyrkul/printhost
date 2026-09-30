@@ -28,10 +28,51 @@ class WsConnection {
     private final Object writeLock = new Object();
     private volatile boolean closed = false;
 
+    // Messages go out on this connection's own writer thread, never on the broadcaster's: a client that stopped taking
+    // data (a phone gone to sleep, a dropped Tailscale link) blocks a socket write until TCP gives up, minutes later,
+    // and with the write on the broadcaster every dashboard froze meanwhile. Only the newest message waits: each one is
+    // a whole state, so older ones are worth nothing. Guarded by `this`.
+    private static final long WRITE_STALL_MS = 10_000;
+    private String pending = null;
+    private long writingSince = 0;  // when the write in progress started, 0 = none
+
     WsConnection(Socket socket) throws IOException {
         this.socket = socket;
         this.in = socket.getInputStream();
         this.out = socket.getOutputStream();
+        Thread writer = new Thread("PrintHostWsWriter") {
+            @Override
+            public void run() {
+                writeLoop();
+            }
+        };
+        writer.setDaemon(true);
+        writer.start();
+    }
+
+    private void writeLoop() {
+        try {
+            while (true) {
+                String text;
+                synchronized (this) {
+                    while (pending == null && !closed) wait();
+                    if (closed) return;
+                    text = pending;
+                    pending = null;
+                    writingSince = System.currentTimeMillis();
+                }
+                sendRaw(OP_TEXT, text.getBytes(StandardCharsets.UTF_8));
+                synchronized (this) {
+                    writingSince = 0;
+                }
+            }
+        } catch (InterruptedException e) {
+            // service shutting down
+        } catch (IOException e) {
+            Log.d(TAG, "send failed, closing: " + e.getMessage());
+        } finally {
+            close();
+        }
     }
 
     /** Blocks until the client closes, sends a close frame, or the connection errors out -
@@ -62,16 +103,19 @@ class WsConnection {
         }
     }
 
-    /** Safe to call from any thread (the broadcaster) concurrently with this connection's own
-     *  read loop - writeLock keeps two frames from interleaving on the wire. Silently drops the
-     *  send if the connection is already closed instead of throwing, matching the "best effort
-     *  broadcast" nature of WsHub.broadcast(). */
+    /** Never blocks: hands the message to this connection's writer thread (replacing one still waiting). A write stuck
+     *  for WRITE_STALL_MS means the client is gone: the socket is closed, which also frees the stuck writer; the
+     *  dashboard reconnects by itself. Silently drops the send if the connection is already closed. */
     void send(String text) {
         if (closed) return;
-        try {
-            sendRaw(OP_TEXT, text.getBytes(StandardCharsets.UTF_8));
-        } catch (IOException e) {
-            Log.d(TAG, "send failed, closing: " + e.getMessage());
+        boolean stalled;
+        synchronized (this) {
+            stalled = writingSince != 0 && System.currentTimeMillis() - writingSince > WRITE_STALL_MS;
+            pending = text;
+            notifyAll();
+        }
+        if (stalled) {
+            Log.d(TAG, "client stopped taking data for " + WRITE_STALL_MS / 1000 + " s, closing");
             close();
         }
     }
@@ -86,6 +130,9 @@ class WsConnection {
         try {
             socket.close();
         } catch (IOException ignored) {
+        }
+        synchronized (this) {
+            notifyAll();  // the writer thread ends
         }
     }
 
