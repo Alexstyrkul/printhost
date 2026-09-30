@@ -2035,6 +2035,10 @@ function pollCamStatus() {
     $("camFpsChip").textContent = ""; $("roomTemp").textContent = "-"; $("roomHum").textContent = "";
     camWorst = "bad"; renderHealth();
     $("camDot").className = "cam-dot";
+    // No board (the plug is off, or it is out of reach): no camera either. Without this the stream kept waiting and the
+    // badge counted "No new picture for N s" forever. The next answer from the board starts the stream again.
+    if (camWanted || camStreamUp) stopCamStream();
+    showCamStream(false, "Camera is off");
   });
 }
 
