@@ -82,6 +82,41 @@ for 2 min; gives up after 3 failed tries in a row ("press Connect"). No limit wh
 room), 3D preview (desktop only: it runs out of memory on phones), files, schedule card right; board vitals in one
 bottom line; Plug / Printer / Camera switches in the header. One screen from 520 px window height; stacks on phones.
 
+**The panel: the phone replaces the printer's own screen (2026-10-04, branch `feature/phone-screen`).** The stock
+screen is unplugged (the printer boots and answers over USB without it) and the phone is mounted on the printer. The
+PrintHost app's `MainActivity` is now the panel (`phone-app/src/.../panel/`, native views, no WebView): tabs Print
+(3D preview of the gcode with a layer slider, progress, Pause/Stop, tiles Nozzle/Bed/Fan/Speed/Flow/Z offset that open
+a -/+ sheet, the files on the board's card with Start, the board's vitals and the room sensor), Control (round X/Y pad
+with Home, Z, Motors off/on), Filament (PLA/TPU preheat, Load, Unload, feed by hand, Cool down - everything that heats
+shows a bar and can be cancelled while it heats), Calibrate (Z offset, bed mesh with editable points, Calibrate =
+G28 + G29 + save), Settings (connection switch, board logs, machine values, Power off). `Printer` is the screens'
+interface; `Live` feeds it from `PrinterService` and the board, `Mock` from pretend values
+(`am start -n dev.oleksandr.printhost/.MainActivity --ez mock true`, used on the emulator).
+- Phone API for the same actions: `POST /control/{home, move?axis=&dist=, motors-off, motors-on, temp?hotend=&bed=,
+  preheat?preset=, cooldown, fan?percent=, speed?percent=, flow?percent=, extrude?mm=, feed?mm=&temp=, zoffset?delta=,
+  mesh?column=&row=&z=, cancel}`, `/filament/load?temp=`. One manual action at a time. While printing only heat, fan,
+  speed, flow and Z babystep work; the board enforces the same list (`M104 M140 M106 M107 M220 M221 S<n>`, `M290 Z<n>`,
+  sent un-numbered between two print lines, kept in the journal).
+- Long commands do not block the board any more: `POST /printer/gcode?...&async=1` returns `{"job":N}`, the result comes
+  from `GET /printer/job?id=N`. The board's HTTP server handles one request at a time; a request that waited for G28 /
+  G29 made the dashboard show "Camera is off" and the panel "Printer is not connected". The phone uses async for every
+  command with a timeout above 6 s. Temperatures are polled once a second. Manual commands appear in the event log as
+  `gcode: <cmd> -> ok`.
+- Simulator for testing without the printer: `POST phone/debug/link?kind=sim|usb` (the panel shows "Simulator"). Do
+  not switch while the user is using the system: it drops the real printer link.
+- Door watch: the front camera notices the cabinet door (`DoorWatch.java`, `POST /debug/door?mode=off|log|on&threshold=`,
+  `GET /debug/door`). Measured: closed door 0.1-0.2, a moving door 45-50; threshold 20. Runs while the plug is on and
+  the screen is off, wakes the screen. Not yet checked during a print (the phone shakes with the printer).
+- Printer facts (M115/M503): BABYSTEPPING, EMERGENCY_PARSER, AUTOREPORT_TEMP on; no HOST_ACTION_COMMANDS / PROMPT_SUPPORT
+  (never send M600/M0: the printer would wait for its knob); presets 200/60 "PLA" and 230/70 "TPU".
+- **G29 without G28 first answers "ok" at once, probes nothing and leaves an all-zero mesh; saving that wiped the stored
+  mesh once.** `levelBed` now homes first, requires the probing to take time and the mesh to be non-zero before M500.
+  `M420 V` prints the 4x4 mesh and then a 16x16 "Subdivided" one: only the first is the mesh.
+- A heater left on by a cut-off load / unload / feed is put back at the next connect (pref `heat_action_restore`).
+- Open: the stock screen's auto Z-offset routine (`M8015` / `G212` in Creality's source, unconfirmed here - the button
+  is hidden); battery saving while the plug is off (the phone's charger is on the same plug); door-watch noise during a
+  print; the Motion / PID pages.
+
 ## 4. Findings you must know (each cost hours)
 
 1. **lwIP ignored its PSRAM option on the S3** (IDF 4.4 checks the old name `CONFIG_WIFI_LWIP_ALLOCATION_FROM_SPIRAM_FIRST`).
