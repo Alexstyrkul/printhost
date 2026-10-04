@@ -61,10 +61,21 @@ void closeDev() {
   if (ioMtx) xSemaphoreGive(ioMtx);
 }
 
+// Set by the patched components/usb/hub.c instead of its abort() (the board used to reboot there).
+extern "C" volatile uint32_t printhost_hub_ignored_port_events;
+extern "C" volatile int printhost_hub_last_ignored_port_event;
+
 void usbLibTask(void *) {
+  uint32_t ignoredSeen = 0;
   for (;;) {
     uint32_t flags;
     usb_host_lib_handle_events(portMAX_DELAY, &flags);
+    uint32_t ignored = printhost_hub_ignored_port_events;
+    if (ignored != ignoredSeen) {
+      ignoredSeen = ignored;
+      logEvent("usb: repeated port event %d while the port was recovering - ignored (#%u)",
+               printhost_hub_last_ignored_port_event, (unsigned)ignored);
+    }
     if (flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) usb_host_device_free_all();
   }
 }
