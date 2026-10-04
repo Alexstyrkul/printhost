@@ -25,7 +25,9 @@ public class EspPrinterConnection extends EspStoreConnection {
     /** "usb" = the real printer on the board's OTG port, "sim" = the board's built-in fake Marlin. */
     private final String linkKind;
 
-    private boolean open = false;
+    // volatile and read without the lock: the panel asks from the UI thread, which must never wait behind a long
+    // synchronized call here (an unload holds this object for minutes; a poll of an unreachable board for seconds)
+    private volatile boolean open = false;
     private JSONObject lastStatus = null;
     private long lastStatusAt = 0;
     private long finishedSeen = 0;
@@ -55,7 +57,7 @@ public class EspPrinterConnection extends EspStoreConnection {
     }
 
     @Override
-    public synchronized boolean isOpen() {
+    public boolean isOpen() {
         return open;
     }
 
@@ -266,8 +268,16 @@ public class EspPrinterConnection extends EspStoreConnection {
     private static final int UNLOAD_HEAT_TEMP_C = 240;
     private static final int UNLOAD_COOL_TEMP_C = 140;
 
+    private volatile boolean unloadCancelled = false;
+
+    /** Stops an unload that is still heating the nozzle (once the filament moves it runs to the end). */
+    public void cancelUnload() {
+        unloadCancelled = true;
+    }
+
     @Override
     public synchronized void unloadFilament(LineListener listener) throws IOException {
+        unloadCancelled = false;
         gcode("M104 S" + UNLOAD_HEAT_TEMP_C, 5000);
         // Wait for the heat by watching temperatures, so the dashboard shows them live.
         long deadline = System.currentTimeMillis() + 10 * 60 * 1000L;
@@ -278,7 +288,11 @@ public class EspPrinterConnection extends EspStoreConnection {
                         st.optDouble("hotend"), st.optDouble("hotendTarget"), st.optDouble("bed"), st.optDouble("bedTarget")));
             }
             if (st.optDouble("hotend") >= UNLOAD_HEAT_TEMP_C - 3) break;
-            sleepQuietly(1000);
+            if (unloadCancelled) {
+                gcode("M104 S0", 5000);
+                throw new IOException("Cancelled");
+            }
+            sleepQuietly(500);
         }
         gcode("G91", 5000);
         gcode("G1 E15.0 F240", 60000);
@@ -289,14 +303,44 @@ public class EspPrinterConnection extends EspStoreConnection {
 
     @Override
     public synchronized void levelBed(long levelTimeoutMs) throws IOException {
+        // Home first: without it this printer answers G29 with "ok" at once, probes nothing and leaves an empty (all
+        // zero) mesh behind - and saving that wiped the stored mesh (2026-10-04). So: home, probe, and save only if the
+        // probing really ran and the mesh it left is not empty.
+        gcode("G28", 120000);
+        long t0 = System.currentTimeMillis();
         gcode("G29", Math.max(levelTimeoutMs, 60000));
+        if (System.currentTimeMillis() - t0 < 4000) {
+            throw new IOException("The printer did not run the leveling (it answered at once). Nothing was saved.");
+        }
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("[+-]\\d+\\.\\d+").matcher(firstGrid(gcode("M420 V", 8000)));
+        boolean any = false, nonZero = false;
+        while (m.find()) {
+            any = true;
+            if (Math.abs(Double.parseDouble(m.group())) > 0.0005) nonZero = true;
+        }
+        if (any && !nonZero) throw new IOException("The printer reports an empty bed mesh after leveling. Nothing was saved.");
         gcode("M420 S1", 5000);
         gcode("M500", 5000);
     }
 
+    /** The first grid of an "M420 V" report: the mesh itself. This firmware prints a second, 16x16 interpolated one after
+     *  the line "Subdivided with ...", which is not what was probed. */
+    static String firstGrid(String m420) {
+        int i = m420.indexOf("Subdivided");
+        return i < 0 ? m420 : m420.substring(0, i);
+    }
+
     @Override
     public synchronized String queryLevelingGrid() throws IOException {
-        return gcode("M420 V", 8000);
+        return firstGrid(gcode("M420 V", 8000));
+    }
+
+    // ---- manual control ------------------------------------------------------------------------
+
+    /** One command for the manual controls. Not synchronized: homing takes many seconds and must not hold up the
+     *  temperature polls. While a print runs the board accepts only its short list of tune commands. */
+    public String manualGcode(String cmd, long timeoutMs) throws IOException {
+        return gcode(cmd, timeoutMs);
     }
 
     // ---- HTTP to the board's printer engine ---------------------------------------------------
@@ -319,9 +363,43 @@ public class EspPrinterConnection extends EspStoreConnection {
         return lastStatus;
     }
 
+    /** Commands that can take longer than this are sent without waiting for them (see gcode()). */
+    private static final long LONG_COMMAND_MS = 6000;
+
+    /**
+     * One command to the printer through the board. A quick one is a single request. One that may take long (homing,
+     * leveling, waiting for a move) is queued on the board and its result is asked for until it is done: the board
+     * handles one HTTP request at a time, so a request that waited for the printer made the board look dead to
+     * everything else (the dashboard showed "Camera is off", the panel "Printer is not connected").
+     */
     private String gcode(String cmd, long timeoutMs) throws IOException {
-        JSONObject r = call("/printer/gcode?cmd=" + URLEncoder.encode(cmd, "UTF-8") + "&timeout=" + timeoutMs, timeoutMs + 10000);
-        return r.optString("reply");
+        String q = "/printer/gcode?cmd=" + URLEncoder.encode(cmd, "UTF-8") + "&timeout=" + timeoutMs;
+        if (timeoutMs <= LONG_COMMAND_MS) return call(q, timeoutMs + 10000).optString("reply");
+        JSONObject started = call(q + "&async=1", 10000);
+        if (!started.has("job")) return started.optString("reply");  // a board that does not know "async" answered the old way
+        long job = started.optLong("job");
+        long deadline = System.currentTimeMillis() + timeoutMs + 10000, wait = 80;
+        for (;;) {
+            sleepQuietly(wait);
+            wait = Math.min(wait * 2, 400);
+            JSONObject j = null;
+            try {
+                j = new JSONObject(httpGet("/printer/job?id=" + job));
+            } catch (org.json.JSONException e) {
+                // unreadable answer: ask again
+            } catch (IOException e) {
+                // a lost request does not stop the command on the board: keep asking until the deadline
+            }
+            if (j != null) {
+                if (!j.optBoolean("ok")) throw new IOException("Printer bridge: the board lost the command (it restarted?)");
+                if (j.optBoolean("done")) {
+                    lastStatus = null;
+                    if (!j.optBoolean("success")) throw new IOException("Printer bridge: " + j.optString("error", "command failed"));
+                    return j.optString("reply");
+                }
+            }
+            if (System.currentTimeMillis() > deadline) throw new IOException("Printer bridge: no answer from the board in time");
+        }
     }
 
     /** POSTs to the engine; throws with the engine's own message if it refused. Invalidates the status cache. */

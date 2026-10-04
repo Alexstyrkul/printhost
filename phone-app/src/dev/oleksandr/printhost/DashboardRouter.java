@@ -99,6 +99,14 @@ public class DashboardRouter implements RequestRouter {
             } catch (Exception ignored) {
             }
             writeJson(out, outcome.success ? 200 : 422, json);
+        } else if ((p.startsWith("/control/") || p.equals("/filament/load")) && req.method.equals("POST")) {
+            PrinterService.UploadOutcome outcome = manualControl(p, req);
+            JSONObject json = resultJson(outcome.success, service.getStateJson());
+            try {
+                json.put("message", outcome.message);
+            } catch (Exception ignored) {
+            }
+            writeJson(out, outcome.success ? 200 : 422, json);
         } else if (p.equals("/level") && req.method.equals("POST")) {
             PrinterService.UploadOutcome outcome = service.levelBed();
             JSONObject json = resultJson(outcome.success, service.getStateJson());
@@ -120,6 +128,26 @@ public class DashboardRouter implements RequestRouter {
                 }
             }
             writeJson(out, 200, body);
+        } else if (p.equals("/debug/door") && req.method.equals("GET")) {
+            writeJson(out, 200, service.doorReport());
+        } else if (p.equals("/debug/door") && req.method.equals("POST")) {
+            // mode=off|log|on, threshold=<change that counts as "the door opened">
+            double th = 0;
+            try {
+                th = Double.parseDouble(req.queryParam("threshold"));
+            } catch (NumberFormatException ignored) {
+            }
+            service.setDoorWatch(req.queryParam("mode"), th);
+            writeJson(out, 200, service.doorReport());
+        } else if (p.equals("/debug/link") && req.method.equals("POST")) {
+            // kind=sim: the board's pretend printer (testing without the real one); kind=usb: the real printer
+            PrinterService.UploadOutcome outcome = service.setSimulator("sim".equals(req.queryParam("kind")));
+            JSONObject json = resultJson(outcome.success, service.getStateJson());
+            try {
+                json.put("message", outcome.message);
+            } catch (Exception ignored) {
+            }
+            writeJson(out, outcome.success ? 200 : 422, json);
         } else if (p.equals("/debug/sdlist") && req.method.equals("GET")) {
             writeText(out, 200, "text/plain", service.debugListSdFiles());
         } else if (p.equals("/sdfiles") && req.method.equals("GET")) {
@@ -600,6 +628,39 @@ public class DashboardRouter implements RequestRouter {
             case 500: return "Internal Server Error";
             case 502: return "Bad Gateway";
             default: return "";
+        }
+    }
+
+    /** The manual controls (what the printer's own screen offers). Every value is checked again in PrinterService. */
+    private PrinterService.UploadOutcome manualControl(String p, HttpRequest req) {
+        try {
+            switch (p) {
+                case "/control/home": return service.manualHome();
+                case "/control/cancel":
+                    service.manualCancel();
+                    return new PrinterService.UploadOutcome(true, "Cancel requested");
+                case "/control/motors-on": return service.manualMotorsOn();
+                case "/control/mesh": return service.manualSetMeshPoint(Integer.parseInt(req.queryParam("column")),
+                        Integer.parseInt(req.queryParam("row")), Double.parseDouble(req.queryParam("z")));
+                case "/control/feed": return service.manualExtrude(Double.parseDouble(req.queryParam("mm")), Integer.parseInt(req.queryParam("temp")));
+                case "/control/move": return service.manualMove(req.queryParam("axis"), Double.parseDouble(req.queryParam("dist")));
+                case "/control/motors-off": return service.manualMotorsOff();
+                case "/control/temp": {
+                    String h = req.queryParam("hotend"), b = req.queryParam("bed");
+                    return service.manualSetTemps(h.isEmpty() ? null : Integer.valueOf(h), b.isEmpty() ? null : Integer.valueOf(b));
+                }
+                case "/control/preheat": return service.manualPreheat(Integer.parseInt(req.queryParam("preset")));
+                case "/control/cooldown": return service.manualCooldown();
+                case "/control/fan": return service.manualFan(Integer.parseInt(req.queryParam("percent")));
+                case "/control/speed": return service.manualFeed(Integer.parseInt(req.queryParam("percent")));
+                case "/control/flow": return service.manualFlow(Integer.parseInt(req.queryParam("percent")));
+                case "/control/extrude": return service.manualExtrude(Double.parseDouble(req.queryParam("mm")));
+                case "/control/zoffset": return service.manualZOffset(Double.parseDouble(req.queryParam("delta")));
+                case "/filament/load": return service.manualLoadFilament(Integer.parseInt(req.queryParam("temp")));
+                default: return new PrinterService.UploadOutcome(false, "Unknown control");
+            }
+        } catch (NumberFormatException e) {
+            return new PrinterService.UploadOutcome(false, "Bad value");
         }
     }
 }

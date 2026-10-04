@@ -34,9 +34,9 @@ public class PrinterService extends Service {
     private static final String TAG = "PrinterService";
     private static final String CHANNEL_ID = "printhost_service";
     private static final int NOTIFICATION_ID = 1;
-    static final int HTTP_PORT = 8899; // not 2525, so it can't be confused with 3D Fox
+    public static final int HTTP_PORT = 8899; // not 2525, so it can't be confused with 3D Fox
     private static final int POLL_INTERVAL_MS = 1500;
-    private static final int IDLE_TEMP_POLL_INTERVAL_MS = 8000;
+    private static final int IDLE_TEMP_POLL_INTERVAL_MS = 1500;  // the panel on the phone shows these live (was 8 s)
     private static final int MAX_CONSECUTIVE_POLL_FAILURES = 5;
 
     private final PrinterState state = new PrinterState();
@@ -76,10 +76,22 @@ public class PrinterService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        instance = this;
         android.content.SharedPreferences prefs = getSharedPreferences("printhost", MODE_PRIVATE);
         espHost = prefs.getString("esp_host", espHost);
-        // The printer is always driven by the ESP32 board; this phone never opens USB.
-        printerConnection = new EspPrinterConnection("http://" + espHost, "usb");
+        // The printer is always driven by the ESP32 board; this phone never opens USB. "sim" = the board's built-in
+        // pretend printer (see setSimulator()).
+        state.simulator = "sim".equals(prefs.getString("esp_link", "usb"));
+        printerConnection = new EspPrinterConnection("http://" + espHost, state.simulator ? "sim" : "usb");
+        doorMode = prefs.getString("door_watch", "off");
+        doorWatch = new DoorWatch(this, new DoorWatch.Listener() {
+            @Override
+            public void onMotion(double change) {
+                Log.i(TAG, "door watch: change " + change + " - waking the screen");
+                wakeScreen();
+            }
+        });
+        doorWatch.threshold = prefs.getFloat("door_threshold", 20f);
         macNotifier = new MacNotifier(this);
         alertNotifier = new AlertNotifier(this, macNotifier);
         for (String k : getSharedPreferences("printhost", MODE_PRIVATE).getString("alerted_keys", "").split("\n")) {
@@ -132,8 +144,60 @@ public class PrinterService extends Service {
         return null;
     }
 
+    // ---- door watch: the front camera notices the cabinet door opening and switches the screen on ----
+    // Modes (pref "door_watch"): off, log (only record what the camera sees, for tuning), on (wake the screen).
+    // The camera runs only while the plug is on (the phone is then on its charger) and, in mode "on", only while the
+    // screen is off.
+    private DoorWatch doorWatch;
+    private volatile String doorMode = "off";
+
+    public JSONObject doorReport() {
+        return doorWatch == null ? new JSONObject() : doorWatch.report(doorMode);
+    }
+
+    public void setDoorWatch(String mode, double threshold) {
+        if (!"log".equals(mode) && !"on".equals(mode)) mode = "off";
+        android.content.SharedPreferences.Editor e = getSharedPreferences("printhost", MODE_PRIVATE).edit().putString("door_watch", mode);
+        if (threshold > 0) e.putFloat("door_threshold", (float) threshold);
+        e.apply();
+        doorMode = mode;
+        if (threshold > 0 && doorWatch != null) doorWatch.threshold = threshold;
+        // "camera" must be part of the foreground service type before the camera is used with the screen off
+        startForegroundCompat();
+        updateDoorWatch();
+    }
+
+    /** Starts or stops the camera to match the mode, the plug and the screen. Called on changes and from the plug poller. */
+    private void updateDoorWatch() {
+        if (doorWatch == null) return;
+        boolean plug = state.plugOn != null && state.plugOn;
+        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        boolean screenOn = pm != null && pm.isInteractive();
+        boolean want = plug && ("log".equals(doorMode) || ("on".equals(doorMode) && !screenOn));
+        doorWatch.act = "on".equals(doorMode);
+        if (want && !doorWatch.isRunning()) doorWatch.start();
+        else if (!want && doorWatch.isRunning()) doorWatch.stop();
+    }
+
+    // ---- for the panel (MainActivity, same process) ----
+    private static volatile PrinterService instance;
+
+    /** The running service, or null while it is not started. */
+    public static PrinterService get() {
+        return instance;
+    }
+
+    public PrinterState getState() {
+        return state;
+    }
+
+    public boolean isPrinterOpen() {
+        return printerConnection != null && printerConnection.isOpen();
+    }
+
     @Override
     public void onDestroy() {
+        instance = null;
         stopPoller();
         stopTempPoller();
         if (plugPollerThread != null) plugPollerThread.requestStop();
@@ -150,8 +214,11 @@ public class PrinterService extends Service {
     private void startForegroundCompat() {
         Notification notification = buildNotification("Idle");
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // "camera" only once the permission is there (newer Android refuses the type without it); needed for the
+            // door watch to see anything while the screen is off
+            boolean cam = checkSelfPermission(android.Manifest.permission.CAMERA) == android.content.pm.PackageManager.PERMISSION_GRANTED;
             startForeground(NOTIFICATION_ID, notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE | (cam ? ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA : 0));
         } else {
             startForeground(NOTIFICATION_ID, notification);
         }
@@ -471,7 +538,8 @@ public class PrinterService extends Service {
     }
 
     /** Automatic connect attempts give up after this many failures in a row (retrying forever kept the dashboard on
-     *  "Connecting..."); a Connect by hand, the plug turning on again or a successful connect start them again.
+     *  "Connecting..."); a Connect by hand, the plug turning on again, the printer appearing on the board or a successful connect
+     *  start them again.
      *  Not applied while the board reports a running print: following a print through a network gap matters more. */
     private static final int AUTO_CONNECT_MAX_FAILS = 3;
     private volatile int autoConnectFails = 0;
@@ -497,6 +565,8 @@ public class PrinterService extends Service {
                 printerConnection.connect();
                 state.firmwareInfo = firstLine(printerConnection.queryFirmwareInfo());
                 state.zOffset = parseZOffset(printerConnection.queryZOffset());
+                readManualInfo();
+                restoreAfterCutOffHeatAction();
                 state.lastError = "";
                 updateNotification("Connected");
                 startTempPoller();
@@ -623,6 +693,30 @@ public class PrinterService extends Service {
             Log.w(TAG, "camera quality change failed", e);
             return false;
         }
+    }
+
+    /**
+     * Test mode: on = talk to the board's built-in pretend printer, so every action can be tried without the real one
+     * (the board then leaves the real printer alone); off = back to the real printer. Kept across restarts.
+     */
+    public UploadOutcome setSimulator(boolean on) {
+        if (printActive()) return new UploadOutcome(false, "Not while printing");
+        if (on == state.simulator) return new UploadOutcome(true, on ? "Simulator" : "Real printer");
+        disconnectPrinter();
+        synchronized (commandLock) {
+            getSharedPreferences("printhost", MODE_PRIVATE).edit().putString("esp_link", on ? "sim" : "usb").apply();
+            state.simulator = on;
+            printerConnection = new EspPrinterConnection("http://" + espHost, on ? "sim" : "usb");
+        }
+        boolean ok = connectPrinter();
+        if (!ok) {  // the printer often misses the first question right after its USB link is reopened: ask once more
+            try {
+                Thread.sleep(6000);
+            } catch (InterruptedException ignored) {
+            }
+            ok = connectPrinter();
+        }
+        return new UploadOutcome(ok, ok ? (on ? "Simulator" : "Real printer") : state.lastError);
     }
 
     /** Address of the ESP32 board that drives the printer and stores the gcode files. */
@@ -955,6 +1049,8 @@ public class PrinterService extends Service {
                 // A new print is a new power session: "switch off once cooled" left over from the previous print (started
                 // again while still warm) must not cut the plug if this one ends in an error.
                 autoShutoffArmed = false;
+                forgetPosition();
+                state.manualFan = null;
                 state.fileReady = false;
                 state.phase = PrinterState.Phase.PRINTING;
                 state.printProgressPercent = 0;
@@ -1132,7 +1228,7 @@ public class PrinterService extends Service {
         PrinterState.Phase ph = state.phase;
         boolean printing = ph == PrinterState.Phase.PRINTING || ph == PrinterState.Phase.PAUSED;
         boolean heating = state.hotendTarget > 0 || state.bedTarget > 0;
-        if (printing || !heating || state.unloadingFilament || state.levelingBed) {
+        if (printing || !heating || state.unloadingFilament || state.levelingBed || !state.manualBusy.isEmpty()) {
             heatersIdleSince = 0;
             heatersAlerted = false;
             return;
@@ -1529,6 +1625,447 @@ public class PrinterService extends Service {
         }
     }
 
+    // ---- manual control: what the printer's own screen offers ------------------------------------
+    // Move / home / motors off, temperatures and presets, fan, extrude / retract / load, Z offset, speed and flow.
+    // One action at a time (manualLock). While a print runs only the tune commands are allowed, and the board
+    // itself accepts nothing else then.
+
+    private final java.util.concurrent.locks.ReentrantLock manualLock = new java.util.concurrent.locks.ReentrantLock();
+
+    private static final double BED_X_MM = 220, BED_Y_MM = 220, BED_Z_MM = 250;
+    private static final int HOTEND_MAX_C = 260, BED_MAX_C = 100;
+    private static final int MIN_EXTRUDE_TEMP_C = 170; // the firmware refuses to push cold filament below this
+    private static final double Z_OFFSET_STEP_MAX = 0.1, Z_OFFSET_LIMIT = 5;
+
+    private interface ManualAction {
+        String run(EspPrinterConnection c) throws IOException;
+    }
+
+    private boolean printActive() {
+        PrinterState.Phase ph = state.phase;
+        return ph == PrinterState.Phase.PRINTING || ph == PrinterState.Phase.PAUSED;
+    }
+
+    private UploadOutcome manual(String busyText, boolean allowedWhilePrinting, ManualAction action) {
+        if (!printerConnection.isOpen() || !(printerConnection instanceof EspPrinterConnection)) {
+            return new UploadOutcome(false, "Printer is not connected");
+        }
+        if (printActive() && !allowedWhilePrinting) {
+            return new UploadOutcome(false, "Not available while printing");
+        }
+        if (state.levelingBed || state.unloadingFilament) {
+            return new UploadOutcome(false, "The printer is busy");
+        }
+        if (!manualLock.tryLock()) {
+            return new UploadOutcome(false, "The printer is busy: " + state.manualBusy);
+        }
+        try {
+            state.manualBusy = busyText;
+            return new UploadOutcome(true, action.run((EspPrinterConnection) printerConnection));
+        } catch (IOException e) {
+            Log.e(TAG, "manual control failed: " + busyText, e);
+            return new UploadOutcome(false, String.valueOf(e.getMessage()));
+        } finally {
+            state.manualBusy = "";
+            manualLock.unlock();
+        }
+    }
+
+    private static String fmt(String f, Object... a) {
+        return String.format(java.util.Locale.US, f, a);
+    }
+
+    private static final Pattern M114_POS = Pattern.compile("X:([\\-0-9.]+)\\s+Y:([\\-0-9.]+)\\s+Z:([\\-0-9.]+)");
+
+    private void readPosition(EspPrinterConnection c) throws IOException {
+        Matcher m = M114_POS.matcher(c.manualGcode("M114", 5000));
+        if (!m.find()) throw new IOException("The printer did not report its position");
+        state.posX = Double.parseDouble(m.group(1));
+        state.posY = Double.parseDouble(m.group(2));
+        state.posZ = Double.parseDouble(m.group(3));
+    }
+
+    private void forgetPosition() {
+        state.homed = false;
+        state.posX = null;
+        state.posY = null;
+        state.posZ = null;
+    }
+
+    public UploadOutcome manualHome() {
+        return manual("Homing", false, new ManualAction() {
+            @Override
+            public String run(EspPrinterConnection c) throws IOException {
+                forgetPosition();
+                c.manualGcode("G28", 120000);
+                readPosition(c);
+                state.homed = true;
+                return "Homed";
+            }
+        });
+    }
+
+    /**
+     * Homed: an absolute move to the current position plus dist, kept inside the bed. Not homed: a plain relative move -
+     * the printer does not know where it is, so nothing limits it; the person at the printer watches the axis.
+     */
+    public UploadOutcome manualMove(final String axisParam, final double dist) {
+        final String axis = axisParam == null ? "" : axisParam.toUpperCase(java.util.Locale.US);
+        if (!(axis.equals("X") || axis.equals("Y") || axis.equals("Z")) || dist == 0 || Math.abs(dist) > 100) {
+            return new UploadOutcome(false, "Bad move");
+        }
+        return manual("Moving " + axis, false, new ManualAction() {
+            @Override
+            public String run(EspPrinterConnection c) throws IOException {
+                int feed = axis.equals("Z") ? 600 : 3000;
+                if (!state.homed || state.posX == null) {
+                    c.manualGcode("G91", 5000);
+                    try {
+                        c.manualGcode(fmt("G1 %s%.2f F%d", axis, dist, feed), 10000);
+                    } finally {
+                        c.manualGcode("G90", 5000);
+                    }
+                    c.manualGcode("M400", 90000); // wait until the move is done
+                    return fmt("%s %+.1f", axis, dist);
+                }
+                double cur = axis.equals("X") ? state.posX : axis.equals("Y") ? state.posY : state.posZ;
+                double max = axis.equals("X") ? BED_X_MM : axis.equals("Y") ? BED_Y_MM : BED_Z_MM;
+                double target = Math.max(0, Math.min(max, cur + dist));
+                if (Math.abs(target - cur) < 0.005) return axis + " is at its limit";
+                c.manualGcode("G90", 5000);
+                c.manualGcode(fmt("G1 %s%.2f F%d", axis, target, feed), 10000);
+                c.manualGcode("M400", 90000);
+                if (axis.equals("X")) state.posX = target;
+                else if (axis.equals("Y")) state.posY = target;
+                else state.posZ = target;
+                return fmt("%s %.1f", axis, target);
+            }
+        });
+    }
+
+    /** Locks the motors again after Motors off. The position stays unknown until the next Home. */
+    public UploadOutcome manualMotorsOn() {
+        return manual("Locking motors", false, new ManualAction() {
+            @Override
+            public String run(EspPrinterConnection c) throws IOException {
+                c.manualGcode("M17", 10000);
+                return "Motors on";
+            }
+        });
+    }
+
+    public UploadOutcome manualMotorsOff() {
+        return manual("Releasing motors", false, new ManualAction() {
+            @Override
+            public String run(EspPrinterConnection c) throws IOException {
+                c.manualGcode("M84", 10000);
+                forgetPosition();
+                return "Motors off";
+            }
+        });
+    }
+
+    /** hotend / bed: target in C, null = leave as it is. */
+    public UploadOutcome manualSetTemps(final Integer hotend, final Integer bed) {
+        if ((hotend == null && bed == null) || (hotend != null && (hotend < 0 || hotend > HOTEND_MAX_C))
+                || (bed != null && (bed < 0 || bed > BED_MAX_C))) {
+            return new UploadOutcome(false, "Temperature out of range (nozzle 0-" + HOTEND_MAX_C + ", bed 0-" + BED_MAX_C + ")");
+        }
+        return manual("Setting temperature", true, new ManualAction() {
+            @Override
+            public String run(EspPrinterConnection c) throws IOException {
+                if (hotend != null) {
+                    c.manualGcode("M104 S" + hotend, 15000);
+                    state.hotendTarget = hotend;
+                }
+                if (bed != null) {
+                    c.manualGcode("M140 S" + bed, 15000);
+                    state.bedTarget = bed;
+                }
+                return (hotend != null ? "Nozzle " + hotend + "°" : "") + (hotend != null && bed != null ? ", " : "")
+                        + (bed != null ? "Bed " + bed + "°" : "");
+            }
+        });
+    }
+
+    public UploadOutcome manualPreheat(int index) {
+        JSONObject preset = state.presets.optJSONObject(index);
+        if (preset == null) return new UploadOutcome(false, "No such preset");
+        return manualSetTemps(preset.optInt("hotend"), preset.optInt("bed"));
+    }
+
+    public UploadOutcome manualCooldown() {
+        return manualSetTemps(0, 0);
+    }
+
+    public UploadOutcome manualFan(final int percent) {
+        if (percent < 0 || percent > 100) return new UploadOutcome(false, "Fan 0-100%");
+        return manual("Setting fan", true, new ManualAction() {
+            @Override
+            public String run(EspPrinterConnection c) throws IOException {
+                int raw = (int) Math.round(percent * 2.55);
+                c.manualGcode(raw == 0 ? "M107" : "M106 S" + raw, 15000);
+                state.manualFanOverFile = state.fanSpeed;
+                state.manualFan = raw;
+                return "Fan " + percent + "%";
+            }
+        });
+    }
+
+    public UploadOutcome manualFeed(final int percent) {
+        if (percent < 10 || percent > 300) return new UploadOutcome(false, "Speed 10-300%");
+        return manual("Setting speed", true, new ManualAction() {
+            @Override
+            public String run(EspPrinterConnection c) throws IOException {
+                c.manualGcode("M220 S" + percent, 15000);
+                state.feedPercent = percent;
+                return "Speed " + percent + "%";
+            }
+        });
+    }
+
+    public UploadOutcome manualFlow(final int percent) {
+        if (percent < 50 || percent > 200) return new UploadOutcome(false, "Flow 50-200%");
+        return manual("Setting flow", true, new ManualAction() {
+            @Override
+            public String run(EspPrinterConnection c) throws IOException {
+                c.manualGcode("M221 S" + percent, 15000);
+                state.flowPercent = percent;
+                return "Flow " + percent + "%";
+            }
+        });
+    }
+
+    private void extrudeRelative(EspPrinterConnection c, double mm, int feed) throws IOException {
+        c.manualGcode("G91", 5000);
+        try {
+            c.manualGcode(fmt("G1 E%.1f F%d", mm, feed), 10000);
+            c.manualGcode("M400", (long) (Math.abs(mm) * 60000 / feed) + 30000);
+        } finally {
+            c.manualGcode("G90", 5000);
+        }
+    }
+
+    /** mm > 0 pushes filament out, mm < 0 pulls it back. The nozzle must already be hot. */
+    public UploadOutcome manualExtrude(final double mm) {
+        return manualExtrude(mm, 0);
+    }
+
+    /** heatTo > 0: a nozzle below the extrusion minimum is first heated to that temperature (and put back afterwards)
+     *  instead of the request being refused. */
+    public UploadOutcome manualExtrude(final double mm, final int heatTo) {
+        if (mm == 0 || Math.abs(mm) > 100) return new UploadOutcome(false, "Length 1-100 mm");
+        if (heatTo != 0 && (heatTo < 180 || heatTo > HOTEND_MAX_C)) return new UploadOutcome(false, "Temperature 180-" + HOTEND_MAX_C);
+        return manual(mm > 0 ? "Extruding" : "Retracting", false, new ManualAction() {
+            @Override
+            public String run(EspPrinterConnection c) throws IOException {
+                boolean cold = state.hotendTemp < MIN_EXTRUDE_TEMP_C;
+                if (cold && heatTo == 0) {
+                    throw new IOException(fmt("Heat the nozzle first: %.0f° now, %d° needed", state.hotendTemp, MIN_EXTRUDE_TEMP_C));
+                }
+                if (!cold) {
+                    extrudeRelative(c, mm, 300);
+                } else {
+                    int before = (int) Math.round(state.hotendTarget);
+                    noteHeatAction(before);
+                    try {
+                        heatNozzleAndWait(c, heatTo);
+                        extrudeRelative(c, mm, 300);
+                    } finally {
+                        c.manualGcode("M104 S" + before, 15000);
+                        state.hotendTarget = before;
+                        clearHeatAction();
+                    }
+                }
+                return fmt("%s %.0f mm", mm > 0 ? "Extruded" : "Retracted", Math.abs(mm));
+            }
+        });
+    }
+
+    private volatile boolean manualCancelRequested = false;
+
+    /** Stops a manual action that is still waiting for the nozzle to heat (load, feed by hand). */
+    public void manualCancel() {
+        manualCancelRequested = true;
+        if (printerConnection instanceof EspPrinterConnection) ((EspPrinterConnection) printerConnection).cancelUnload();
+    }
+
+    // ---- a heater left on by an action that never finished ----
+    // Load, unload and feed-by-hand heat the nozzle and put the target back when they end. If the app dies in between
+    // (crash, phone restart, reinstall) nobody puts it back. So the target to return to is written down before the
+    // action heats anything and erased when the action ends; a note still there at the next connect means the action
+    // was cut off, and the nozzle is put back then. A preheat the user asked for leaves no note and is never touched.
+
+    private void noteHeatAction(int targetBefore) {
+        getSharedPreferences("printhost", MODE_PRIVATE).edit().putInt("heat_action_restore", targetBefore).commit();
+    }
+
+    private void clearHeatAction() {
+        getSharedPreferences("printhost", MODE_PRIVATE).edit().remove("heat_action_restore").commit();
+    }
+
+    private void restoreAfterCutOffHeatAction() {
+        android.content.SharedPreferences prefs = getSharedPreferences("printhost", MODE_PRIVATE);
+        if (!prefs.contains("heat_action_restore") || !(printerConnection instanceof EspPrinterConnection)) return;
+        EspPrinterConnection c = (EspPrinterConnection) printerConnection;
+        if (!"IDLE".equals(c.boardState())) return;  // never during a print: its temperatures are its own
+        int target = prefs.getInt("heat_action_restore", 0);
+        try {
+            c.manualGcode("M104 S" + target, 15000);
+            state.hotendTarget = target;
+            clearHeatAction();
+            Log.w(TAG, "a filament action was cut off while heating: nozzle target put back to " + target);
+        } catch (IOException e) {
+            Log.w(TAG, "could not put the nozzle target back yet, will retry at the next connect", e);
+        }
+    }
+
+    private void heatNozzleAndWait(EspPrinterConnection c, int temp) throws IOException {
+        manualCancelRequested = false;
+        c.manualGcode("M104 S" + temp, 15000);
+        state.hotendTarget = temp;
+        long deadline = System.currentTimeMillis() + 8 * 60 * 1000L;
+        while (state.hotendTemp < temp - 3) {
+            if (manualCancelRequested) throw new IOException("Cancelled");
+            if (System.currentTimeMillis() > deadline) throw new IOException("The nozzle did not reach " + temp + "°");
+            if (!printerConnection.isOpen()) throw new IOException("Printer disconnected");
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                throw new IOException("Interrupted");
+            }
+        }
+    }
+
+    /** Heats the nozzle, feeds the filament through, then puts the nozzle target back to what it was. */
+    public UploadOutcome manualLoadFilament(final int temp) {
+        if (temp < 180 || temp > HOTEND_MAX_C) return new UploadOutcome(false, "Temperature 180-" + HOTEND_MAX_C);
+        return manual("Loading filament", false, new ManualAction() {
+            @Override
+            public String run(EspPrinterConnection c) throws IOException {
+                int before = (int) Math.round(state.hotendTarget);
+                noteHeatAction(before);
+                try {
+                    heatNozzleAndWait(c, temp);
+                    extrudeRelative(c, 50, 300);
+                    extrudeRelative(c, 30, 150);
+                } finally {
+                    c.manualGcode("M104 S" + before, 15000);
+                    state.hotendTarget = before;
+                    clearHeatAction();
+                }
+                return "Filament loaded";
+            }
+        });
+    }
+
+    private static double round2(double v) {
+        return Math.round(v * 100) / 100.0;
+    }
+
+    /** Idle: changes the stored probe Z offset. Printing: moves the nozzle right away (babystep); the new value is
+     *  stored when the print ends (see storeZOffsetAfterPrint()). */
+    public UploadOutcome manualZOffset(final double delta) {
+        if (delta == 0 || Math.abs(delta) > Z_OFFSET_STEP_MAX + 1e-9) return new UploadOutcome(false, "Step up to " + Z_OFFSET_STEP_MAX + " mm");
+        final double target = round2(state.zOffset + delta);
+        if (Math.abs(target) > Z_OFFSET_LIMIT) return new UploadOutcome(false, "Z offset limit reached");
+        return manual("Setting Z offset", true, new ManualAction() {
+            @Override
+            public String run(EspPrinterConnection c) throws IOException {
+                if (printActive()) {
+                    c.manualGcode(fmt("M290 Z%.2f", delta), 15000);
+                    state.zOffset = target;
+                    state.zOffsetUnsaved = true;
+                    return fmt("Z offset %.2f", target);
+                }
+                c.manualGcode(fmt("M851 Z%.2f", target), 5000);
+                c.manualGcode("M500", 10000);
+                state.zOffset = target;
+                state.zOffsetUnsaved = false;
+                return fmt("Z offset %.2f saved", target);
+            }
+        });
+    }
+
+    /** One point of the bed mesh, set by hand (the stock screen's "edit leveling data"): column 0-3 from the left,
+     *  row 0-3 from the back. Stored at once. */
+    public UploadOutcome manualSetMeshPoint(final int column, final int row, final double z) {
+        if (column < 0 || column > 3 || row < 0 || row > 3 || Math.abs(z) > 2) return new UploadOutcome(false, "Bad mesh point");
+        return manual("Saving bed point", false, new ManualAction() {
+            @Override
+            public String run(EspPrinterConnection c) throws IOException {
+                c.manualGcode(fmt("G29 W I%d J%d Z%.2f", column, row, z), 5000);
+                c.manualGcode("M500", 5000);
+                return fmt("Point saved: %.2f", z);
+            }
+        });
+    }
+
+    /** After a print in which the Z offset was babystepped: make the printer's stored probe offset equal to what the
+     *  dashboard shows. Some firmware moves the probe offset together with the babystep, some does not - so read it
+     *  back and only write the difference. Called from the idle poller. */
+    private void storeZOffsetAfterPrint() {
+        if (!state.zOffsetUnsaved || printActive() || !(printerConnection instanceof EspPrinterConnection)) return;
+        EspPrinterConnection c = (EspPrinterConnection) printerConnection;
+        if (!c.isOpen() || !"IDLE".equals(c.boardState()) || !manualLock.tryLock()) return;
+        try {
+            double want = state.zOffset;
+            double have = parseZOffset(c.manualGcode("M851", 5000));
+            if (Math.abs(have - want) > 0.005) c.manualGcode(fmt("M851 Z%.2f", want), 5000);
+            c.manualGcode("M500", 10000);
+            state.zOffsetUnsaved = false;
+            Log.i(TAG, "Z offset " + want + " stored after the print (the printer had " + have + ")");
+        } catch (IOException e) {
+            Log.w(TAG, "storing the Z offset failed, will retry", e);
+        } finally {
+            manualLock.unlock();
+        }
+    }
+
+    /** The values of one setting line of the M503 report ("echo:  M92 X80.00 Y80.00 ..." gives "X80.00 Y80.00 ..."). */
+    private static String m503Line(String m503, String code) {
+        for (String line : m503.split("\n")) {
+            int i = line.indexOf(code + " ");
+            if (i >= 0 && line.indexOf(';') < 0) return line.substring(i + code.length() + 1).trim();
+        }
+        return "";
+    }
+
+    private static final Pattern M145_PRESET = Pattern.compile("M145 S(\\d+) H([0-9.]+) B([0-9.]+)");
+    private static final Pattern PERCENT = Pattern.compile("(\\d+)\\s*%");
+    private static final String[] PRESET_NAMES = {"PLA", "TPU"}; // as the printer's own screen names them
+
+    /** Right after connecting to an idle printer: its preheat presets and the current speed / flow factors. */
+    private void readManualInfo() {
+        forgetPosition();
+        state.manualFan = null;
+        state.zOffsetUnsaved = false;
+        state.feedPercent = null;
+        state.flowPercent = null;
+        if (!(printerConnection instanceof EspPrinterConnection)) return;
+        EspPrinterConnection c = (EspPrinterConnection) printerConnection;
+        if (!"IDLE".equals(c.boardState())) return;
+        try {
+            String m503 = c.manualGcode("M503", 10000);
+            state.machineInfo = new String[][]{{"Steps per mm", m503Line(m503, "M92")}, {"Max speed, mm/s", m503Line(m503, "M203")},
+                    {"Acceleration", m503Line(m503, "M204")}, {"Nozzle PID", m503Line(m503, "M301")}};
+            Matcher m = M145_PRESET.matcher(m503);
+            JSONArray presets = new JSONArray();
+            while (m.find()) {
+                int i = Integer.parseInt(m.group(1));
+                presets.put(new JSONObject().put("name", i < PRESET_NAMES.length ? PRESET_NAMES[i] : "Preset " + (i + 1))
+                        .put("hotend", (int) Double.parseDouble(m.group(2))).put("bed", (int) Double.parseDouble(m.group(3))));
+            }
+            if (presets.length() > 0) state.presets = presets;
+            Matcher f = PERCENT.matcher(c.manualGcode("M220", 5000));
+            if (f.find()) state.feedPercent = Integer.parseInt(f.group(1));
+            f = PERCENT.matcher(c.manualGcode("M221", 5000));
+            if (f.find()) state.flowPercent = Integer.parseInt(f.group(1));
+        } catch (Exception e) {
+            Log.w(TAG, "reading presets / speed / flow failed (non-fatal)", e);
+        }
+    }
+
     // ---- maintenance: filament unload / bed leveling -------------------------------------------
     // Both are real physical actions (heating + extruder motion, or a full probe pass) - blocked
     // outright while a print is active, same as the SD-file operations above, and never touched
@@ -1547,7 +2084,9 @@ public class PrinterService extends Service {
                     || state.phase == PrinterState.Phase.UPLOADING) {
                 return new UploadOutcome(false, "Cannot unload filament while " + state.phase);
             }
+            if (!state.manualBusy.isEmpty()) return new UploadOutcome(false, "The printer is busy: " + state.manualBusy);
             state.unloadingFilament = true;
+            noteHeatAction(0);
             try {
                 printerConnection.unloadFilament(new PrinterConnection.LineListener() {
                     @Override
@@ -1559,11 +2098,13 @@ public class PrinterService extends Service {
                 });
                 return new UploadOutcome(true, "Filament unloaded - pull it out now");
             } catch (IOException | TimeoutException e) {
+                if ("Cancelled".equals(e.getMessage())) return new UploadOutcome(false, "Cancelled");
                 Log.e(TAG, "unloadFilament failed", e);
                 state.lastError = String.valueOf(e.getMessage());
                 return new UploadOutcome(false, state.lastError);
             } finally {
                 state.unloadingFilament = false;
+                clearHeatAction();
             }
         }
     }
@@ -1577,6 +2118,8 @@ public class PrinterService extends Service {
                     || state.phase == PrinterState.Phase.UPLOADING) {
                 return new UploadOutcome(false, "Cannot level while " + state.phase);
             }
+            if (!state.manualBusy.isEmpty()) return new UploadOutcome(false, "The printer is busy: " + state.manualBusy);
+            forgetPosition(); // G29 homes and moves on its own
             state.levelingBed = true;
             try {
                 printerConnection.levelBed(LEVEL_TIMEOUT_MS);
@@ -1682,6 +2225,7 @@ public class PrinterService extends Service {
                     // most callers only clear it at the START of their own next successful run -
                     // this background poll is what actually proves things are healthy again.
                     state.lastError = "";
+                    storeZOffsetAfterPrint();
                     checkHeatersLeftOn();
                     maybeAutoShutoff();
                 } catch (InterruptedException e) {
@@ -1725,6 +2269,7 @@ public class PrinterService extends Service {
             while (!stopRequested) {
                 try {
                     Thread.sleep(STATE_BROADCAST_INTERVAL_MS);
+                    updateDoorWatch();
                     if (stopRequested) break;
                     if (!wsHub.hasConnections()) continue;
                     String json = getStateJson().toString();
@@ -1785,6 +2330,7 @@ public class PrinterService extends Service {
         private volatile boolean stopRequested = false;
         private boolean prevPlugOn = false;
         private long windowEnd = 0, lastAttempt = 0, lastReattachCheck = 0;
+        private boolean boardHadPrinter = false;
 
         AutoConnectThread() {
             super("PrintHostAutoConnect");
@@ -1820,6 +2366,11 @@ public class PrinterService extends Service {
                         lastReattachCheck = now;
                         String bs = ((EspPrinterConnection) printerConnection).boardState();
                         boolean printing = bs.equals("PRINTING") || bs.equals("PAUSED");
+                        // The printer has just appeared on the board (switched on by hand, or the plug edge was missed):
+                        // earlier failed tries no longer count, so the Printer switch does not stay off.
+                        boolean hasPrinter = printing || bs.equals("IDLE");
+                        if (hasPrinter && !boardHadPrinter) autoConnectFails = 0;
+                        boardHadPrinter = hasPrinter;
                         if (printing || (bs.equals("IDLE") && autoConnectFails < AUTO_CONNECT_MAX_FAILS)) {
                             Log.i(TAG, "the board is " + bs + " - attaching");
                             if (connectPrinter(true)) autoConnectFails = 0;
@@ -1827,6 +2378,7 @@ public class PrinterService extends Service {
                             continue;
                         }
                     }
+                    if (!detached) boardHadPrinter = false;  // attached: the next appearance counts as new
                     // The board restarted (or lost the printer) behind our back: we still think we are connected. Drop the
                     // stale state and connect again. Only while idle - a print on the board is never touched.
                     if (plug && ph == PrinterState.Phase.IDLE && printerConnection instanceof EspPrinterConnection) {
@@ -2003,6 +2555,8 @@ public class PrinterService extends Service {
                 state.elapsedSeconds = parseElapsedSeconds(printTime);
                 if (uploadedFile != null) {
                     state.fanSpeed = GcodeFanParser.fanSpeedAtByteOffset(uploadedFile, state.uploadedBytes);
+                    // A fan value set by hand holds until the file itself changes the fan.
+                    if (state.manualFan != null && !java.util.Objects.equals(state.fanSpeed, state.manualFanOverFile)) state.manualFan = null;
                     GcodeLayerParser.LayerInfo layerInfo =
                             GcodeLayerParser.layerInfoAtByteOffset(uploadedFile, state.uploadedBytes);
                     state.currentLayer = layerInfo == null ? null : layerInfo.currentLayer;

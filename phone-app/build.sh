@@ -22,7 +22,7 @@ echo "== javac =="
 # -parameters: without it, d8 8.2.2 crashes with a NullPointerException while processing
 # synthetic accessor methods for nested classes (see PRINTHOST_PLAN.md build notes).
 "$JAVA_HOME/bin/javac" -source 8 -target 8 -parameters -encoding UTF-8 \
-  -bootclasspath "$PLATFORM" -classpath "$PLATFORM" \
+  -bootclasspath "$PLATFORM:$BT/core-lambda-stubs.jar" -classpath "$PLATFORM" \
   -d classes $(find gen src -name "*.java")
 
 echo "== d8 =="

@@ -44,6 +44,36 @@ public class PrinterState {
     public volatile boolean unloadingFilament = false;
     public volatile boolean levelingBed = false;
 
+    // ---- manual control (what the printer's own screen offers) ----
+    /** The phone talks to the board's built-in pretend printer instead of the real one (for testing). */
+    public volatile boolean simulator = false;
+    /** What a manual action is doing right now ("Homing", "Loading filament"...), "" = nothing. */
+    public volatile String manualBusy = "";
+    /** Homed through this app since the motors were last released: only then may the axes be moved. */
+    public volatile boolean homed = false;
+    public volatile Double posX = null, posY = null, posZ = null; // null = unknown
+    public volatile Integer feedPercent = null; // print speed (M220), null = unknown
+    public volatile Integer flowPercent = null; // extrusion (M221), null = unknown
+    /** Fan value set by hand (0-255); shown instead of the file's value until the file changes the fan itself. */
+    public volatile Integer manualFan = null;
+    public volatile Integer manualFanOverFile = null;
+    /** Z offset moved during a print (babysteps), not yet stored in the printer's memory. */
+    public volatile boolean zOffsetUnsaved = false;
+    /** The printer's own stored settings for the panel's Information block (from M503): {label, value} pairs. */
+    public volatile String[][] machineInfo = new String[0][];
+    /** The printer's preheat presets (M145): [{name, hotend, bed}]. */
+    public volatile org.json.JSONArray presets = defaultPresets();
+
+    static org.json.JSONArray defaultPresets() {
+        org.json.JSONArray a = new org.json.JSONArray();
+        try {
+            a.put(new JSONObject().put("name", "PLA").put("hotend", 200).put("bed", 60));
+            a.put(new JSONObject().put("name", "TPU").put("hotend", 230).put("bed", 70));
+        } catch (JSONException ignored) {
+        }
+        return a;
+    }
+
     public volatile String scheduledFile = null; // SD short name, null = nothing scheduled
     public volatile String scheduledFileDisplay = null;
     public volatile long scheduledAtMillis = 0;
@@ -79,7 +109,18 @@ public class PrinterState {
             o.put("expectedBytes", expectedBytes);
             o.put("printProgressPercent", printProgressPercent);
             o.put("elapsedSeconds", elapsedSeconds);
-            o.put("fanSpeed", fanSpeed == null ? JSONObject.NULL : fanSpeed);
+            Integer fan = manualFan != null ? manualFan : fanSpeed;
+            o.put("fanSpeed", fan == null ? JSONObject.NULL : fan);
+            o.put("simulator", simulator);
+            o.put("manualBusy", manualBusy);
+            o.put("homed", homed);
+            o.put("posX", posX == null ? JSONObject.NULL : posX);
+            o.put("posY", posY == null ? JSONObject.NULL : posY);
+            o.put("posZ", posZ == null ? JSONObject.NULL : posZ);
+            o.put("feedPercent", feedPercent == null ? JSONObject.NULL : feedPercent);
+            o.put("flowPercent", flowPercent == null ? JSONObject.NULL : flowPercent);
+            o.put("zOffsetUnsaved", zOffsetUnsaved);
+            o.put("presets", presets);
             o.put("currentLayer", currentLayer == null ? JSONObject.NULL : currentLayer);
             o.put("totalLayers", totalLayers == null ? JSONObject.NULL : totalLayers);
             o.put("batteryPercent", batteryPercent);
