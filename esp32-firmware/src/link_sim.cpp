@@ -80,6 +80,10 @@ class SimLink : public PrinterLink {
   uint32_t lastAt = 0;
   uint32_t lastN = 0, numbered = 0;
   float hot = 24, bed = 24, hotT = 0, bedT = 0;
+  float zOff = -0.05f;
+  float px = 0, py = 0, pz = 0;  // position, for M114
+  bool rel = false;
+  int feedPct = 100, flowPct = 100;
   uint32_t lastStep = 0;
 
   void push(const char *text, uint32_t delayMs = 0) {
@@ -181,7 +185,31 @@ class SimLink : public PrinterLink {
       push("Cap:EEPROM:1");
       push("ok");
     } else if (!strcmp(up, "M851")) {
-      push("echo:Probe Z Offset: Z-0.050");
+      const char *z = strchr(cmd + 4, 'Z');
+      if (z) zOff = atof(z + 1);
+      snprintf(out, sizeof(out), "echo:Probe Z Offset: Z%.3f", zOff);
+      push(out);
+      push("ok");
+    } else if (!strcmp(up, "M290")) {
+      const char *z = strchr(cmd + 4, 'Z');
+      if (z) zOff += atof(z + 1);  // like BABYSTEP_ZPROBE_OFFSET: the probe offset follows the babystep
+      push("ok");
+    } else if (!strcmp(up, "M220") || !strcmp(up, "M221")) {
+      const char *sv = strchr(cmd + 4, 'S');
+      int &pct = up[3] == '0' ? feedPct : flowPct;
+      if (sv) pct = atoi(sv + 1);
+      else {
+        if (up[3] == '0') snprintf(out, sizeof(out), "FR:%d%%", feedPct);
+        else snprintf(out, sizeof(out), "echo:E0 Flow: %d%%", flowPct);
+        push(out);
+      }
+      push("ok");
+    } else if (!strcmp(up, "M503")) {
+      push("echo:; Material heatup parameters:");
+      push("echo:  M145 S0 H200.00 B60.00 F0");
+      push("echo:  M145 S1 H230.00 B70.00 F0");
+      snprintf(out, sizeof(out), "echo:  M851 X-24.25 Y-15.00 Z%.2f", zOff);
+      push(out);
       push("ok");
     } else if (!strcmp(up, "M104") || !strcmp(up, "M140") || !strcmp(up, "M109") || !strcmp(up, "M190")) {
       const char *s = strchr(cmd, 'S');
@@ -206,8 +234,22 @@ class SimLink : public PrinterLink {
       }
       push("ok");
     } else if (up[0] == 'G' && (up[1] == '0' || up[1] == '1' || up[1] == '2' || up[1] == '3') && up[2] == 0) {
+      for (const char *p = cmd + 2; *p; p++) {
+        float *axis = *p == 'X' ? &px : *p == 'Y' ? &py : *p == 'Z' ? &pz : nullptr;
+        if (axis && p[-1] == ' ') *axis = rel ? *axis + atof(p + 1) : atof(p + 1);
+      }
       push("ok", 1000 / simMotionPerSec);
+    } else if (!strcmp(up, "G90") || !strcmp(up, "G91")) {
+      rel = up[2] == '1';
+      push("ok");
+    } else if (!strcmp(up, "M114")) {
+      snprintf(out, sizeof(out), "X:%.2f Y:%.2f Z:%.2f E:0.00 Count X:0 Y:0 Z:0", px, py, pz);
+      push(out);
+      push("ok");
     } else if (!strcmp(up, "G28")) {
+      px = 110;
+      py = 110;
+      pz = 10;
       push("ok", 3000);
     } else if (!strcmp(up, "G29")) {
       push("ok", 5000);

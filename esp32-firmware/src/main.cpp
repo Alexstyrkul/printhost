@@ -1349,14 +1349,38 @@ static esp_err_t printerDiscardHandler(httpd_req_t *req) {
   bool ok = printerDiscardInterrupted(err);
   return printerReply(req, ok, err);
 }
+static String jsonText(String s) {
+  s.replace("\\", "\\\\");
+  s.replace("\"", "'");
+  s.replace("\n", "\\n");
+  s.replace("\r", "");
+  return s;
+}
+
+// POST /printer/gcode?cmd=&timeout=[&async=1]. With async=1 the answer comes at once with a "job" number and the
+// result is fetched with GET /printer/job?id=: a command that takes long must not hold this server (it handles one
+// request at a time) - the dashboard and the phone would see the board as dead until it finishes.
 static esp_err_t printerGcodeHandler(httpd_req_t *req) {
   String err, reply;
   uint32_t t = (uint32_t)queryValue(req, "timeout").toInt();
+  if (queryValue(req, "async") == "1") {
+    uint32_t job = 0;
+    bool ok = printerGcodeAsync(queryValue(req, "cmd"), t ? t : 5000, job, err);
+    return printerReply(req, ok, err, "\"job\":" + String(job));
+  }
   bool ok = printerGcode(queryValue(req, "cmd"), t ? t : 5000, reply, err);
-  reply.replace("\\", "\\\\");
-  reply.replace("\"", "'");
-  reply.replace("\n", "\\n");
-  return printerReply(req, ok, err, "\"reply\":\"" + reply + "\"");
+  return printerReply(req, ok, err, "\"reply\":\"" + jsonText(reply) + "\"");
+}
+
+static esp_err_t printerJobHandler(httpd_req_t *req) {
+  bool done = false, ok = false;
+  String reply, err;
+  if (!printerJob((uint32_t)queryValue(req, "id").toInt(), done, ok, reply, err)) {
+    return sendJsonStatus(req, "404 Not Found", "{\"ok\":false,\"error\":\"no such job\"}");
+  }
+  String out = String("{\"ok\":true,\"done\":") + (done ? "true" : "false") + ",\"success\":" + (ok ? "true" : "false") + ",\"reply\":\"" +
+               jsonText(reply) + "\",\"error\":\"" + jsonText(err) + "\"}";
+  return sendJsonStatus(req, "200 OK", out);
 }
 
 static esp_err_t printerWindowHandler(httpd_req_t *req) {
@@ -1747,6 +1771,7 @@ static void startServers() {
       {"/printer/recover", HTTP_POST, printerRecoverHandler, nullptr},
       {"/printer/recover/discard", HTTP_POST, printerDiscardHandler, nullptr},
       {"/printer/gcode", HTTP_POST, printerGcodeHandler, nullptr},
+      {"/printer/job", HTTP_GET, printerJobHandler, nullptr},
       {"/printer/sim", HTTP_POST, printerSimHandler, nullptr},
       {"/logs", HTTP_GET, logsListHandler, nullptr},
       {"/logs/read", HTTP_GET, logsReadHandler, nullptr},

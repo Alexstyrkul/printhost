@@ -32,6 +32,7 @@ export PRINTHOST_OTA_PASS=<OTA_PASS>; uvx --from platformio pio run -e esp32s3_o
 | `src/test_ui.h` | Debug page served at `/` |
 | `components/esp32-camera` | v2.0.4 (vendored) |
 | `components/usb_host_cdc_acm` | v2.0.6 (vendored, adds `cdc_acm_host_rx_pause/resume`) |
+| `components/usb` | ESP-IDF 4.4.7 (vendored, `hub.c`: no `abort()` on a repeated port event during recovery) |
 
 ## HTTP API (port 80 unless noted)
 
@@ -40,6 +41,8 @@ export PRINTHOST_OTA_PASS=<OTA_PASS>; uvx --from platformio pio run -e esp32s3_o
 - `POST /camera?on=1|0` power the camera; `GET /control?var=profile&val=fast|balanced|sharp|xga|sxga`
 - `POST /files?name=<n>` (raw body, streamed, returns bytes + crc32), `GET /files`, `POST /files/delete?name=<n>`
 - `GET /printer/status` (includes `dry`: true while the active/last run was a rehearsal); `POST /printer/{link?kind=usb|sim|none, connect, disconnect, print?file=&dry=N&skip=M&badEvery=K, pause, resume, stop, gcode?cmd=&timeout=, sim?speed=&resendEvery=&latency=, window?n=}`
+  - `gcode` while a print runs accepts only the tune commands, one at a time, sent un-numbered between two print lines and answered when the printer acknowledges it: `M104 S`, `M140 S`, `M106 S`, `M107`, `M220 S`, `M221 S`, `M290 Z` (each range-checked). The value also goes into the print journal, so a resume after a crash keeps it. Tested on the `sim` link, including injected line errors.
+  - `gcode?...&async=1` answers at once with `"job":N`; `GET /printer/job?id=N` gives `done`, `success`, `reply`, `error`. For anything that takes long (G28, G29, M400): this server handles one request at a time.
   - `skip=M` (rehearsal only, needs `dry`): jump straight to file line M instead of reading up to it in real time. Only the first `G28` before M is sent for real (for a homed reference) - refuses to run if none is found. `dry` and `skip` are the SAME coordinate (the file's own line numbers) - `skip=220000&dry=225000` sends lines 220000-225000, not "225000 more lines after the skip"; `dry` must be greater than `skip`.
   - `badEvery=K` (rehearsal only, needs `dry`): deliberately corrupts every Kth sent line's checksum so real Marlin rejects it and asks for a resend - for validating the FIFO resync path against real firmware.
 - `POST /wifi` (form ssid/pass) - used by the setup AP page. OTA: ArduinoOTA, host `printhost-cam`.

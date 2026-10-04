@@ -51,6 +51,12 @@ bool printerDiscardInterrupted(String &err);
 const char *printerBootId();
 // One-off command (not while printing). Returns the printer's answer text (ends with "ok").
 bool printerGcode(const String &cmd, uint32_t timeoutMs, String &reply, String &err);
+// The same without waiting: the command is queued and jobId names it; printerJob() tells when it is done. For commands
+// that take long (homing, bed leveling, waiting for a move): the HTTP server handles one request at a time, so a
+// request that waits for the printer keeps every other request (status, camera control, the dashboard) waiting too.
+bool printerGcodeAsync(const String &cmd, uint32_t timeoutMs, uint32_t &jobId, String &err);
+// False if there is no such job (the board restarted, or a newer job replaced it).
+bool printerJob(uint32_t jobId, bool &done, bool &ok, String &reply, String &err);
 // Simulator tuning: motion lines per second, and inject a checksum error every N lines (0 = never).
 bool printerSimTune(int linesPerSec, int resendEvery, int latencyMs, String &err);
 // Lines the engine keeps in flight (1 = stop-and-wait, default 3, max 6).

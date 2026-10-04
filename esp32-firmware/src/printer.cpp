@@ -30,6 +30,7 @@ struct Cmd {
   String err;
   bool ok = false;
   bool abandoned = false;  // the HTTP thread gave up waiting; the engine frees the command itself
+  bool async = false;      // nobody waits: the result goes into gJob (see printerGcodeAsync)
   SemaphoreHandle_t done = nullptr;
 };
 
@@ -53,6 +54,34 @@ String gLastEnd;        // how the last print of this boot ended: finished / sto
 
 void lock() { xSemaphoreTake(stMtx, portMAX_DELAY); }
 void unlock() { xSemaphoreGive(stMtx); }
+
+// The one command queued without a waiting HTTP request, and its result once the engine has run it (under stMtx).
+struct Job {
+  uint32_t id = 0;
+  bool done = true, ok = false;
+  String reply, err;
+};
+Job gJob;
+uint32_t gJobSeq = 0;
+
+// Answers a command: wakes the HTTP thread that waits for it, or stores the result of a command nobody waits for.
+void answerCmd(Cmd *c) {
+  if (c->async) {
+    lock();
+    gJob.done = true;
+    gJob.ok = c->ok;
+    gJob.reply = c->reply;
+    gJob.err = c->err;
+    unlock();
+    delete c;
+    return;
+  }
+  portENTER_CRITICAL(&cmdMux);
+  bool ab = c->abandoned;
+  portEXIT_CRITICAL(&cmdMux);
+  if (ab) delete c;
+  else xSemaphoreGive(c->done);
+}
 
 // ---- machine state along the file (for resuming) -----------------------------------------------------
 struct ResumeState {
@@ -178,6 +207,47 @@ bool gcodeAllowed(const String &c) {
   u.trim();
   u.toUpperCase();
   return !(u.startsWith("M502") || u.startsWith("M997"));
+}
+
+// The only commands accepted while a print runs: the ones the printer's own screen offers in its tune menu.
+// Each must be a single "<code> <letter><number>" with a value in a sane range. repeatable: sending it twice does
+// no harm (M290 moves Z by a step each time, so it is never sent again on its own).
+bool tuneCmdAllowed(const String &c, bool &repeatable, String &why) {
+  String u = c;
+  u.trim();
+  u.toUpperCase();
+  repeatable = true;
+  if (u == "M107") return true;
+  int sp = u.indexOf(' ');
+  if (sp < 0 || u.indexOf(' ', sp + 1) >= 0 || (int)u.length() < sp + 3) {
+    why = "only M104/M140/M106/M107/M220/M221 S<n> and M290 Z<n> are accepted while printing";
+    return false;
+  }
+  String code = u.substring(0, sp);
+  char key = u[sp + 1];
+  char *end = nullptr;
+  const char *num = u.c_str() + sp + 2;
+  float v = strtof(num, &end);
+  if (end == num || *end != 0) {
+    why = "bad number";
+    return false;
+  }
+  float lo, hi;
+  if (code == "M104" && key == 'S') lo = 0, hi = 260;
+  else if (code == "M140" && key == 'S') lo = 0, hi = 100;
+  else if (code == "M106" && key == 'S') lo = 0, hi = 255;
+  else if (code == "M220" && key == 'S') lo = 10, hi = 300;
+  else if (code == "M221" && key == 'S') lo = 50, hi = 200;
+  else if (code == "M290" && key == 'Z') lo = -0.1f, hi = 0.1f, repeatable = false;
+  else {
+    why = "only M104/M140/M106/M107/M220/M221 S<n> and M290 Z<n> are accepted while printing";
+    return false;
+  }
+  if (v < lo || v > hi) {
+    why = "value out of range";
+    return false;
+  }
+  return true;
 }
 
 // ---- SD line reader ----------------------------------------------------------------------------
@@ -468,7 +538,7 @@ uint32_t scanTo(LineReader &rd, uint32_t upTo, ResumeState &st, String &err, boo
 // Error recovery ("Resend"): Marlin throws away everything after a damaged line, and may answer each of the lines
 // that were already on the wire with its own error. So on the first Error/Resend the engine stops sending, waits
 // until the line goes quiet, forgets what was in flight and re-sends from the line Marlin asked for.
-enum SlotType : uint8_t { S_PRINT, S_POLL, S_FINISH };
+enum SlotType : uint8_t { S_PRINT, S_POLL, S_FINISH, S_MANUAL };
 
 struct Slot {
   SlotType type;
@@ -504,6 +574,11 @@ struct PrintRun {
   bool pendValid = false;  // a gcode line was read from the file but not sent yet
   char pend[256];
   uint32_t pendAfter = 0;
+
+  // A command from the user while the print runs (temperature, fan, speed, flow, Z babystep): sent without a line
+  // number between two print lines, one at a time. Kept here until the printer acknowledges it.
+  Cmd *man = nullptr;
+  bool manSent = false;
 
   bool resync = false;     // an error was reported: waiting for the line to go quiet
   uint32_t resyncUntil = 0;
@@ -632,13 +707,7 @@ void safeShutdown() {
   unlock();
 }
 
-void answerPrintCmd(Cmd *c) {
-  portENTER_CRITICAL(&cmdMux);
-  bool ab = c->abandoned;
-  portEXIT_CRITICAL(&cmdMux);
-  if (ab) delete c;
-  else xSemaphoreGive(c->done);
-}
+void answerPrintCmd(Cmd *c) { answerCmd(c); }
 
 // True for the commands that heat something (skipped in a rehearsal).
 bool isHeatCmd(const char *s) {
@@ -658,6 +727,17 @@ bool ackHead(PrintRun &r, bool viaProbe) {
     gFinished++;
     unlock();
     return true;
+  }
+  if (s.type == S_MANUAL) {
+    logEvent("RX manual ok after %u ms", (unsigned)((esp_timer_get_time() - s.sentUs) / 1000));
+    if (r.man) {
+      r.man->ok = true;
+      r.man->reply = "ok\n";
+      answerPrintCmd(r.man);
+      r.man = nullptr;
+    }
+    r.manSent = false;
+    return false;
   }
   if (s.type == S_PRINT) {
     if (s.traced) {
@@ -967,7 +1047,7 @@ void runPrint(const String &path, uint32_t dryLines, uint32_t skipLines, const R
 
   link->flushInput();
   r.lastRx = millis();
-  r.nextPoll = millis() + 2000;
+  r.nextPoll = millis() + 1000;
 
   // Reset the printer's line counter so numbering starts from a known place (sent alone, acked before anything else).
   if (!sendLine(r, 0, "M110", 0, true)) {
@@ -1002,6 +1082,20 @@ void runPrint(const String &path, uint32_t dryLines, uint32_t skipLines, const R
         setState(PS_IDLE);
         finishPrint("stopped");
         goto done;
+      } else if (c->type == C_GCODE) {
+        bool repeatable;
+        String why;
+        if (r.man) {
+          c->err = "another command is still waiting for the printer";
+        } else if (!tuneCmdAllowed(c->arg, repeatable, why)) {
+          c->err = "printer is busy printing: " + why;
+        } else {
+          c->arg.trim();
+          c->arg.toUpperCase();
+          r.man = c;  // answered when the printer acknowledges it
+          r.manSent = false;
+          continue;
+        }
       } else {
         c->ok = false;
         c->err = "printer is busy printing";
@@ -1122,6 +1216,19 @@ void runPrint(const String &path, uint32_t dryLines, uint32_t skipLines, const R
       // forever for a completion that already happened on the wire. Letting `r.eof && !finishSent`
       // fire again below resends M400 and re-tracks it properly. Sending M400 twice is harmless.
       if (r.finishSent) r.finishSent = false;
+      if (r.man && r.manSent) {
+        bool repeatable;
+        String why;
+        tuneCmdAllowed(r.man->arg, repeatable, why);
+        if (repeatable) {
+          r.manSent = false;  // goes out again after the re-sent lines
+        } else {
+          r.man->err = "a line error hit while the command was on the wire: it may or may not have been applied";
+          answerPrintCmd(r.man);
+          r.man = nullptr;
+          r.manSent = false;
+        }
+      }
       fifoClear(r);
       r.resync = false;
       r.lastGood = 0;
@@ -1151,7 +1258,7 @@ void runPrint(const String &path, uint32_t dryLines, uint32_t skipLines, const R
 
       // temperature poll (also while paused)
       if ((int32_t)(now - r.nextPoll) >= 0 && r.fn < win) {
-        r.nextPoll = now + 2000;
+        r.nextPoll = now + 1000;  // temperatures once a second (the panel on the phone shows them live)
         if (r.fn == 0 || r.throttle == 0) {
           if (!sendPoll(r)) {
             safeShutdown();
@@ -1179,6 +1286,37 @@ void runPrint(const String &path, uint32_t dryLines, uint32_t skipLines, const R
         }
         r.resendFrom = r.resendFrom < r.lineNo ? r.resendFrom + 1 : 0;
         continue;
+      }
+
+      // a command from the user (also while paused)
+      if (r.man && !r.manSent) {
+        portENTER_CRITICAL(&cmdMux);
+        bool ab = r.man->abandoned;
+        portEXIT_CRITICAL(&cmdMux);
+        if (ab) {  // the caller stopped waiting (the printer was busy heating): do not apply it behind their back
+          delete r.man;
+          r.man = nullptr;
+        } else {
+          String line = r.man->arg + "\n";
+          if (!sendRaw(line.c_str())) {
+            safeShutdown();
+            setError("write to printer failed");
+            goto done;
+          }
+          Slot s;
+          s.type = S_MANUAL;
+          s.traced = true;
+          s.len = (uint16_t)line.length();
+          s.lineNo = 0;
+          s.bytesAfter = 0;
+          s.sentUs = esp_timer_get_time();
+          s.sentMs = millis();
+          fifoPush(r, s);
+          r.manSent = true;
+          trackLine(r.cur, r.man->arg.c_str());  // a resume after a crash keeps the value the user set
+          logEvent("TX manual %s", r.man->arg.c_str());
+          continue;
+        }
       }
 
       if (st != PS_PRINTING) break;  // paused: nothing new goes out
@@ -1273,6 +1411,12 @@ void runPrint(const String &path, uint32_t dryLines, uint32_t skipLines, const R
   }
 
 done:
+  if (r.man) {
+    r.man->ok = false;
+    r.man->err = "the print ended before the printer confirmed the command";
+    answerPrintCmd(r.man);
+    r.man = nullptr;
+  }
   if (r.rd.f) {
     // Give the card lock back only if it was got: giving a mutex another task holds trips a FreeRTOS assert (abort).
     bool held = xSemaphoreTake(sdMutex, pdMS_TO_TICKS(3000)) == pdTRUE;
@@ -1365,7 +1509,7 @@ void idleTick() {
   unlock();
   if (st != PS_IDLE || !g_idlePoll) return;
   if ((int32_t)(millis() - nextPoll) < 0) return;
-  nextPoll = millis() + 2000;
+  nextPoll = millis() + 1000;
   String reply, err;
   execGcode("M105", 2500, reply, err);  // updates temperatures via parseTemps
 }
@@ -1497,13 +1641,7 @@ void interruptedTick() {
 }
 
 // ---- command handling --------------------------------------------------------------------------
-void finishCmd(Cmd *c) {
-  portENTER_CRITICAL(&cmdMux);
-  bool ab = c->abandoned;
-  portEXIT_CRITICAL(&cmdMux);
-  if (ab) delete c;
-  else xSemaphoreGive(c->done);
-}
+void finishCmd(Cmd *c) { answerCmd(c); }
 
 void applyLinkChoice(const String &kind, String &err) {
   if (link) {
@@ -1592,6 +1730,11 @@ void handleCmd(Cmd *c) {
         break;
       }
       c->ok = execGcode(c->arg, c->timeoutMs, c->reply, c->err);
+      // Manual commands go into the event log (not the bookkeeping ones every jog step sends), so that "did the printer
+      // get it?" can be answered afterwards.
+      if (!(c->arg.startsWith("M400") || c->arg.startsWith("M114") || c->arg.startsWith("G90") || c->arg.startsWith("G91"))) {
+        logEvent("gcode: %s -> %s", c->arg.c_str(), c->ok ? "ok" : c->err.c_str());
+      }
       if (c->ok && c->arg.startsWith("M115")) {
         int i = c->reply.indexOf("FIRMWARE_NAME");
         if (i >= 0) {
@@ -1839,6 +1982,53 @@ bool printerGcode(const String &cmd, uint32_t timeoutMs, String &reply, String &
   if (timeoutMs < 500) timeoutMs = 500;
   if (timeoutMs > 600000) timeoutMs = 600000;
   return post(C_GCODE, cmd, timeoutMs, &reply, err, timeoutMs + 8000);
+}
+
+bool printerGcodeAsync(const String &cmd, uint32_t timeoutMs, uint32_t &jobId, String &err) {
+  if (cmd.length() == 0 || cmd.length() > 200) {
+    err = "bad command length";
+    return false;
+  }
+  if (timeoutMs < 500) timeoutMs = 500;
+  if (timeoutMs > 600000) timeoutMs = 600000;
+  lock();
+  if (!gJob.done) {
+    unlock();
+    err = "another command is still running";
+    return false;
+  }
+  gJob = Job();
+  gJob.id = jobId = ++gJobSeq;
+  gJob.done = false;
+  unlock();
+  Cmd *c = new Cmd();
+  c->type = C_GCODE;
+  c->arg = cmd;
+  c->timeoutMs = timeoutMs;
+  c->async = true;
+  if (xQueueSend(cmdQ, &c, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    delete c;
+    lock();
+    gJob.done = true;
+    gJob.err = "engine queue full";
+    unlock();
+    err = "engine queue full";
+    return false;
+  }
+  return true;
+}
+
+bool printerJob(uint32_t jobId, bool &done, bool &ok, String &reply, String &err) {
+  lock();
+  bool known = jobId != 0 && gJob.id == jobId;
+  if (known) {
+    done = gJob.done;
+    ok = gJob.ok;
+    reply = gJob.reply;
+    err = gJob.err;
+  }
+  unlock();
+  return known;
 }
 
 bool printerFileInUse(const String &name) {
