@@ -298,6 +298,8 @@
   .preview-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
   #previewGhostCanvas { z-index: 1; opacity: 0.65; }
   #previewSolidCanvas { z-index: 2; }
+  #previewLiteCanvas { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 2; cursor: grab; }
+  #previewLiteCanvas[hidden] { display: none; }
   .preview-loading { position: absolute; inset: 0; z-index: 3; display: flex; align-items: center;
                       justify-content: center; color: var(--text-faint); font-size: 12px;
                       text-align: center; padding: 0 20px; transition: opacity 0.2s ease; pointer-events: none; }
@@ -633,6 +635,7 @@
         <div class="preview-stage" id="previewStage">
           <canvas id="previewGhostCanvas"></canvas>
           <canvas id="previewSolidCanvas"></canvas>
+          <canvas id="previewLiteCanvas" hidden></canvas>
           <div class="preview-loading" id="previewLoading">No file loaded</div>
         </div>
         <div class="preview-legend">
@@ -839,6 +842,7 @@
       <div class="ctl-pane" id="ctlPaneFil" hidden>
         <div class="ctl-label">Load (heats, feeds 80 mm)</div>
         <div class="ctl-row" id="ctlLoad"></div>
+        <div class="ctl-row" id="ctlLoadWait" hidden style="margin-top:6px;"><button id="ctlLoadContinue" class="primary">Filament is in: continue</button></div>
         <div class="ctl-label">Unload (heats to 240&deg;)</div>
         <div class="ctl-row"><button id="ctlUnload">Unload filament</button></div>
         <div class="ctl-label">Extrude / retract, mm</div>
@@ -1372,17 +1376,42 @@ var previewFile = null;
 var previewLoading = false;
 var PREVIEW_READY_PHASES = { UPLOAD_VERIFIED: true, PRINTING: true, PAUSED: true };
 
+// Files above this size get the light preview (plain lines, parsed off the page's thread - vendor/preview-lite.js):
+// the regular one builds tube geometry on the page's own thread and a 70 MB file froze the whole dashboard.
+var PREVIEW_LITE_ABOVE_BYTES = 20 * 1024 * 1024;
+
 function loadPreview(fileKey, gcodeUrl, initialLayer, onReady) {
   previewLoading = true;
   previewFile = fileKey;
   $("previewLoading").textContent = "Loading preview…";
   $("previewLoading").classList.remove("hidden", "error");
-  import("/vendor/preview-panel.js").then(function (mod) {
-    return mod.initPrintPreview({
-      ghostCanvas: $("previewGhostCanvas"),
-      solidCanvas: $("previewSolidCanvas"),
-      gcodeUrl: gcodeUrl,
-      initialLayer: initialLayer,
+  // Ask for the file only to learn its size (the body is dropped at once), then pick the preview that can take it.
+  fetch(gcodeUrl).then(function (res) {
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    var size = +res.headers.get("Content-Length") || 0;
+    if (res.body && res.body.cancel) res.body.cancel();
+    var lite = size > PREVIEW_LITE_ABOVE_BYTES;
+    $("previewLiteCanvas").hidden = !lite;
+    $("previewGhostCanvas").style.display = $("previewSolidCanvas").style.display = lite ? "none" : "";
+    if (lite) {
+      return import("/vendor/preview-lite.js").then(function (mod) {
+        return mod.initPrintPreviewLite({
+          canvas: $("previewLiteCanvas"),
+          gcodeUrl: gcodeUrl,
+          initialLayer: initialLayer,
+          onProgress: function (p) {
+            if (previewFile === fileKey) $("previewLoading").textContent = "Loading preview… " + Math.round(p * 100) + "%";
+          },
+        });
+      });
+    }
+    return import("/vendor/preview-panel.js").then(function (mod) {
+      return mod.initPrintPreview({
+        ghostCanvas: $("previewGhostCanvas"),
+        solidCanvas: $("previewSolidCanvas"),
+        gcodeUrl: gcodeUrl,
+        initialLayer: initialLayer,
+      });
     });
   }).then(function (api) {
     if (previewFile !== fileKey) return; // superseded by a newer selection while this was loading
@@ -2501,6 +2530,8 @@ function renderControl(s) {
   if (live && !printing && !busy && !s.homed) {
     Array.prototype.forEach.call(document.querySelectorAll("#ctlPaneMove [data-axis]"), function (b) { b.disabled = true; });
   }
+  $("ctlLoadWait").hidden = !s.loadWaiting;
+  if (s.loadWaiting) $("ctlLoadContinue").disabled = false;  // the one button that works while the load waits
   $("ctlMoveNote").textContent = printing ? "Not available while printing." : (s.homed ? "" : "Press Home all first: the axes move only after homing.");
   $("ctlFilNote").textContent = printing ? "Not available while printing."
       : (live && s.hotendTemp < 170 ? "Extrude and retract need a hot nozzle (170° or more)." : "");
@@ -2568,8 +2599,9 @@ $("ctlPaneTemp").addEventListener("click", function (e) {
 
 $("ctlLoad").onclick = function (e) {
   var b = e.target.closest("button");
-  if (b && confirm("Load filament? The nozzle heats to " + b.dataset.temp + "° and feeds 80 mm.")) ctlDo("/filament/load?temp=" + b.dataset.temp);
+  if (b && confirm("Load filament? The nozzle heats to " + b.dataset.temp + "° waits for you to insert the filament, then feeds 80 mm.")) ctlDo("/filament/load?temp=" + b.dataset.temp);
 };
+$("ctlLoadContinue").onclick = function () { post("/control/continue"); };
 $("ctlUnload").onclick = function () { $("unloadFilamentBtn").onclick(); };
 $("ctlExtrude").onclick = function () { ctlDo("/control/extrude?mm=" + ctlLen); };
 $("ctlRetract").onclick = function () { ctlDo("/control/extrude?mm=" + (-ctlLen)); };
