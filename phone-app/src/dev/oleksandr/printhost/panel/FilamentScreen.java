@@ -20,7 +20,7 @@ final class FilamentScreen extends Screen {
     private Progress unloadBox, feedBox, coolBox;
     private final Progress[] matBox = new Progress[2];
     // loading view
-    private TextView loadTitle, loadTemp;
+    private TextView loadTitle, loadTemp, loadContinue, loadCancel;
     private Bar loadBar;
     private final View[] dot = new View[4];
     private final TextView[] stepText = new TextView[4];
@@ -192,7 +192,7 @@ final class FilamentScreen extends Screen {
         b.addView(t, block());
 
         LinearLayout steps = Ui.card(c);
-        String[] names = {"Insert the filament", "Heating the nozzle", "Feeding the filament", "Done"};
+        String[] names = {"Heating the nozzle", "Insert the filament", "Feeding the filament", "Done"};
         for (int i = 0; i < 4; i++) {
             LinearLayout r = Ui.row(c);
             r.setMinimumHeight(Ui.dp(c, 46));
@@ -205,12 +205,19 @@ final class FilamentScreen extends Screen {
         b.addView(steps, block());
 
         b.addView(spring());
-        TextView cancel = Ui.ghost(c, "Cancel");
-        cancel.setOnClickListener(v -> {
+        // shown once the nozzle is hot: the printer waits here until the filament is in
+        loadContinue = Ui.button(c, "Continue", Ui.GREEN, Ui.ON_GREEN);
+        loadContinue.setOnClickListener(v -> {
+            m.continueLoad();
+            changed.run();
+        });
+        b.addView(loadContinue, block(56));
+        loadCancel = Ui.ghost(c, "Cancel");
+        loadCancel.setOnClickListener(v -> {
             m.cancelOp();
             changed.run();
         });
-        b.addView(cancel, block(48));
+        b.addView(loadCancel, block(48));
         return sv;
     }
 
@@ -224,7 +231,10 @@ final class FilamentScreen extends Screen {
             loadTitle.setText("Loading " + m.matName[m.material]);
             loadTemp.setText(Math.round(m.nozzle) + "°");
             loadBar.set(m.nozzle / m.opTemp);
-            int now = m.opPhase + 1;  // step 0 (insert) is always done
+            // steps: 0 heating, 1 insert the filament (waits for Continue), 2 feeding, 3 done
+            int now = m.opPhase == 0 ? 0 : m.opPhase == 3 ? 1 : m.opPhase == 1 ? 2 : 3;
+            loadContinue.setVisibility(m.opPhase == 3 ? View.VISIBLE : View.INVISIBLE);
+            Ui.enabled(loadCancel, m.opPhase == 0 || m.opPhase == 3);  // not once the filament moves
             for (int i = 0; i < 4; i++) {
                 boolean done = i < now || (i == 3 && m.opPhase == 2), cur = i == now && !done;
                 GradientDrawable d = new GradientDrawable();

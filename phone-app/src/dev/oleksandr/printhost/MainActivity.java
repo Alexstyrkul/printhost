@@ -48,6 +48,10 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         panel.resume();
+        // Started again while the panel is visible: Android lets a service use the camera with the screen off only if
+        // it was (re)started from a visible app. Without this the door watch got "camera error 3" after every start
+        // that happened with the screen off (a reinstall, a reboot).
+        if (!getIntent().getBooleanExtra("mock", false)) startPrinterService();
     }
 
     @Override

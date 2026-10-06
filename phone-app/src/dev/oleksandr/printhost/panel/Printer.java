@@ -36,13 +36,16 @@ public abstract class Printer {
     double nozzle, nozzleTarget, bed, bedTarget;
     int fan, speed = 100, flow = 100;
     double zOffset;
+    /** False while the printer's real Z offset has not been read yet (the app started during a print). */
+    boolean zOffsetKnown = true;
 
     boolean homed = false, homing = false, motorsOn = false;
     double x, y, z;
 
     int material = 0;
     int feedMm = 5;
-    /** A filament action in progress. Phase 0 = heating, 1 = moving the filament, 2 = done (load only). */
+    /** A filament action in progress. Phase 0 = heating, 1 = moving the filament, 2 = done (load only),
+     *  3 = hot and waiting for continueLoad() (load only: time to push the filament in). */
     int op = OP_NONE, opPhase = 0;
     int opTemp;
     String feedVerb = "Extruding";
@@ -111,6 +114,9 @@ public abstract class Printer {
     abstract void feed(int dir);
 
     abstract void cancelOp();
+
+    /** The filament is in: a load that waits (phase 3) goes on to feed it. */
+    abstract void continueLoad();
 
     abstract void home();
 

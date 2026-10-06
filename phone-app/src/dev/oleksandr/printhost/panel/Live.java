@@ -127,6 +127,7 @@ final class Live extends Printer {
         if (now > holdUntil[K_SPEED]) speed = st.feedPercent == null ? 100 : st.feedPercent;
         if (now > holdUntil[K_FLOW]) flow = st.flowPercent == null ? 100 : st.flowPercent;
         if (now > holdUntil[K_Z]) zOffset = st.zOffset;
+        zOffsetKnown = st.zOffsetKnown;
 
         homed = st.homed;
         x = st.posX == null ? 0 : st.posX;
@@ -141,7 +142,10 @@ final class Live extends Printer {
         motorsOn = !motorsReleased;
 
         if (now > opHoldUntil) {
-            if ("Loading filament".equals(busy)) setOp(OP_LOAD, loadTemp);
+            if ("Loading filament".equals(busy)) {
+                setOp(OP_LOAD, loadTemp);
+                if (st.loadWaiting) opPhase = 3;
+            }
             else if (st.unloadingFilament) setOp(OP_UNLOAD, 240);
             else if ("Extruding".equals(busy) || "Retracting".equals(busy)) setOp(OP_FEED, feedTemp);
             else if (now < loadDoneUntil) {
@@ -356,6 +360,7 @@ final class Live extends Printer {
 
     @Override
     void nudgeZOffset(int dir) {
+        if (!zOffsetKnown) return;
         double next = clamp(Math.round((zOffset + 0.01 * dir) * 100) / 100.0, -5, 5);
         if (next == zOffset) return;
         zOffset = next;
@@ -456,6 +461,14 @@ final class Live extends Printer {
         PrinterService s = svc();
         if (s != null) s.manualCancel();
         opHoldUntil = 0;
+    }
+
+    @Override
+    void continueLoad() {
+        PrinterService s = svc();
+        if (s != null) s.manualContinue();
+        opPhase = 1;
+        opHoldUntil = System.currentTimeMillis() + 1500;
     }
 
     // ---- motion ----

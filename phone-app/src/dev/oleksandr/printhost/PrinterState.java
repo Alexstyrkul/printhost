@@ -47,6 +47,8 @@ public class PrinterState {
     // ---- manual control (what the printer's own screen offers) ----
     /** The phone talks to the board's built-in pretend printer instead of the real one (for testing). */
     public volatile boolean simulator = false;
+    /** Loading filament: the nozzle is hot and the printer waits for "Continue" before it feeds. */
+    public volatile boolean loadWaiting = false;
     /** What a manual action is doing right now ("Homing", "Loading filament"...), "" = nothing. */
     public volatile String manualBusy = "";
     /** Homed through this app since the motors were last released: only then may the axes be moved. */
@@ -59,6 +61,8 @@ public class PrinterState {
     public volatile Integer manualFanOverFile = null;
     /** Z offset moved during a print (babysteps), not yet stored in the printer's memory. */
     public volatile boolean zOffsetUnsaved = false;
+    /** False until the printer's real Z offset has been read (it cannot be read while a print runs). */
+    public volatile boolean zOffsetKnown = false;
     /** The printer's own stored settings for the panel's Information block (from M503): {label, value} pairs. */
     public volatile String[][] machineInfo = new String[0][];
     /** The printer's preheat presets (M145): [{name, hotend, bed}]. */
@@ -113,6 +117,7 @@ public class PrinterState {
             o.put("fanSpeed", fan == null ? JSONObject.NULL : fan);
             o.put("simulator", simulator);
             o.put("manualBusy", manualBusy);
+            o.put("loadWaiting", loadWaiting);
             o.put("homed", homed);
             o.put("posX", posX == null ? JSONObject.NULL : posX);
             o.put("posY", posY == null ? JSONObject.NULL : posY);
@@ -120,6 +125,7 @@ public class PrinterState {
             o.put("feedPercent", feedPercent == null ? JSONObject.NULL : feedPercent);
             o.put("flowPercent", flowPercent == null ? JSONObject.NULL : flowPercent);
             o.put("zOffsetUnsaved", zOffsetUnsaved);
+            o.put("zOffsetKnown", zOffsetKnown);
             o.put("presets", presets);
             o.put("currentLayer", currentLayer == null ? JSONObject.NULL : currentLayer);
             o.put("totalLayers", totalLayers == null ? JSONObject.NULL : totalLayers);

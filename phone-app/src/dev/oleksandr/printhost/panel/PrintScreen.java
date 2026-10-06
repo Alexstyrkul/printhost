@@ -156,6 +156,7 @@ final class PrintScreen extends Screen {
                 tileValue[kind].setSingleLine(true);
                 t.addView(tileValue[kind], Ui.lp(c, Ui.FILL, Ui.WRAP, 0, 0, 4, 0, 0));
                 t.setOnClickListener(v -> {
+                    if (kind == AdjustSheet.Z_OFFSET && !m.zOffsetKnown) return;  // not read from the printer yet
                     if (m.power && m.connected) AdjustSheet.show(c, m, kind, changed);
                 });
                 row.addView(t, Ui.lp(c, 0, Ui.WRAP, 1, i == 0 ? 0 : 10, 0, 0, 0));

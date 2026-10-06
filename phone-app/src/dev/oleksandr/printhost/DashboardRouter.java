@@ -639,6 +639,9 @@ public class DashboardRouter implements RequestRouter {
                 case "/control/cancel":
                     service.manualCancel();
                     return new PrinterService.UploadOutcome(true, "Cancel requested");
+                case "/control/continue":
+                    service.manualContinue();
+                    return new PrinterService.UploadOutcome(true, "Continuing");
                 case "/control/motors-on": return service.manualMotorsOn();
                 case "/control/mesh": return service.manualSetMeshPoint(Integer.parseInt(req.queryParam("column")),
                         Integer.parseInt(req.queryParam("row")), Double.parseDouble(req.queryParam("z")));

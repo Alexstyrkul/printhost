@@ -32,7 +32,7 @@ final class AdjustSheet {
             case FAN: return m.fan > 0 ? m.fan + "%" : "Off";
             case SPEED: return m.speed + "%";
             case FLOW: return m.flow + "%";
-            default: return String.format(Locale.US, "%.2f", m.zOffset).replace('-', '−');
+            default: return m.zOffsetKnown ? String.format(Locale.US, "%.2f", m.zOffset).replace('-', '−') : "–";
         }
     }
 

@@ -103,8 +103,8 @@ final class CalibrateScreen extends Screen {
         if (zVal == null) return;
         zVal.setText(AdjustSheet.value(m, AdjustSheet.Z_OFFSET));
         boolean ok = m.manualOk();
-        Ui.enabled(zMinus, m.power && m.connected && !m.busy());
-        Ui.enabled(zPlus, m.power && m.connected && !m.busy());
+        Ui.enabled(zMinus, m.power && m.connected && !m.busy() && m.zOffsetKnown);
+        Ui.enabled(zPlus, m.power && m.connected && !m.busy() && m.zOffsetKnown);
         measure.setVisibility(m.canMeasure ? View.VISIBLE : View.GONE);
         measure.setText(m.measuring ? "Calibrating…" : "Calibrate");
         Ui.enabled(measure, ok);

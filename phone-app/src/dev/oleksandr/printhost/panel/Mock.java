@@ -81,7 +81,7 @@ final class Mock extends Printer {
         }
         if (op != OP_NONE) {
             if (opPhase == 0 && nozzle >= opTemp - 3) {
-                opPhase = 1;
+                opPhase = op == OP_LOAD ? 3 : 1;
                 opUntil = now + (op == OP_FEED ? feedMm * 200L : 5000);
             } else if (opPhase == 1 && now >= opUntil) {
                 if (op == OP_LOAD) {
@@ -192,6 +192,14 @@ final class Mock extends Printer {
     @Override
     void cancelOp() {
         if (op != OP_NONE) endOp();
+    }
+
+    @Override
+    void continueLoad() {
+        if (op == OP_LOAD && opPhase == 3) {
+            opPhase = 1;
+            opUntil = System.currentTimeMillis() + 5000;
+        }
     }
 
     @Override

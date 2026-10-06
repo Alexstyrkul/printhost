@@ -47,7 +47,8 @@ final class DoorWatch {
     private final float[] prev = new float[GRID_W * GRID_H];
     private boolean havePrev = false;
     private long lastSampleAt = 0;
-    private int above = 0, seen = 0;
+    private int above = 0, quiet = 0;
+    private boolean armed = false;
 
     // samples for /debug/door: time, light, change (ring buffer)
     private final long[] sT = new long[KEEP];
@@ -55,6 +56,7 @@ final class DoorWatch {
     private int sCount = 0, sNext = 0;
 
     private volatile boolean running = false;
+    private volatile long failedAt = 0;
     private volatile String error = "";
     volatile double threshold = 20;
     volatile boolean act = false;  // false = only record ("log"), true = call the listener ("on")
@@ -70,6 +72,7 @@ final class DoorWatch {
 
     synchronized void start() {
         if (running) return;
+        if (System.currentTimeMillis() - failedAt < 15000) return;  // after a failure wait before trying again
         if (ctx.checkSelfPermission(android.Manifest.permission.CAMERA) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
             error = "camera permission not granted";
             return;
@@ -78,7 +81,8 @@ final class DoorWatch {
         running = true;
         havePrev = false;
         above = 0;
-        seen = 0;
+        quiet = 0;
+        armed = false;
         thread = new HandlerThread("PrintHostDoor");
         thread.start();
         handler = new Handler(thread.getLooper());
@@ -118,6 +122,7 @@ final class DoorWatch {
         Log.w(TAG, error, e);
         closeCamera();
         running = false;
+        failedAt = System.currentTimeMillis();
     }
 
     private void open() {
@@ -233,12 +238,21 @@ final class DoorWatch {
             }
             // Measured in the cabinet (2026-10-04, lamp on): a closed door gives 0.1-0.2, an opening or closing door one
             // sample of 45-50, sometimes with smaller ones (5-16) around it. So: one sample above the threshold, or two
-            // in a row above a quarter of it. The first samples after the camera starts are skipped (it is still
-            // settling its exposure: one such frame measured 118).
-            seen++;
+            // in a row above a quarter of it.
+            //
+            // Nothing counts until the picture has been quiet for three samples in a row after the camera started.
+            // In a dark cabinet the phone's own screen is the only light: when it goes off the picture changes by 100+,
+            // which used to count as "the door moved", woke the screen, and looped every few seconds (2026-10-05).
+            if (!armed) {
+                quiet = change < threshold / 4 ? quiet + 1 : 0;
+                if (quiet >= 3) armed = true;
+                return;
+            }
             above = change > threshold / 4 ? above + 1 : 0;
-            if (act && seen > 3 && (change > threshold || above >= 2)) {
+            if (act && (change > threshold || above >= 2)) {
                 above = 0;
+                armed = false;
+                quiet = 0;
                 listener.onMotion(change);
             }
         } catch (Exception e) {

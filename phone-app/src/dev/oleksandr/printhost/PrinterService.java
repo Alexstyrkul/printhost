@@ -88,7 +88,7 @@ public class PrinterService extends Service {
             @Override
             public void onMotion(double change) {
                 Log.i(TAG, "door watch: change " + change + " - waking the screen");
-                wakeScreen();
+                wakeScreenAndStayOn();
             }
         });
         doorWatch.threshold = prefs.getFloat("door_threshold", 20f);
@@ -564,7 +564,7 @@ public class PrinterService extends Service {
             try {
                 printerConnection.connect();
                 state.firmwareInfo = firstLine(printerConnection.queryFirmwareInfo());
-                state.zOffset = parseZOffset(printerConnection.queryZOffset());
+                readZOffsetOrRemembered();
                 readManualInfo();
                 restoreAfterCutOffHeatAction();
                 state.lastError = "";
@@ -739,6 +739,7 @@ public class PrinterService extends Service {
             state.bedTemp = 0;
             state.bedTarget = 0;
             state.zOffset = 0;
+            state.zOffsetKnown = false;
             state.firmwareInfo = "";
             // The chosen file lives on the ESP32's SD card, not in the printer, so it stays selected.
             state.printProgressPercent = 0;
@@ -1882,7 +1883,14 @@ public class PrinterService extends Service {
         });
     }
 
-    private volatile boolean manualCancelRequested = false;
+    private volatile boolean manualCancelRequested = false, manualContinueRequested = false;
+    /** How long a load waits, hot, for "Continue" before it gives up and puts the nozzle back. */
+    private static final long LOAD_WAIT_MAX_MS = 10 * 60 * 1000L;
+
+    /** "The filament is in": lets a waiting load go on to feed it. */
+    public void manualContinue() {
+        manualContinueRequested = true;
+    }
 
     /** Stops a manual action that is still waiting for the nozzle to heat (load, feed by hand). */
     public void manualCancel() {
@@ -1947,9 +1955,26 @@ public class PrinterService extends Service {
                 noteHeatAction(before);
                 try {
                     heatNozzleAndWait(c, temp);
+                    // Hot: now wait until the person has pushed the filament in and says so. Feeding straight away
+                    // (as it did at first) left no time to insert it.
+                    manualContinueRequested = false;
+                    state.loadWaiting = true;
+                    long deadline = System.currentTimeMillis() + LOAD_WAIT_MAX_MS;
+                    while (!manualContinueRequested) {
+                        if (manualCancelRequested) throw new IOException("Cancelled");
+                        if (System.currentTimeMillis() > deadline) throw new IOException("Nobody pressed Continue: loading stopped, nozzle put back");
+                        if (!printerConnection.isOpen()) throw new IOException("Printer disconnected");
+                        try {
+                            Thread.sleep(200);
+                        } catch (InterruptedException e) {
+                            throw new IOException("Interrupted");
+                        }
+                    }
+                    state.loadWaiting = false;
                     extrudeRelative(c, 50, 300);
                     extrudeRelative(c, 30, 150);
                 } finally {
+                    state.loadWaiting = false;
                     c.manualGcode("M104 S" + before, 15000);
                     state.hotendTarget = before;
                     clearHeatAction();
@@ -1963,10 +1988,44 @@ public class PrinterService extends Service {
         return Math.round(v * 100) / 100.0;
     }
 
+    // ---- the Z offset the app shows must be the printer's real one ----
+    // The printer answers "what is your Z offset" (M851) only while it is not printing. An app that starts during a
+    // print (a reinstall, a restart) therefore cannot read it - and used to show 0. Changing the offset from that 0
+    // would have written a wrong offset into the printer after the print (2026-10-05, caught before anything was
+    // pressed). Now: the last value really read from the printer is remembered across restarts; until a value is
+    // known the offset is shown as unknown and cannot be changed; and the value stored after a print is always
+    // "what the printer had before the print + the babysteps made", never the number on the screen.
+    private double zOffsetBeforePrint = 0, zBabystepped = 0;
+
+    private void rememberZOffset(double z) {
+        state.zOffset = z;
+        state.zOffsetKnown = true;
+        getSharedPreferences("printhost", MODE_PRIVATE).edit().putFloat("z_offset_real", (float) z).apply();
+    }
+
+    /** At connect: read the real offset if the printer is idle, else use the last one really read (if any). */
+    private void readZOffsetOrRemembered() {
+        boolean idle = printerConnection instanceof EspPrinterConnection
+                && "IDLE".equals(((EspPrinterConnection) printerConnection).boardState());
+        if (idle) {
+            try {
+                rememberZOffset(parseZOffset(((EspPrinterConnection) printerConnection).manualGcode("M851", 5000)));
+                zBabystepped = 0;
+                return;
+            } catch (IOException e) {
+                Log.w(TAG, "reading the Z offset failed", e);
+            }
+        }
+        android.content.SharedPreferences prefs = getSharedPreferences("printhost", MODE_PRIVATE);
+        state.zOffsetKnown = prefs.contains("z_offset_real");
+        state.zOffset = state.zOffsetKnown ? round2(prefs.getFloat("z_offset_real", 0) + zBabystepped) : 0;
+    }
+
     /** Idle: changes the stored probe Z offset. Printing: moves the nozzle right away (babystep); the new value is
      *  stored when the print ends (see storeZOffsetAfterPrint()). */
     public UploadOutcome manualZOffset(final double delta) {
         if (delta == 0 || Math.abs(delta) > Z_OFFSET_STEP_MAX + 1e-9) return new UploadOutcome(false, "Step up to " + Z_OFFSET_STEP_MAX + " mm");
+        if (!state.zOffsetKnown) return new UploadOutcome(false, "The Z offset is not known yet (it is read when the printer is idle)");
         final double target = round2(state.zOffset + delta);
         if (Math.abs(target) > Z_OFFSET_LIMIT) return new UploadOutcome(false, "Z offset limit reached");
         return manual("Setting Z offset", true, new ManualAction() {
@@ -1974,13 +2033,15 @@ public class PrinterService extends Service {
             public String run(EspPrinterConnection c) throws IOException {
                 if (printActive()) {
                     c.manualGcode(fmt("M290 Z%.2f", delta), 15000);
+                    if (!state.zOffsetUnsaved) zOffsetBeforePrint = round2(state.zOffset);
+                    zBabystepped = round2(target - zOffsetBeforePrint);
                     state.zOffset = target;
                     state.zOffsetUnsaved = true;
                     return fmt("Z offset %.2f", target);
                 }
                 c.manualGcode(fmt("M851 Z%.2f", target), 5000);
                 c.manualGcode("M500", 10000);
-                state.zOffset = target;
+                rememberZOffset(target);
                 state.zOffsetUnsaved = false;
                 return fmt("Z offset %.2f saved", target);
             }
@@ -2005,15 +2066,23 @@ public class PrinterService extends Service {
      *  dashboard shows. Some firmware moves the probe offset together with the babystep, some does not - so read it
      *  back and only write the difference. Called from the idle poller. */
     private void storeZOffsetAfterPrint() {
-        if (!state.zOffsetUnsaved || printActive() || !(printerConnection instanceof EspPrinterConnection)) return;
+        if (printActive() || !(printerConnection instanceof EspPrinterConnection)) return;
+        if (!state.zOffsetUnsaved && state.zOffsetKnown) return;
         EspPrinterConnection c = (EspPrinterConnection) printerConnection;
         if (!c.isOpen() || !"IDLE".equals(c.boardState()) || !manualLock.tryLock()) return;
         try {
-            double want = state.zOffset;
             double have = parseZOffset(c.manualGcode("M851", 5000));
+            if (!state.zOffsetUnsaved) {  // nothing to store: just learn the real value (the app started during a print)
+                rememberZOffset(have);
+                return;
+            }
+            // what the printer had before the print plus the babysteps - never the number that was on the screen
+            double want = round2(zOffsetBeforePrint + zBabystepped);
             if (Math.abs(have - want) > 0.005) c.manualGcode(fmt("M851 Z%.2f", want), 5000);
             c.manualGcode("M500", 10000);
             state.zOffsetUnsaved = false;
+            zBabystepped = 0;
+            rememberZOffset(want);
             Log.i(TAG, "Z offset " + want + " stored after the print (the printer had " + have + ")");
         } catch (IOException e) {
             Log.w(TAG, "storing the Z offset failed, will retry", e);
@@ -2672,6 +2741,17 @@ public class PrinterService extends Service {
     /** A brief, one-shot wake - nothing is held afterward, so it can never fight a manual
      *  power-button lock (see usbtap's UsbAllowService for why that matters). */
     @SuppressWarnings("deprecation") // SCREEN_BRIGHT_WAKE_LOCK has no non-deprecated replacement
+    /** Switches the screen on and lets it stay on like after a touch (the phone's own timeout then switches it off).
+     *  wakeScreen() alone lit it for about three seconds. */
+    public void wakeScreenAndStayOn() {
+        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        if (pm == null) return;
+        PowerManager.WakeLock lock = pm.newWakeLock(
+                PowerManager.SCREEN_BRIGHT_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP | PowerManager.ON_AFTER_RELEASE,
+                "PrintHost:doorWake");
+        lock.acquire(15000);  // held for 15 s; ON_AFTER_RELEASE then starts the normal screen timeout
+    }
+
     public void wakeScreen() {
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
         if (pm == null) return;
