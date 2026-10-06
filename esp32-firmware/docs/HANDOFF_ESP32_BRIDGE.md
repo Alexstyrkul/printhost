@@ -113,6 +113,14 @@ interface; `Live` feeds it from `PrinterService` and the board, `Mock` from pret
   mesh once.** `levelBed` now homes first, requires the probing to take time and the mesh to be non-zero before M500.
   `M420 V` prints the 4x4 mesh and then a 16x16 "Subdivided" one: only the first is the mesh.
 - A heater left on by a cut-off load / unload / feed is put back at the next connect (pref `heat_action_restore`).
+- 2026-10-05/06: the door watch arms only after three quiet samples (in a dark cabinet the phone's own screen going
+  off looked like a moving door and looped), keeps the screen on after a wake, and needs the panel shown once with the
+  screen on after every app start (Android gives a service the camera only when started from a visible app:
+  "camera error 3" otherwise). The Z offset is shown and changeable only once really read from the printer (M851 is
+  refused while printing; an app started mid-print used to show 0); the last read value is kept in prefs, and after a
+  print the stored value is "before the print + babysteps". Filament load heats, then waits for Continue
+  (`/control/continue`, 10 min), then feeds. Dashboard: files over 20 MB use `vendor/preview-lite.js` +
+  `preview-worker.js` (parsed in a Web Worker, drawn as lines) - the regular tube preview froze the page on 70 MB.
 - Open: the stock screen's auto Z-offset routine (`M8015` / `G212` in Creality's source, unconfirmed here - the button
   is hidden); battery saving while the plug is off (the phone's charger is on the same plug); door-watch noise during a
   print; the Motion / PID pages.
